@@ -1,0 +1,8 @@
+{
+  "dmPolicy": "allowlist",
+  "groupPolicy": "decide",
+  "botPolicy": "ai-decide",
+  "allowedUsers": [],
+  "allowedChats": [],
+  "allowedBots": []
+}

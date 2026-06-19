@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex.telegram</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3.12</string>
+    <string>/path/to/codex-telegram-channel/scripts/codex_telegram_bot.py</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/codex-telegram-channel</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/.codex/channels/codex-telegram/logs/service.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/.codex/channels/codex-telegram/logs/service.err.log</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>

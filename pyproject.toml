@@ -1,0 +1,14 @@
+[project]
+name = "codex-telegram-channel"
+version = "0.1.0"
+description = "Standalone Telegram bridge for talking to Codex."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
