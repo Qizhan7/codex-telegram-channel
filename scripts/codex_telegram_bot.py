@@ -29,7 +29,7 @@ from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 SERVICE_NAME = "codex-telegram"
@@ -73,11 +73,30 @@ DEFAULT_MEDIA_GROUP_DELAY_SECONDS = 1.5
 MIN_MEDIA_GROUP_DELAY_SECONDS = 0.5
 DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS = 20.0
 DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS = 3600
-DIRECT_BACKGROUND_ACK_TEXT = "我让这轮在后台继续，做完回来交结果。"
+DIRECT_BACKGROUND_ACK_TEXT = "我还在处理，跑完回来给你结论。"
 INTERRUPTED_BACKGROUND_NOTICE_TEXT = "刚才那个后台任务被服务重启打断了，我没有拿到完成结果。需要继续的话，我会按 worker 路径重新派。"
 DEFAULT_AUTO_WORKER_CHECK_SECONDS = 5
 DEFAULT_AUTO_WORKER_RESULT_CHARS = 3500
 AUTO_WORKER_ACK_TEXT = "我派 worker 去做，主线程留着验收。"
+TELEGRAM_OUTPUT_REFERENCE_RE = re.compile(
+    r"(?:"
+    r"上一条|上条|上一句|上句|刚才(?:那|这)?(?:条|句|个回复|个消息|个回答)?|"
+    r"你刚(?:才)?(?:说|发|回)|那条|这条|那句|这句|"
+    r"\blast\s+(?:message|reply|response)\b|\bprevious\s+(?:message|reply|response)\b|"
+    r"\bthat\s+(?:message|reply|response)\b"
+    r")",
+    re.IGNORECASE,
+)
+TELEGRAM_OUTPUT_ACTION_RE = re.compile(
+    r"(?:改成|改一下|改掉|编辑|换成|删掉|删除|撤回|重发|重新发|补发|"
+    r"\bedit\b|\brevise\b|\brewrite\b|\bchange\b|\bdelete\b|\bremove\b|\bresend\b|\bredo\b)",
+    re.IGNORECASE,
+)
+TELEGRAM_OUTPUT_QUERY_RE = re.compile(
+    r"(?:说了?啥|说了?什么|发了?什么|回了?什么|刚才.*(?:啥|什么)|"
+    r"\bwhat\s+did\s+you\s+(?:say|send|reply)\b|\bwhat\s+was\s+that\b)",
+    re.IGNORECASE,
+)
 TELEGRAM_ALLOWED_UPDATES = (
     "message",
     "edited_message",
@@ -2226,6 +2245,24 @@ def recent_editable_output_rows(conn: sqlite3.Connection, chat_id: str, limit: i
         (chat_id, limit),
     ).fetchall()
     return list(reversed(rows))
+
+
+def should_include_telegram_outputs_for_text(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return False
+    if re.search(r"\bbot_message_id\s*=", clean, re.IGNORECASE):
+        return True
+    has_reference = bool(TELEGRAM_OUTPUT_REFERENCE_RE.search(clean))
+    if has_reference and (TELEGRAM_OUTPUT_ACTION_RE.search(clean) or TELEGRAM_OUTPUT_QUERY_RE.search(clean)):
+        return True
+    if re.search(r"\[(?:回复|reply)\s*@", clean, re.IGNORECASE) and TELEGRAM_OUTPUT_ACTION_RE.search(clean):
+        return True
+    return False
+
+
+def should_include_telegram_outputs(texts: Iterable[str]) -> bool:
+    return any(should_include_telegram_outputs_for_text(text) for text in texts)
 
 
 def recent_continuable_output_row(
@@ -5775,6 +5812,33 @@ def auto_worker_title(text: str, reason: str) -> str:
     return f"TG worker: {title}"
 
 
+
+def looks_like_execution_request_for_background_ack(text: str) -> bool:
+    """Return True when a slow-turn ack is useful instead of noisy.
+
+    Direct-background acks are user-visible, so reserve them for concrete work:
+    investigation, edits, setup, generation, verification, deployment, or other
+    requests where the user benefits from knowing the task is still running.
+    Casual chat can simply deliver the final reply later without a system-ish
+    interstitial bubble.
+    """
+    clean = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not clean:
+        return False
+    if re.search(
+        r"(帮我|你帮|麻烦|可以.*(查|看|改|修|弄|做|写|设|配|跑|测|验证|总结|整理|想想|优化)|"
+        r"(查|检查|看一下|看看|定位|debug|investigate|inspect|确认|验证|测试|跑一下|"
+        r"修|改|更新|优化|重构|实现|接上|配置|设置|安装|部署|发布|上线|"
+        r"总结|整理|生成|写|做|处理|分析|排查|backfill|迁移|提交|commit|push|pr|"
+        r"log|日志|报错|错误|异常|进程|launchd|worker|tg|telegram|数据库|sqlite|db|jsonl))",
+        clean,
+    ):
+        return True
+    # Short owner continuations such as “行你看看” are common after a task setup.
+    if re.fullmatch(r"(行|好|嗯|那)?(你)?(先)?(看一下|看看|查一下|处理|弄吧|改吧)", clean):
+        return True
+    return False
+
 def task_ack_focus(text: str) -> str:
     clean = re.sub(r"\s+", " ", str(text or "")).strip().lower()
     if not clean:
@@ -5797,7 +5861,7 @@ def task_ack_focus(text: str) -> str:
 
 
 def direct_background_ack_text(trigger_text: str) -> str:
-    return f"{task_ack_focus(trigger_text)}；这轮可能会久一点，我让它在后台继续，做完回来交结果。"
+    return f"{task_ack_focus(trigger_text)}。这轮要多跑一会儿，我先放后台继续；出结果回来讲。"
 
 
 def auto_worker_ack_text(reason: str, trigger_text: str) -> str:
@@ -8414,10 +8478,14 @@ def build_prompt(
     for row in rows:
         context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
-    output_lines = [
-        format_editable_output_row(row)
-        for row in recent_editable_output_rows(conn, chat.chat_id, RECENT_EDITABLE_OUTPUTS)
-    ]
+    output_lines = (
+        [
+            format_editable_output_row(row)
+            for row in recent_editable_output_rows(conn, chat.chat_id, RECENT_EDITABLE_OUTPUTS)
+        ]
+        if should_include_telegram_outputs([text])
+        else []
+    )
     reaction_feedback = recent_message_reaction_feedback(conn, chat.chat_id)
     handoff_block = (
         handoff_block_override
@@ -8582,10 +8650,14 @@ def build_batch_prompt(
     ):
         context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
-    output_lines = [
-        format_editable_output_row(row)
-        for row in recent_editable_output_rows(conn, chat.chat_id, RECENT_EDITABLE_OUTPUTS)
-    ]
+    output_lines = (
+        [
+            format_editable_output_row(row)
+            for row in recent_editable_output_rows(conn, chat.chat_id, RECENT_EDITABLE_OUTPUTS)
+        ]
+        if should_include_telegram_outputs(item.text for item in items)
+        else []
+    )
     reaction_feedback = recent_message_reaction_feedback(conn, chat.chat_id)
     handoff_block = pending_handoff_block(conn, config)
     batch_lines = []
@@ -12465,7 +12537,14 @@ class BotService:
             message_thread_id=message_thread_id,
         )
 
-    def should_send_direct_background_ack(self, allow_silent_reply: bool, explicitly_addressed: bool) -> bool:
+    def should_send_direct_background_ack(
+        self,
+        allow_silent_reply: bool,
+        explicitly_addressed: bool,
+        trigger_text: str = "",
+    ) -> bool:
+        if not looks_like_execution_request_for_background_ack(trigger_text):
+            return False
         return not allow_silent_reply or explicitly_addressed
 
     def send_direct_background_ack(
@@ -12479,7 +12558,7 @@ class BotService:
         allow_silent_reply: bool,
         explicitly_addressed: bool,
     ) -> None:
-        if not self.should_send_direct_background_ack(allow_silent_reply, explicitly_addressed):
+        if not self.should_send_direct_background_ack(allow_silent_reply, explicitly_addressed, trigger_text):
             return
         ack_text = direct_background_ack_text(trigger_text)
         delivery_error = ""
@@ -12620,7 +12699,11 @@ class BotService:
         allow_silent_reply: bool,
         explicitly_addressed: bool,
     ) -> None:
-        if not self.should_send_direct_background_ack(allow_silent_reply, explicitly_addressed):
+        if not self.should_send_direct_background_ack(
+            allow_silent_reply,
+            explicitly_addressed,
+            f"{decision.reason} {decision.title}",
+        ):
             return
         ack_text = auto_worker_ack_text(decision.reason, decision.title)
         try:

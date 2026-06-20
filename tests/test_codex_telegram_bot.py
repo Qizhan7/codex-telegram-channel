@@ -421,6 +421,55 @@ def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_p
     assert "序 当前消息" not in recent_block
 
 
+def test_app_server_prompt_omits_telegram_outputs_for_ordinary_chat(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.record_channel_delivery(
+        conn,
+        "run-1",
+        chat.chat_id,
+        0,
+        10,
+        None,
+        None,
+        "previous visible reply",
+        event_type="reply",
+    )
+
+    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 11, "普通聊天一句", cfg)
+
+    assert "<telegram_outputs>" not in prompt
+    assert "previous visible reply" not in prompt
+
+
+def test_app_server_prompt_includes_telegram_outputs_for_edit_reference(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.record_channel_delivery(
+        conn,
+        "run-1",
+        chat.chat_id,
+        0,
+        10,
+        None,
+        None,
+        "previous visible reply",
+        event_type="reply",
+    )
+
+    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 11, "把上一条改成：新的说法", cfg)
+
+    assert "<telegram_outputs>" in prompt
+    assert "bot_message_id=10" in prompt
+    assert "previous visible reply" in prompt
+
+
 def test_private_status_like_chat_enters_codex_instead_of_local_fast_reply(
     tmp_path: Path,
     monkeypatch,
@@ -745,6 +794,78 @@ def test_direct_background_ack_unblocks_and_delivers_later(tmp_path: Path, monke
         acquired = lock.acquire(blocking=False)
     assert acquired
     lock.release()
+
+
+def test_direct_background_ack_skips_casual_slow_private_turn(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(
+        tmp_path,
+        direct_background=True,
+        direct_background_after_seconds=0.01,
+        direct_background_timeout_seconds=60,
+        auto_worker=False,
+    )
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+    sent: list[str] = []
+
+    def fake_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        sent.append(text)
+        return [len(sent)]
+
+    def fake_run_codex(*args, **kwargs):
+        time.sleep(0.1)
+        return codex_telegram_bot.RunResult(
+            run_id=kwargs.get("run_id") or "run-casual",
+            status="ok",
+            reply="会有一点。",
+            session_id_after=None,
+            error=None,
+            channel_events=[],
+        )
+
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fake_send_message)
+    monkeypatch.setattr(codex_telegram_bot, "run_codex", fake_run_codex)
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "start_typing_feedback",
+        lambda *args, **kwargs: threading.Event(),
+    )
+
+    service.run_single_message(
+        conn,
+        chat,
+        sender,
+        43,
+        None,
+        "这样叫你你干活会更有劲吗？",
+        "这样叫你你干活会更有劲吗？",
+        False,
+        True,
+    )
+
+    deadline = time.monotonic() + 1
+    while len(sent) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sent == ["会有一点。"]
+    assert (
+        conn.execute("SELECT COUNT(*) FROM channel_deliveries WHERE event_type = 'background_ack'").fetchone()[0]
+        == 0
+    )
+
+
+def test_background_ack_task_heuristic_and_copy() -> None:
+    assert codex_telegram_bot.looks_like_execution_request_for_background_ack(
+        "你要不想想怎么把这个机制优化一点"
+    )
+    assert codex_telegram_bot.looks_like_execution_request_for_background_ack("行你看看")
+    assert not codex_telegram_bot.looks_like_execution_request_for_background_ack("序哥哥*^o^*")
+    assert not codex_telegram_bot.looks_like_execution_request_for_background_ack("这样叫你你干活会更有劲吗？")
+    assert codex_telegram_bot.direct_background_ack_text("行你看看") == (
+        "我先看现场。这轮要多跑一会儿，我先放后台继续；出结果回来讲。"
+    )
 
 
 def test_auto_worker_delegates_heavy_single_without_shared_codex(tmp_path: Path, monkeypatch) -> None:
