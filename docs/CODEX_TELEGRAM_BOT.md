@@ -47,11 +47,14 @@ CODEX_TELEGRAM_REPLY_TIMEOUT_SECONDS=300
 CODEX_TELEGRAM_DIRECT_BACKGROUND=1
 CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS=20
 CODEX_TELEGRAM_DIRECT_BACKGROUND_TIMEOUT_SECONDS=3600
+CODEX_TELEGRAM_AUTO_WORKER=1
+CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS=5
+CODEX_TELEGRAM_AUTO_WORKER_RESULT_CHARS=3500
 CODEX_TELEGRAM_CONTEXT_MESSAGES=24
 CODEX_TELEGRAM_SHARED_CONTEXT_MESSAGES=8
 CODEX_TELEGRAM_STEADY_CONTEXT_MESSAGES=0
 CODEX_TELEGRAM_CONTEXT_TEXT_CHARS=800
-CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=80000
+CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000
 CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5
 CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS=1.5
 CODEX_TELEGRAM_GROUP_DECISION_SOURCE=bridge
@@ -81,6 +84,20 @@ Owner ids from `.env` are automatically allowed. Add group chat ids to
 `allowedChats`, and trusted bot ids to `allowedBots` if bot-to-bot context is
 needed.
 
+## Group Decide Mode
+
+The bridge always enforces chat access first: group messages only matter inside
+`allowedChats`. In `/codex_mode decide`, `CODEX_TELEGRAM_GROUP_DECISION_SOURCE`
+controls where the social decision happens.
+
+With `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, owner/allowlist messages in
+an allowed group enter Codex so the model can choose whether to reply or stay
+silent. A non-allowlist human can also wake Codex when the message explicitly
+addresses the bot by `@username`, replies to a bot message, or contains one of
+the configured `CODEX_TELEGRAM_WAKE_PHRASES`. Each group turn includes a
+`<recent_chat_window>` block with the last five same-chat messages before the
+trigger or batch, so Codex has the local conversation lead-in when deciding.
+
 ## Prompt Contract
 
 The public base prompt is neutral:
@@ -96,8 +113,9 @@ After visible tool calls, the model mirrors a short `TG sent: ...` summary into
 the private transcript.
 
 The prompt includes source-labeled Telegram context, current chat metadata,
-attachment paths when files are downloaded, and a compact instruction describing
-whether silence is acceptable for the current turn.
+the group `<recent_chat_window>` when applicable, attachment paths when files
+are downloaded, and a compact instruction describing whether silence is
+acceptable for the current turn.
 
 ## Direct Background Turns
 
@@ -105,13 +123,38 @@ whether silence is acceptable for the current turn.
 after Telegram's visible wait window. Quick turns still finish inline. When a
 single-message turn or batched group turn runs longer than
 `CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS`, the bridge sends a short
-acknowledgement, leaves the same Codex task running in the background, and
-delivers the final channel-tool output back to the original Telegram chat.
+task-specific acknowledgement, leaves the same Codex task running in the
+background, and delivers the final channel-tool output back to the original
+Telegram chat.
 
 `CODEX_TELEGRAM_DIRECT_BACKGROUND_TIMEOUT_SECONDS` controls the longer timeout
 used after a turn moves into that background path. This is separate from Codex
 worker tools: the task stays in the Telegram-backed Codex thread instead of
 opening a separate worker session.
+
+## Auto Worker Delegation
+
+`CODEX_TELEGRAM_AUTO_WORKER=1` keeps the shared Telegram Codex thread lean by
+delegating heavier execution requests before they enter the shared app-server
+session. Debugging, log/database inspection, broad file work, tests, deployment,
+implementation tasks, multi-step requests, and consecutive addressed task
+batches are started as separate Codex workers. The Telegram thread receives a
+short task-specific acknowledgement, then the bridge schedules a private worker
+alarm for the Telegram resident. At each alarm, the resident inspects the same
+worker task, continues that worker session when needed, sets another alarm if it
+is still running, and decides whether a visible Telegram reply helps. When a new
+Telegram message arrives while related worker context exists, the resident gets
+a private worker summary and decides whether to continue the existing worker
+session or start a separate worker.
+
+Workers run with Telegram channel tools disabled. They only write private worker
+output; Telegram messages always come from the Telegram resident through the
+normal channel tools.
+
+Short chat, simple answers, and explicit tiny edits such as one-line wording or
+typo fixes stay in the shared Telegram thread. `CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS`
+sets the first automatic worker check delay. Worker result text is read through
+`codex_worker_status` by the resident before anything is sent to Telegram.
 
 ## Shared Desktop Thread
 
@@ -167,7 +210,10 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind the chat or shared context to a session.
 - `/codex_rollover`: start a clean shared session with a bounded handoff.
-- `/codex_mode mention|all|decide`: set group trigger behavior.
+- `/codex_mode mention|all|decide`: set group trigger behavior. With
+  `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, `decide` forwards
+  owner/allowlist messages and explicit configured-name calls so Codex can
+  choose whether to reply or stay silent.
 - `/codex_batch single|batch|status`: switch group batching behavior.
 - `/codex auto|single|multi|status`: switch visible reply bubble shape.
 - `/codex_debug on|off|status`: show or hide raw Desktop prompts.

@@ -20,11 +20,20 @@ the repo.
     shared Desktop thread back to the current active Telegram chat.
 - Visible Telegram tools: `reply`, `send_photos`, `send_files`, `react`, and
   `edit_message`.
+- Group decide mode can defer social judgment to Codex: owner/allowlist
+  messages enter the model, explicit name calls from other group members can
+  wake it, and group turns include the last five same-chat messages before the
+  trigger.
 - Direct background continuation for long turns: quick tasks finish inline; if a
   single-message or batched group Codex turn runs past
-  `CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS`, the bridge sends a short
-  acknowledgement, keeps the same Codex task running, and delivers the final
-  result back to the original Telegram chat with the normal channel tools.
+  `CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS`, the bridge sends a short,
+  task-specific acknowledgement, keeps the same Codex task running, and delivers
+  the final result back to the original Telegram chat with the normal channel
+  tools.
+- Auto-worker supervision for larger tasks: workers run without Telegram channel
+  tools; the Telegram resident sets scheduled worker checks, inspects the same
+  task, continues it when needed, decides whether a new request belongs in that
+  worker or a new one, and decides what to say in Telegram.
 - Public, neutral base prompt: the model is a generic Codex collaborator reached
   through Telegram, with no private persona dependency.
 
@@ -98,7 +107,10 @@ launchctl kickstart -k gui/$(id -u)/com.codex.telegram
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind to a Codex session.
 - `/codex_rollover`: start a clean shared session with a short handoff.
-- `/codex_mode mention|all|decide`: set group trigger mode.
+- `/codex_mode mention|all|decide`: set group trigger mode. With
+  `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, `decide` forwards
+  owner/allowlist messages and explicit configured-name calls so Codex can
+  choose whether to reply or stay silent.
 - `/codex_batch single|batch|status`: set group batching.
 - `/codex auto|single|multi|status`: set visible reply bubble shape.
 - `/codex_debug on|off|status`: show or hide raw Desktop prompts.

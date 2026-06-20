@@ -42,7 +42,7 @@ DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
 REPLY_CONTEXT_TEXT_CHARS = 180
-DEFAULT_ROLLOVER_INPUT_TOKENS = 80_000
+DEFAULT_ROLLOVER_INPUT_TOKENS = 200_000
 HANDOFF_MAX_INBOUND_MESSAGES = 6
 HANDOFF_MAX_VISIBLE_REPLIES = 2
 HANDOFF_CONTEXT_TEXT_CHARS = 160
@@ -73,7 +73,11 @@ DEFAULT_MEDIA_GROUP_DELAY_SECONDS = 1.5
 MIN_MEDIA_GROUP_DELAY_SECONDS = 0.5
 DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS = 20.0
 DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS = 3600
-DIRECT_BACKGROUND_ACK_TEXT = "好，我开始做。跑久了我自己回来交结果。"
+DIRECT_BACKGROUND_ACK_TEXT = "我让这轮在后台继续，做完回来交结果。"
+INTERRUPTED_BACKGROUND_NOTICE_TEXT = "刚才那个后台任务被服务重启打断了，我没有拿到完成结果。需要继续的话，我会按 worker 路径重新派。"
+DEFAULT_AUTO_WORKER_CHECK_SECONDS = 5
+DEFAULT_AUTO_WORKER_RESULT_CHARS = 3500
+AUTO_WORKER_ACK_TEXT = "我派 worker 去做，主线程留着验收。"
 TELEGRAM_ALLOWED_UPDATES = (
     "message",
     "edited_message",
@@ -237,6 +241,7 @@ MESSAGE_SHAPE_KEY_PREFIX = "message_shape:"
 MESSAGE_SHAPES = {"auto", "single", "multi"}
 GROUP_QUIET_UNTIL_KEY_PREFIX = "group_quiet_until:"
 GROUP_QUIET_WINDOW_SECONDS = 600
+RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES = 5
 RECENT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CHAT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CONTINUATION_OUTPUT_SECONDS = 20 * 60
@@ -262,30 +267,27 @@ PRIVATE_ASIDE_TURN_CHECK = (
     "when needed; otherwise finish normally or silently."
 )
 TASK_INTAKE_GUIDANCE = (
-    "Task intake: For concrete execution requests, begin with a brief visible acknowledgement such as "
-    "`好，我来。` State the route in one short clause: handling it directly here, continuing as a direct "
-    "background Telegram task if it runs long, opening a Codex worker, or handing it to Desktop/another Codex window. "
-    "Add the first checkpoint or completion approach in plain words. "
-    "For tiny immediate fixes, the acknowledgement can be the first line of the answer."
+    "Task intake: For concrete execution requests, use a short acknowledgement that says what you are about to do, "
+    "with wording shaped by the actual task instead of a memorized stock sentence. State the route in one short "
+    "clause: handling it directly here, continuing as a direct background Telegram task if it runs long, opening a "
+    "Codex worker, or handing it to Desktop/another Codex window. Add the first checkpoint or completion approach "
+    "in plain words. For tiny immediate fixes, the acknowledgement can be the first line of the answer."
 )
 DIRECT_BACKGROUND_GUIDANCE = (
-    "Direct background continuation: For larger work that still belongs in this Telegram conversation, keep doing the "
-    "task yourself in the same Codex thread. The bridge may send a short acknowledgement and let your turn continue "
-    "outside the visible Telegram wait window; when the work is done, use the normal Telegram channel tools to report "
-    "the result, changed files, verification, and next useful choice. Prefer this path when the owner expects you, "
-    "not a separate worker, to carry the task."
+    "Direct background continuation: Use the same Telegram-backed Codex thread for chat, short answers, and tiny "
+    "localized edits. If a small turn runs past the visible Telegram wait window, the bridge may send a short "
+    "acknowledgement and let it finish in the background. For larger coding tasks, multi-step debugging, log/database "
+    "inspection, long verification, or broad file work, prefer a Codex worker so the shared Telegram thread stays lean."
 )
 WORKER_DELEGATION_GUIDANCE = (
-    "Codex worker delegation: For larger coding tasks, multi-step debugging, long verification, or work likely "
-    "to benefit from a separate worker session, you may open a separate Codex worker with codex_worker_start. "
-    "Give the worker the concrete goal, cwd, relevant files, success signals, and a short reporting format. "
-    "Keep the Telegram turn as supervisor: tell the owner that the worker is running, then use "
-    "codex_worker_status to read progress and results when useful. For follow-up instructions, use "
-    "codex_worker_continue with the task_id so the same worker session carries continuity. You may set "
-    "codex_worker_alarm as a private check point, so you can come back later, inspect the worker, and decide the "
-    "next visible or quiet step. When a worker reaches complete or needs_input, return to Telegram and summarize "
-    "the result, changed files, verification, and the next useful choice. For quick chat, simple answers, or tiny "
-    "edits, handling the turn directly is a good fit."
+    "Codex worker delegation: Treat the Telegram turn as the routing and supervision hub. Delegate execution, "
+    "investigation, debugging, log/database inspection, broad file work, and verification to workers by default. "
+    "Handle work directly only for quick chat, simple answers, or explicit tiny edits such as one or two lines. "
+    "When there is existing worker context, decide whether the owner is adding to that same task or asking for a "
+    "separate task: continue the same task_id/session for same-task follow-up, or start a new worker for separate "
+    "work. Give workers the concrete goal, cwd, relevant files, success signals, and a concise reporting format. "
+    "Inspect progress with codex_worker_status, set private worker alarms when another check would help, and report "
+    "back to Telegram yourself only when a visible update is useful."
 )
 WEATHER_CODES: dict[int, str] = {
     0: "晴", 1: "大部晴", 2: "多云", 3: "阴",
@@ -341,6 +343,9 @@ class Config:
     direct_background: bool = True
     direct_background_after_seconds: float = DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS
     direct_background_timeout_seconds: int = DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS
+    auto_worker: bool = True
+    auto_worker_check_seconds: int = DEFAULT_AUTO_WORKER_CHECK_SECONDS
+    auto_worker_result_chars: int = DEFAULT_AUTO_WORKER_RESULT_CHARS
 
 
 @dataclass(frozen=True)
@@ -401,6 +406,13 @@ class BatchState:
     revision: int = 0
     running: bool = False
     timer: threading.Timer | None = None
+
+
+@dataclass(frozen=True)
+class AutoWorkerDecision:
+    reason: str
+    title: str
+    task: str
 
 
 @dataclass(frozen=True)
@@ -619,6 +631,15 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
                 DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS,
             ),
         ),
+        auto_worker=parse_bool(env("CODEX_TELEGRAM_AUTO_WORKER"), default=True),
+        auto_worker_check_seconds=max(
+            1,
+            parse_int(env("CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS"), DEFAULT_AUTO_WORKER_CHECK_SECONDS),
+        ),
+        auto_worker_result_chars=max(
+            500,
+            parse_int(env("CODEX_TELEGRAM_AUTO_WORKER_RESULT_CHARS"), DEFAULT_AUTO_WORKER_RESULT_CHARS),
+        ),
     )
     if require_ready:
         missing = []
@@ -683,11 +704,14 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     "CODEX_TELEGRAM_DIRECT_BACKGROUND=1",
                     f"CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS={DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS:g}",
                     f"CODEX_TELEGRAM_DIRECT_BACKGROUND_TIMEOUT_SECONDS={DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS}",
+                    "CODEX_TELEGRAM_AUTO_WORKER=1",
+                    f"CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS={DEFAULT_AUTO_WORKER_CHECK_SECONDS}",
+                    f"CODEX_TELEGRAM_AUTO_WORKER_RESULT_CHARS={DEFAULT_AUTO_WORKER_RESULT_CHARS}",
                     "CODEX_TELEGRAM_CONTEXT_MESSAGES=24",
                     "CODEX_TELEGRAM_SHARED_CONTEXT_MESSAGES=8",
                     "CODEX_TELEGRAM_STEADY_CONTEXT_MESSAGES=0",
                     f"CODEX_TELEGRAM_CONTEXT_TEXT_CHARS={DEFAULT_CONTEXT_TEXT_CHARS}",
-                    "CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=80000",
+                    "CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000",
                     "CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5",
                     f"CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS={DEFAULT_MEDIA_GROUP_DELAY_SECONDS:g}",
                     "CODEX_TELEGRAM_DENY_UNKNOWN=0",
@@ -1762,6 +1786,44 @@ def prompt_context_rows(
     return sort_context_rows(list(merged.values()))[-max_rows:]
 
 
+def recent_same_chat_context_rows(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    limit: int,
+    *,
+    exclude: set[tuple[str, int]] | None = None,
+) -> list[sqlite3.Row]:
+    if limit <= 0:
+        return []
+    exclude_keys = exclude or set()
+    fetch_limit = max(limit, limit + len(exclude_keys))
+    noise_filter, noise_params = local_context_noise_filter_sql("m")
+    rows = conn.execute(
+        f"""
+        SELECT
+          m.telegram_message_id,
+          m.chat_id,
+          COALESCE(c.chat_type, 'unknown') AS chat_type,
+          COALESCE(c.title, '') AS chat_title,
+          m.sender_name,
+          m.text,
+          m.created_at
+        FROM messages m
+        LEFT JOIN chats c ON c.chat_id = m.chat_id
+        WHERE m.chat_id = ? AND {noise_filter}
+        ORDER BY m.created_at DESC, m.telegram_message_id DESC
+        LIMIT ?
+        """,
+        (chat_id, *noise_params, fetch_limit),
+    ).fetchall()
+    filtered = [
+        row
+        for row in rows
+        if (str(row["chat_id"]), int(row["telegram_message_id"])) not in exclude_keys
+    ][:limit]
+    return list(reversed(filtered))
+
+
 def truncate_context_text(text: str, limit: int) -> str:
     clean = re.sub(r"\s+", " ", text).strip()
     if limit <= 0 or len(clean) <= limit:
@@ -1783,6 +1845,26 @@ def format_context_row(row: sqlite3.Row, text_limit: int = DEFAULT_CONTEXT_TEXT_
     title_part = f" {title}" if title else ""
     source = f"{row['chat_type']} {row['chat_id']}{title_part}"
     return f"- {row['created_at']} [{source}] {row['sender_name']}: {clean_text}"
+
+
+def recent_group_trigger_context_lines(
+    conn: sqlite3.Connection,
+    chat: Chat,
+    config: Config,
+    *,
+    exclude: set[tuple[str, int]] | None = None,
+) -> list[str]:
+    if chat.chat_type == "private":
+        return []
+    return [
+        format_context_row(row, config.context_text_chars)
+        for row in recent_same_chat_context_rows(
+            conn,
+            chat.chat_id,
+            RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES,
+            exclude=exclude,
+        )
+    ]
 
 
 def owner_private_destinations(config: Config) -> str:
@@ -1879,6 +1961,35 @@ def mark_running_runs_interrupted(conn: sqlite3.Connection, reason: str) -> int:
     )
     conn.commit()
     return cursor.rowcount
+
+
+def running_runs_with_background_ack(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT
+          r.id AS run_id,
+          r.chat_id AS chat_id,
+          d.telegram_message_id AS ack_message_id,
+          d.message_thread_id AS message_thread_id,
+          d.delivered_at AS ack_delivered_at
+        FROM runs r
+        JOIN channel_deliveries d ON d.run_id = r.id
+        WHERE r.status = 'running'
+          AND d.event_type = 'background_ack'
+          AND d.delivery_status = 'sent'
+          AND d.telegram_message_id IS NOT NULL
+        ORDER BY d.delivered_at DESC
+        """
+    ).fetchall()
+    seen: set[str] = set()
+    deduped: list[sqlite3.Row] = []
+    for row in rows:
+        run_id = str(row["run_id"] or "")
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        deduped.append(row)
+    return deduped
 
 
 def last_run(conn: sqlite3.Connection, chat_id: str) -> sqlite3.Row | None:
@@ -5207,24 +5318,6 @@ def looks_like_presence_ping(
     return wake_phrase_presence_ping(clean, config, allow_bare_name=True)
 
 
-def local_presence_reply_text(text: str, message_id: int) -> str:
-    compact = compact_presence_fragment(text)
-    english = prefers_english_local_reply(text)
-    if re.search(r"(测试|试试|反应|ping|hello|hi|hey)", compact, re.IGNORECASE):
-        variants = (
-            ("I hear you. I'm here.", "Here. This ping reached me.", "Got it. I'm awake.")
-            if english
-            else ("有反应。我在。", "在，这声能听见。", "收到。现在会接。")
-        )
-    else:
-        variants = (
-            ("Here. Want to chat or work?", "Here. Just call me.", "I'm here. Go ahead.")
-            if english
-            else ("在。你现在想聊天还是干活？", "在，叫我就行。", "我在。你说。")
-        )
-    return variants[message_id % len(variants)]
-
-
 def compact_ack_fragment(text: str, config: Config) -> str:
     compact = PRESENCE_PUNCT_RE.sub("", text.lower())
     compact = re.sub(r"[\ufe0e\ufe0f\U0001f3fb-\U0001f3ff]", "", compact)
@@ -5506,24 +5599,6 @@ def local_sticker_reaction_emoji(message: dict[str, Any]) -> str | None:
     return STICKER_REACTION_MAP.get(emoji)
 
 
-def local_ack_reaction_emoji(text: str, message: dict[str, Any], config: Config) -> str:
-    sticker_reaction = local_sticker_reaction_emoji(message)
-    if sticker_reaction:
-        return sticker_reaction
-    compact = compact_reaction_feedback_fragment(text, config)
-    if LAUGHTER_COMPACT_RE.fullmatch(compact) or re.search(r"[😂🤣😆😄😹]", compact):
-        return "😂"
-    if re.search(
-        r"(谢谢|谢了|谢啦|多谢|辛苦|ty|thx|thanks|thankyou|appreciateit|appreciateyou|🙏)",
-        compact,
-        re.IGNORECASE,
-    ):
-        return "❤️"
-    if POSITIVE_FEEDBACK_COMPACT_RE.fullmatch(compact) or re.search(r"[❤️❤🥰😍👏🙌]", compact):
-        return "❤️"
-    return "👍"
-
-
 def looks_like_explicit_task(text: str) -> bool:
     lowered = text.lower()
     patterns = [
@@ -5537,6 +5612,324 @@ def looks_like_explicit_task(text: str) -> bool:
         r"\b(go ahead|do it|start work|apply this|make the change)\b",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+AUTO_WORKER_LIGHT_EDIT_RE = re.compile(
+    r"(?:一行|一两行|两行|三行|几行|小改|小修|小修改|微调|改句|改一句|改个文案|改一句文案|措辞|错别字|拼写|"
+    r"\btypo\b|\bcopy\b|\bwording\b|\bone[- ]?line\b|\btiny\b|\bsmall edit\b)",
+    re.IGNORECASE,
+)
+AUTO_WORKER_FORCE_RE = re.compile(
+    r"(?:交给|派|开|让|找).{0,10}(?:worker|工人|子任务)|(?:worker|工人).{0,10}(?:做|干|跑|处理)|"
+    r"(?:重活|大活).{0,12}(?:worker|拆|派|交给|布置)",
+    re.IGNORECASE,
+)
+AUTO_WORKER_ACTION_RE = re.compile(
+    r"(?:查|看一下|看看|排查|排障|修|改|实现|接上|配置|部署|迁移|重构|跑|执行|验证|检查|"
+    r"debug|fix|inspect|investigate|implement|configure|deploy|patch|edit|run|verify)",
+    re.IGNORECASE,
+)
+AUTO_WORKER_INVESTIGATION_RE = re.compile(
+    r"(?:查一下|查查|排查|排障|调试|debug|investigate|inspect|"
+    r"(?:看一下|看看).{0,24}(?:为什么|怎么回事|咋回事|哪里|状态|配置|设置|问题|报错|错误|日志|代码|文件))",
+    re.IGNORECASE,
+)
+AUTO_WORKER_HEAVY_CONTEXT_RE = re.compile(
+    r"(?:代码|仓库|repo|文件|目录|日志|log|报错|错误|异常|测试|pytest|数据库|sqlite|db|jsonl|进程|"
+    r"端口|launchd|服务|runtime|session|thread|token|上下文|历史|消息|tg|telegram|bridge|worker|"
+    r"codex|app-server|all chats?|north|wechat|微信|app|群|群id|group|权限|allowed|allowlist|监控|设置|配置)",
+    re.IGNORECASE,
+)
+AUTO_WORKER_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(])(?:~?/|\.{1,2}/|/)[^\s`'\"\)]+|"
+    r"\b[\w.-]+\.(?:py|js|jsx|ts|tsx|json|jsonl|md|txt|ya?ml|toml|env|sqlite|db|log|plist)\b",
+    re.IGNORECASE,
+)
+AUTO_WORKER_ATTACHMENT_RE = re.compile(r"\blocal_path\s*=|/incoming/|/tmp/|/Users/", re.IGNORECASE)
+
+
+def auto_worker_light_edit(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    return bool(clean and AUTO_WORKER_LIGHT_EDIT_RE.search(clean) and not AUTO_WORKER_FORCE_RE.search(clean))
+
+
+def auto_worker_taskish(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    return bool(clean and (AUTO_WORKER_ACTION_RE.search(clean) or looks_like_explicit_task(clean)))
+
+
+def auto_worker_task_clause_count(text: str) -> int:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return 0
+    clauses = re.split(
+        r"(?:[。；;\n]+|(?:，|,)?\s*(?:然后|再|顺手|另外|还有|同时|接着|最后|并且|以及|and then|also|then|next)\s*)",
+        clean,
+    )
+    return sum(1 for clause in clauses if auto_worker_taskish(clause))
+
+
+def auto_worker_batch_reason(items: list[BatchItem]) -> str | None:
+    batch_text = "\n\n".join(item.text for item in items)
+    task_items = [
+        item
+        for item in items
+        if item.explicitly_addressed and auto_worker_taskish(item.text) and not auto_worker_light_edit(item.text)
+    ]
+    if len(task_items) >= 2:
+        return "multi-message task bundle"
+    return auto_worker_heavy_reason(batch_text, batch_text)
+
+
+def auto_worker_heavy_reason(text: str, prompt_text: str | None = None) -> str | None:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    prompt = str(prompt_text or "")
+    if not clean and not prompt.strip():
+        return None
+    combined = f"{clean}\n{prompt}"
+    if AUTO_WORKER_FORCE_RE.search(combined):
+        return "explicit worker delegation"
+    if auto_worker_light_edit(clean):
+        return None
+    if AUTO_WORKER_INVESTIGATION_RE.search(clean):
+        return "execution or investigation task"
+    task_clause_count = auto_worker_task_clause_count(clean)
+    if task_clause_count >= 3:
+        return "multi-step execution task"
+    if task_clause_count >= 2 and (
+        AUTO_WORKER_HEAVY_CONTEXT_RE.search(combined) or AUTO_WORKER_FILE_PATH_RE.search(combined)
+    ):
+        return "multi-step execution task"
+    if AUTO_WORKER_ATTACHMENT_RE.search(prompt) and AUTO_WORKER_ACTION_RE.search(clean):
+        return "file or media inspection task"
+    if AUTO_WORKER_FILE_PATH_RE.search(combined) and AUTO_WORKER_ACTION_RE.search(clean):
+        return "file-scoped execution task"
+    if AUTO_WORKER_ACTION_RE.search(clean) and AUTO_WORKER_HEAVY_CONTEXT_RE.search(combined):
+        return "debugging or runtime inspection task"
+    if looks_like_explicit_task(clean) and AUTO_WORKER_HEAVY_CONTEXT_RE.search(combined):
+        return "larger execution task"
+    if len(prompt) > 1200 and looks_like_explicit_task(clean):
+        return "large enriched task"
+    return None
+
+
+def build_auto_worker_task(
+    chat: Chat,
+    sender: Sender,
+    message_id: int,
+    message_thread_id: int | None,
+    prompt_text: str,
+    trigger_text: str,
+    *,
+    reason: str,
+) -> str:
+    thread_line = f"- message_thread_id: {message_thread_id}\n" if message_thread_id is not None else ""
+    return (
+        "Telegram auto-worker task.\n\n"
+        "Origin:\n"
+        f"- reason: {reason}\n"
+        f"- chat_id: {chat.chat_id}\n"
+        f"- chat_type: {chat.chat_type}\n"
+        f"- chat_title: {chat.title or '(none)'}\n"
+        f"- sender: {sender.name} ({sender.user_id})\n"
+        f"- message_id: {message_id}\n"
+        f"{thread_line}"
+        "\nOwner request:\n"
+        f"{trigger_text.strip() or prompt_text.strip()}\n\n"
+        "Task context:\n"
+        f"{prompt_text.strip()}\n\n"
+        "Execution notes:\n"
+        "- Work in the configured cwd unless the request clearly points elsewhere.\n"
+        "- Use existing repo patterns and keep changes scoped.\n"
+        "- Run focused verification when code changes or behavior risk justify it.\n"
+        "- Do not send Telegram messages or use Telegram channel tools; the supervisor will report your result.\n"
+        "- Final response should be concise: changed files, checks run, result, and any needed owner input.\n"
+    )
+
+
+def build_auto_worker_batch_task(chat: Chat, items: list[BatchItem], *, reason: str) -> str:
+    latest = items[-1]
+    sender = latest.sender
+    messages = []
+    for item in items:
+        thread = f" thread_id={item.message_thread_id}" if item.message_thread_id is not None else ""
+        messages.append(
+            f"[message_id={item.message_id}{thread} sender={item.sender.name} user_id={item.sender.user_id}]\n"
+            f"{item.text.strip()}"
+        )
+    return build_auto_worker_task(
+        chat,
+        sender,
+        latest.message_id,
+        latest.message_thread_id,
+        "\n\n".join(messages),
+        latest.text,
+        reason=reason,
+    )
+
+
+def auto_worker_title(text: str, reason: str) -> str:
+    title = truncate_oneline(text, 60)
+    if not title:
+        title = reason
+    return f"TG worker: {title}"
+
+
+def task_ack_focus(text: str) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not clean:
+        return "我来处理"
+    if re.search(r"(tg|telegram|worker|不回消息|没回复|日志|log|报错|错误|异常|进程|launchd|runtime|session)", clean):
+        return "我先查运行现场"
+    if re.search(r"(数据库|sqlite|db|jsonl|队列|状态)", clean):
+        return "我先看数据和状态"
+    if re.search(r"(测试|pytest|验证|检查|check|verify|test)", clean):
+        return "我先跑检查"
+    if re.search(r"(部署|发布|上线|deploy|release)", clean):
+        return "我去处理部署"
+    if re.search(r"(实现|接上|配置|迁移|重构|implement|configure|migrate)", clean):
+        return "我去接这块"
+    if re.search(r"(修|改|fix|patch|edit)", clean):
+        return "我先定位并改掉"
+    if re.search(r"(查|看一下|看看|inspect|debug|investigate)", clean):
+        return "我先看现场"
+    return "我来处理"
+
+
+def direct_background_ack_text(trigger_text: str) -> str:
+    return f"{task_ack_focus(trigger_text)}；这轮可能会久一点，我让它在后台继续，做完回来交结果。"
+
+
+def auto_worker_ack_text(reason: str, trigger_text: str) -> str:
+    if reason == "multi-message task bundle":
+        return "我把这几条任务派给 worker；主线程先不混在一起，等结果出来我验收后回。"
+    if reason == "multi-step execution task":
+        return "这件事步骤有点多，我派 worker 跑；我留在这里看结果、验收后回。"
+    if reason == "explicit worker delegation":
+        return "我按你的意思派 worker；主线程留着验收，跑完我回来交结果。"
+    return f"{task_ack_focus(trigger_text)}；我派 worker 去做，主线程留着验收。"
+
+
+def auto_worker_supervision_note(reason: str) -> str:
+    reason_text = f" Reason: {reason}." if reason else ""
+    return (
+        "Auto-worker supervision checkpoint for the Telegram resident. "
+        "Inspect worker status with codex_worker_status. If it is still running, set another codex_worker_alarm. "
+        "If it is complete or needs input, decide as the Telegram resident whether and how to reply; do not forward raw worker output blindly. "
+        "Use codex_worker_continue with the same task_id/session when follow-up work is needed."
+        f"{reason_text}"
+    )
+
+
+def worker_chat_id_from_state(state: dict[str, Any], alarms_by_task: dict[str, list[dict[str, Any]]]) -> str:
+    delivery = state.get("auto_delivery")
+    if isinstance(delivery, dict):
+        chat_id = str(delivery.get("chat_id") or "").strip()
+        if chat_id:
+            return chat_id
+    task_id = str(state.get("task_id") or "").strip()
+    for alarm in alarms_by_task.get(task_id, []):
+        chat_id = str(alarm.get("chat_id") or "").strip()
+        if chat_id:
+            return chat_id
+    return ""
+
+
+def worker_timestamp_recent(value: Any, *, seconds: int = 30 * 60) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds() <= seconds
+
+
+def worker_state_relevant_for_routing(state: dict[str, Any], alarms: list[dict[str, Any]]) -> bool:
+    status = str(state.get("status") or "").strip()
+    if status in {"running", "needs_input"}:
+        return True
+    if any(str(alarm.get("status") or "") in {"pending", "firing"} for alarm in alarms):
+        return True
+    if status in {"complete", "failed"} and worker_timestamp_recent(state.get("updated_at") or state.get("finished_at")):
+        return True
+    return False
+
+
+def active_worker_context_items(config: Config, chat_id: str, *, limit: int = 3) -> list[str]:
+    alarms_by_task: dict[str, list[dict[str, Any]]] = {}
+    for alarm in list_worker_alarms(config):
+        task_id = str(alarm.get("task_id") or "").strip()
+        if task_id:
+            alarms_by_task.setdefault(task_id, []).append(alarm)
+    lines: list[str] = []
+    for state in list_worker_states(config):
+        task_id = str(state.get("task_id") or "").strip()
+        if not task_id or worker_chat_id_from_state(state, alarms_by_task) != chat_id:
+            continue
+        refreshed = refresh_worker_state(config, state)
+        alarms = alarms_by_task.get(task_id, [])
+        if not worker_state_relevant_for_routing(refreshed, alarms):
+            continue
+        delivery = refreshed.get("auto_delivery")
+        reason = str(delivery.get("reason") or "").strip() if isinstance(delivery, dict) else ""
+        alarm = alarms[0] if alarms else {}
+        note = str(alarm.get("note") or "").strip()
+        due_at = str(alarm.get("due_at") or "").strip()
+        status = str(refreshed.get("status") or "unknown").strip()
+        session_id = str(refreshed.get("session_id") or "(pending)").strip()
+        title = truncate_oneline(str(refreshed.get("title") or task_id), 90)
+        detail = reason or truncate_oneline(note, 120)
+        suffix = f"; note={detail}" if detail else ""
+        due = f"; next_alarm={due_at}" if due_at else ""
+        lines.append(
+            f"- task_id={task_id}; status={status}; session_id={session_id}; title={title}{due}{suffix}"
+        )
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def active_worker_context_block(config: Config, chat_id: str) -> str:
+    lines = active_worker_context_items(config, chat_id)
+    if not lines:
+        return ""
+    return (
+        '<worker_context purpose="telegram resident routing">\n'
+        "You are the Telegram resident. Use this private worker context to decide whether the current message "
+        "belongs in an existing worker session or should start a new worker. Continue an existing worker with "
+        "codex_worker_continue when the user is adding instructions, correcting scope, or unblocking that same task; "
+        "start a new worker when it is a separate task. For tiny one-line edits or simple answers, handle it directly.\n"
+        + "\n".join(lines)
+        + "\n</worker_context>"
+    )
+
+
+def chat_has_worker_context(config: Config, chat_id: str) -> bool:
+    return bool(active_worker_context_items(config, chat_id, limit=1))
+
+
+def busy_parallel_reply_text(text: str) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if re.search(
+        r"(?:需要|要不要|用不用|需不需要|是不是).{0,16}我.{0,16}(?:先|现在)?.{0,24}"
+        r"(?:加|拉|邀请|授权|设置|发|给|准备|开)",
+        clean,
+    ):
+        if re.search(
+            r"(?:(?:加|拉|邀请).{0,12}(?:你|我|bot|机器人|序|codex)|"
+            r"(?:你|我|bot|机器人|序|codex).{0,12}(?:加|拉|邀请))",
+            clean,
+            re.IGNORECASE,
+        ):
+            return "可以，先把我加进去。上一条我这边继续跑着；加好以后继续说，我会接上。"
+        return "可以，你先做这步。上一条我这边继续跑着；你发来的补充我看得到。"
+    if re.search(r"(?:吗|么|嘛|\?)$", clean):
+        return "可以继续问。上一条还在后台跑，但我看得到这边的新消息；能本地答的我先答，需要并行处理的我会另派 worker。"
+    return "上一条还在后台跑，但你可以继续说；我看得到新消息，需要并行处理的我会另派 worker。"
 
 
 def looks_like_non_bot_quiet_statement(text: str) -> bool:
@@ -6285,72 +6678,6 @@ def looks_like_media_capability_question(text: str, message: dict[str, Any]) -> 
     return bool(MEDIA_CAPABILITY_VERB_RE.search(clean))
 
 
-def prefers_english_local_reply(text: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", text)) and not CJK_RE.search(text)
-
-
-def local_media_capability_reply_text(text: str = "") -> str:
-    clean = re.sub(r"\s+", " ", str(text or "")).strip()
-    english = prefers_english_local_reply(clean)
-    if clean and MEDIA_CAPABILITY_LIMIT_RE.search(clean):
-        if english:
-            return (
-                f"Yes. I can take up to {TELEGRAM_OUTBOUND_TOOL_MAX_FILES} local paths or file:// URIs per "
-                f"tool call; Telegram albums/files are split into batches of {TELEGRAM_MEDIA_GROUP_MAX_ITEMS}."
-            )
-        return (
-            f"能。一次最多接 {TELEGRAM_OUTBOUND_TOOL_MAX_FILES} 个本地路径或 file:// URI；图片按相册发，"
-            f"Telegram 每组 {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} 个，超了自动分批。文件、视频、音频也分批走文件。"
-        )
-    if clean and looks_like_media_format_capability_question(clean):
-        if english:
-            return (
-                "Images can go as .gif, .jpeg/.jpg, .png, or .webp photos. PDFs, docs, "
-                "spreadsheets, archives, video, and audio go as files; send uploads directly here."
-            )
-        return "图片支持 .gif、.jpeg/.jpg、.png、.webp；PDF、文档、表格、压缩包、视频和音频都按文件走。你直接发到 Telegram 就行。"
-    if clean and (
-        MEDIA_CAPABILITY_HOWTO_RE.search(clean)
-        or MEDIA_CAPABILITY_INBOUND_RE.search(clean)
-        or looks_like_user_sent_media_capability_question(clean)
-    ):
-        if english:
-            return (
-                "Send images, videos, voice/audio, or files directly in Telegram; I save them as "
-                "local_path references when I need to read them. To send files out, give me local paths "
-                "or file:// URIs."
-            )
-        return "直接在 Telegram 里发图片、视频、语音/音频或文件就行；我会按需下载成 local_path 再读。要我发出去时，给本地路径或 file:// URI。"
-    if clean and MEDIA_CAPABILITY_SEND_RE.search(clean):
-        if english:
-            return (
-                f"Yes. Images go as Telegram albums; PDFs, files, video, and audio go as files. Give me "
-                f"local paths or file:// URIs: up to {TELEGRAM_OUTBOUND_TOOL_MAX_FILES} items, split every "
-                f"{TELEGRAM_MEDIA_GROUP_MAX_ITEMS}."
-            )
-        return (
-            f"能。图片走相册，PDF/文件/视频/音频走文件；给本地路径或 file:// URI 就能发，多项最多 "
-            f"{TELEGRAM_OUTBOUND_TOOL_MAX_FILES} 个，每 {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} 个分批。"
-        )
-    if clean and MEDIA_CAPABILITY_READ_RE.search(clean):
-        if english:
-            return (
-                "Yes. Send images, files, videos, or voice/audio directly here; I can inspect, read, "
-                "or listen to them. PDFs, spreadsheets, and archives are handled as files."
-            )
-        return "能。你直接把图、文件、视频或语音/音频发过来，我能看、读、听；PDF、表格、压缩包这些都按文件处理。"
-    if english:
-        return (
-            f"Yes. You can send images/files here for me to inspect, and I can send local paths or file:// URIs back: "
-            f"images as albums, PDFs/video/audio as files, up to {TELEGRAM_OUTBOUND_TOOL_MAX_FILES} paths "
-            f"split every {TELEGRAM_MEDIA_GROUP_MAX_ITEMS}."
-        )
-    return (
-        f"能。你直接发图/文件我能看也能读；我发出去时图片走相册，PDF/视频/音频按文件走，最多 "
-        f"{TELEGRAM_OUTBOUND_TOOL_MAX_FILES} 个路径或 file:// URI、每 {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} 个分批。"
-    )
-
-
 def looks_like_channel_topic(text: str) -> bool:
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
@@ -6419,64 +6746,6 @@ def looks_like_channel_status_question(text: str, message: dict[str, Any] | None
         or quiet_status_topic
         or context_concern
         or re.search(r"(?:省\s*token|token|每条都回|每条回复|quiet\s+window|quiet\s+mode)", clean, re.IGNORECASE)
-    )
-
-
-def local_channel_status_reply_text(
-    conn: sqlite3.Connection,
-    chat: Chat,
-    chat_row: sqlite3.Row,
-    policy: AccessPolicy,
-    config: Config,
-    text: str = "",
-) -> str:
-    mode = policy_value(chat_row["mode"] or policy.group_policy or "mention")
-    english = prefers_english_local_reply(text)
-    if chat.chat_type == "private":
-        if english:
-            return (
-                "Private chat is direct: I answer normal messages. Tiny presence checks, media capability questions, "
-                "and simple acknowledgements use local fast paths to save tokens."
-            )
-        return "私聊里基本是直接回。小的在不在、媒体能力问题和简单确认会走本地快答/反应，省掉一轮 Codex。"
-
-    batch_mode = group_response_mode(conn, chat.chat_id)
-    shape = message_shape(conn, chat.chat_id)
-    quiet_active = group_quiet_window_active(conn, chat.chat_id)
-    quiet_topic = bool(re.search(r"(?:潜水|静音|安静|少回|少说|看着|quiet|silent)", text, re.IGNORECASE))
-    quiet_hint_en = " Say `you can reply now` or mention me if you want me back." if quiet_topic else ""
-    quiet_hint_zh = " 要恢复可以说“可以说话了”或直接叫我。" if quiet_topic else ""
-    context_concern = bool(CHANNEL_STATUS_CONTEXT_CONCERN_RE.search(text))
-    if mode == "all":
-        mode_detail_en = "all: allowed messages can enter Codex"
-        mode_detail_zh = "all：允许消息都会进 Codex"
-    elif is_ai_decide_policy(mode):
-        mode_detail_en = "decide: direct calls, clear tasks, media/channel questions, and anchored follow-ups can enter Codex"
-        mode_detail_zh = "decide：叫我、明确任务、媒体/频道问题、锚定追问才会进 Codex"
-    else:
-        mode_detail_en = "mention: I enter Codex only when addressed or replied to"
-        mode_detail_zh = "mention：只有叫我或回复我时才进 Codex"
-
-    if english:
-        context_note_en = (
-            " Quiet changes visible replies; context tracking continues."
-            if context_concern
-            else ""
-        )
-        return (
-            f"Current group mode is {mode_detail_en}. Batch mode is {batch_mode}; bubble shape is {shape}. "
-            f"Temporary quiet window is {'on' if quiet_active else 'off'}. "
-            "Background chatter is stored as context or handled locally, so Codex turns stay focused on useful moments."
-            f"{context_note_en}"
-            f"{quiet_hint_en}"
-        )
-    context_note_zh = " 少回/静音只是少出声，不是漏读；该进上下文的还是会保留。" if context_concern else ""
-    return (
-        f"现在群聊是 {mode_detail_zh}。合批：{batch_mode}；气泡：{shape}。"
-        f"临时静音窗口：{'开' if quiet_active else '关'}。"
-        "普通背景会存上下文或本地处理，不会每条都花一轮 Codex。"
-        f"{context_note_zh}"
-        f"{quiet_hint_zh}"
     )
 
 
@@ -7568,6 +7837,9 @@ def status_for_chat(
         f"directBackground: {bool(config.direct_background)}",
         f"directBackgroundAfterSeconds: {config.direct_background_after_seconds:g}",
         f"directBackgroundTimeoutSeconds: {config.direct_background_timeout_seconds}",
+        f"autoWorker: {bool(config.auto_worker)}",
+        f"autoWorkerCheckSeconds: {config.auto_worker_check_seconds}",
+        f"autoWorkerResultChars: {config.auto_worker_result_chars}",
         f"mediaToolMaxPaths: {TELEGRAM_OUTBOUND_TOOL_MAX_FILES}",
         f"mediaToolBatchSize: {TELEGRAM_MEDIA_GROUP_MAX_ITEMS}",
         f"bypassPermissions: {bool(config.bypass_permissions)}",
@@ -8133,6 +8405,12 @@ def build_prompt(
             exclude={(chat.chat_id, message_id)},
         )
     )
+    recent_group_lines = recent_group_trigger_context_lines(
+        conn,
+        chat,
+        config,
+        exclude={(chat.chat_id, message_id)},
+    )
     for row in rows:
         context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
@@ -8155,6 +8433,15 @@ def build_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
+        worker_context = active_worker_context_block(config, chat.chat_id)
+        if worker_context:
+            parts.append(worker_context)
+        if recent_group_lines:
+            parts.append(
+                '<recent_chat_window last="5" purpose="immediate group context before the current trigger">\n'
+                + "\n".join(recent_group_lines)
+                + "\n</recent_chat_window>"
+            )
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -8214,6 +8501,8 @@ def build_prompt(
         if reaction_feedback
         else ""
     )
+    worker_context = active_worker_context_block(config, chat.chat_id)
+    worker_context_block = f"Active worker context:\n{worker_context}\n\n" if worker_context else ""
     return (
         f"{stable_instructions}"
         "Telegram inbound message:\n"
@@ -8231,6 +8520,9 @@ def build_prompt(
         "Recent Telegram context (source-labeled, excludes current message):\n"
         f"{recent_context}"
         f"{handoff_block}\n\n"
+        "Immediate same-chat context (last five messages before the current trigger):\n"
+        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
+        f"{worker_context_block}"
         f"{reaction_feedback_block}"
         "Current Telegram message:\n"
         f"{text}\n\n"
@@ -8276,6 +8568,12 @@ def build_batch_prompt(
 ) -> str:
     context_lines: list[str] = []
     exclude_keys = {(chat.chat_id, item.message_id) for item in items}
+    recent_group_lines = recent_group_trigger_context_lines(
+        conn,
+        chat,
+        config,
+        exclude=exclude_keys,
+    )
     for row in prompt_context_rows(
         conn,
         chat.chat_id,
@@ -8325,6 +8623,12 @@ def build_batch_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
+        if recent_group_lines:
+            parts.append(
+                '<recent_chat_window last="5" purpose="immediate group context before this batch">\n'
+                + "\n".join(recent_group_lines)
+                + "\n</recent_chat_window>"
+            )
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -8387,6 +8691,8 @@ def build_batch_prompt(
         "Recent Telegram context (source-labeled, excludes this batch):\n"
         f"{recent_context}"
         f"{handoff_block}\n\n"
+        "Immediate same-chat context (last five messages before this batch):\n"
+        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
         f"{reaction_feedback_block}"
         "Latest short batch:\n"
         f"{chr(10).join(batch_lines)}\n\n"
@@ -8725,10 +9031,11 @@ def run_codex_exec(
     desktop_title: str | None = None,
     desktop_preview: str | None = None,
     timeout_seconds: int | None = None,
+    run_id: str | None = None,
 ) -> RunResult:
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
-    run_id = safe_run_id(chat_id, message_id)
+    run_id = run_id or safe_run_id(chat_id, message_id)
     prompt_path = config.out_dir / f"{run_id}.prompt.txt"
     reply_path = config.out_dir / f"{run_id}.reply.txt"
     channel_events_path = channel_events_path_for_run(config, run_id) if config.channel_tools else None
@@ -8888,10 +9195,11 @@ def run_codex_app_server(
     desktop_title: str | None = None,
     desktop_preview: str | None = None,
     timeout_seconds: int | None = None,
+    run_id: str | None = None,
 ) -> RunResult:
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
-    run_id = safe_run_id(chat_id, message_id)
+    run_id = run_id or safe_run_id(chat_id, message_id)
     prompt_path = config.out_dir / f"{run_id}.prompt.txt"
     reply_path = config.out_dir / f"{run_id}.reply.txt"
     channel_events_path = channel_events_path_for_run(config, run_id)
@@ -9064,6 +9372,7 @@ def run_codex(
     desktop_preview: str | None = None,
     app_client: CodexAppServerClient | None = None,
     timeout_seconds: int | None = None,
+    run_id: str | None = None,
 ) -> RunResult:
     if config.engine == "app-server":
         if app_client is None:
@@ -9080,6 +9389,7 @@ def run_codex(
             desktop_title,
             desktop_preview,
             timeout_seconds,
+            run_id,
         )
     return run_codex_exec(
         conn,
@@ -9092,6 +9402,7 @@ def run_codex(
         desktop_title,
         desktop_preview,
         timeout_seconds,
+        run_id,
     )
 
 
@@ -9185,6 +9496,8 @@ def start_typing_feedback(
 
 
 def run_channel_mcp_server() -> None:
+    if os.environ.get("CODEX_TELEGRAM_WORKER") == "1":
+        raise SystemExit("Telegram channel tools are disabled inside Codex worker processes.")
     try:
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:
@@ -9750,7 +10063,17 @@ def worker_read_text(path: Any, limit: int = WORKER_RESULT_PREVIEW_CHARS) -> str
         text = Path(str(path)).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
-    return truncate_context_text(text, limit)
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = f"\n... [truncated {len(text) - limit} chars] ...\n"
+    if limit <= len(marker) + 40:
+        return text[: max(1, limit)].rstrip() + f"\n... [truncated {len(text) - limit} chars]"
+    visible = max(1, limit - len(marker))
+    head = max(1, int(visible * 0.65))
+    tail = max(0, visible - head)
+    if tail <= 0:
+        return text[:head].rstrip() + marker.rstrip()
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
 
 
 def worker_find_session_id_in_obj(obj: Any) -> str | None:
@@ -9820,6 +10143,8 @@ def build_worker_prompt(task: str) -> str:
         "Keep changes scoped to the requested behavior and existing patterns.\n"
         "Use focused verification that matches the risk of the change.\n"
         "When finished, report files changed, checks run, and a concise result.\n"
+        "Do not send Telegram messages, start Telegram channel tools, or speak to the Telegram chat directly. "
+        "Only the Telegram resident supervisor decides what is visible in Telegram.\n"
         "End with a status line: `status: complete` or `status: needs_input`.\n"
         "The Telegram supervisor will read your final response and decide how to speak to the owner.\n\n"
         f"Task:\n{task.strip()}\n"
@@ -9830,6 +10155,7 @@ def build_worker_continue_prompt(task: str) -> str:
     return (
         "Telegram supervisor follow-up for this worker session.\n"
         "Continue from your existing context and carry the task to the next useful stopping point.\n"
+        "Do not send Telegram messages or use Telegram channel tools; return private worker output only.\n"
         "End with a status line: `status: complete` or `status: needs_input`.\n\n"
         f"Follow-up:\n{task.strip()}\n"
     )
@@ -9849,10 +10175,12 @@ def build_worker_alarm_prompt(alarm: dict[str, Any]) -> str:
         f'chat_id="{alarm.get("chat_id")}"{thread_attr} due_at="{alarm.get("due_at")}">\n'
         "Your scheduled worker check is due.\n"
         "</worker_alarm>\n\n"
+        "You are the Telegram resident supervisor, not the worker. The worker cannot speak in Telegram. "
         "Use codex_worker_status with this task_id to inspect the worker. "
+        "Use codex_worker_continue with the same task_id when the worker has a session_id and needs follow-up work. "
         "If the worker is still running and another check would help, set a new codex_worker_alarm. "
         "If the worker is complete or needs input, decide whether a visible Telegram update helps the owner now. "
-        "When a visible update helps, use reply with a concise result, changed files, verification, and the next useful choice. "
+        "When a visible update helps, use reply yourself with a concise result, changed files, verification, and the next useful choice. "
         "When no visible update helps yet, keep the Telegram chat unchanged and finish privately with `(silent)`."
         f"{note_block}"
     )
@@ -9959,6 +10287,8 @@ def start_codex_worker(
     stdout_handle = jsonl_path.open("a", encoding="utf-8")
     stderr_handle = stderr_path.open("a", encoding="utf-8")
     try:
+        worker_env = os.environ.copy()
+        worker_env["CODEX_TELEGRAM_WORKER"] = "1"
         proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -9966,6 +10296,7 @@ def start_codex_worker(
             stderr=stderr_handle,
             text=True,
             cwd=str(workdir),
+            env=worker_env,
         )
     except OSError as exc:
         stdout_handle.close()
@@ -10593,7 +10924,8 @@ def app_server_base_instructions(config: Config) -> str:
         "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
         "(reply, send_photos, send_files, react, edit_message). "
         "Codex worker tools (codex_worker_start, codex_worker_status, codex_worker_continue, codex_worker_alarm) "
-        "manage background execution, private check points, and private tool results for your supervision. "
+        "manage background execution, private check points, and private tool results for your supervision; workers do not "
+        "speak in Telegram, and you remain the Telegram resident who inspects, continues, and reports when useful. "
         "Normal final answers stay in private transcript output for Codex Desktop. "
         "For tool chat_id, omit it for the current chat or pass current/here/this explicitly; "
         "owner/owner_private/dm mean the single owner private chat when exactly one owner is configured. "
@@ -10958,8 +11290,24 @@ class CodexAppServerClient:
             state, error = start_codex_worker(self.config, task=task, title=title, cwd=cwd)
             if error or state is None:
                 return self._dynamic_tool_result(error or "worker start failed", success=False)
+            alarm_text = ""
+            task_id = str(state.get("task_id") or "").strip()
+            if task_id and self.current_turn_chat_id:
+                alarm = schedule_worker_alarm(
+                    self.config,
+                    task_id=task_id,
+                    seconds=self.config.auto_worker_check_seconds,
+                    chat_id=self.current_turn_chat_id,
+                    message_thread_id=self.current_turn_message_thread_id,
+                    note=(
+                        "Supervisor checkpoint for a worker you started from Telegram. "
+                        "Inspect status as the Telegram resident, continue the same task_id/session if needed, "
+                        "and decide whether a visible Telegram reply helps."
+                    ),
+                )
+                alarm_text = f"\nSupervisor alarm scheduled: {alarm['alarm_id']} due_at: {alarm['due_at']}"
             return self._dynamic_tool_result(
-                "Codex worker started:\n" + format_worker_state(state, include_result=False),
+                "Codex worker started:\n" + format_worker_state(state, include_result=False) + alarm_text,
                 success=True,
             )
 
@@ -11299,9 +11647,13 @@ class BotService:
 
     def serve(self) -> None:
         with closing(connect_db(self.config)) as conn:
-            interrupted = mark_running_runs_interrupted(conn, "daemon restarted before run completed")
+            interrupted_reason = "daemon restarted before run completed"
+            interrupted_background_runs = running_runs_with_background_ack(conn)
+            interrupted = mark_running_runs_interrupted(conn, interrupted_reason)
             if interrupted:
                 print(f"{utc_now()} marked {interrupted} interrupted run(s)", flush=True)
+            if interrupted_background_runs:
+                self.notify_interrupted_background_runs(conn, interrupted_background_runs, interrupted_reason)
             self.refresh_bot_info(conn)
             print(
                 f"{SERVICE_NAME} running as @{self.bot_username or 'unknown'} "
@@ -11310,6 +11662,8 @@ class BotService:
             )
             if self.config.desktop_outbound:
                 threading.Thread(target=self.desktop_outbound_loop, daemon=True).start()
+            if self.config.auto_worker:
+                threading.Thread(target=self.auto_worker_supervision_loop, daemon=True).start()
             if self.config.engine == "app-server":
                 threading.Thread(target=self.worker_alarm_loop, daemon=True).start()
             while True:
@@ -11349,6 +11703,116 @@ class BotService:
                 time.sleep(5)
             else:
                 time.sleep(2)
+
+    def auto_worker_supervision_loop(self) -> None:
+        while True:
+            try:
+                self.poll_auto_worker_supervision_once()
+            except Exception as exc:
+                print(f"{utc_now()} auto worker supervision error: {exc}", file=sys.stderr, flush=True)
+                time.sleep(5)
+            else:
+                time.sleep(self.config.auto_worker_check_seconds)
+
+    def poll_auto_worker_deliveries_once(self) -> int:
+        return self.poll_auto_worker_supervision_once()
+
+    def poll_auto_worker_supervision_once(self) -> int:
+        if not self.config.auto_worker:
+            return 0
+        processed = 0
+        for state in list_worker_states(self.config):
+            delivery = state.get("auto_delivery")
+            if not isinstance(delivery, dict) or delivery.get("status") != "pending":
+                continue
+            task_id = str(state.get("task_id") or "").strip()
+            chat_id = str(delivery.get("chat_id") or "").strip()
+            if not task_id or not chat_id:
+                continue
+            alarm = schedule_worker_alarm(
+                self.config,
+                task_id=task_id,
+                seconds=self.config.auto_worker_check_seconds,
+                chat_id=chat_id,
+                message_thread_id=int_or_none(delivery.get("message_thread_id")),
+                note=auto_worker_supervision_note(str(delivery.get("reason") or "")),
+            )
+            delivery["status"] = "supervised"
+            delivery["alarm_id"] = alarm["alarm_id"]
+            delivery["alarm_due_at"] = alarm["due_at"]
+            state["auto_delivery"] = delivery
+            write_worker_state(self.config, state)
+            processed += 1
+        return processed
+
+    def notify_interrupted_background_runs(
+        self,
+        conn: sqlite3.Connection,
+        runs: list[sqlite3.Row],
+        reason: str,
+    ) -> int:
+        sent_count = 0
+        for row in runs:
+            run_id = str(row["run_id"] or "").strip()
+            chat_id = str(row["chat_id"] or "").strip()
+            if not run_id or not chat_id:
+                continue
+            thread_id = int_or_none(row["message_thread_id"])
+            delivery_error = ""
+            message_ids: list[int] = []
+            try:
+                message_ids = send_message(
+                    self.config,
+                    chat_id,
+                    INTERRUPTED_BACKGROUND_NOTICE_TEXT,
+                    message_thread_id=thread_id,
+                )
+            except Exception as exc:
+                message_ids = exc.message_ids if isinstance(exc, TelegramSendError) else []
+                delivery_error = str(exc)
+            if message_ids:
+                sent_count += len(message_ids)
+                for telegram_message_id in message_ids:
+                    record_channel_delivery(
+                        conn,
+                        run_id,
+                        chat_id,
+                        -3,
+                        telegram_message_id,
+                        None,
+                        thread_id,
+                        INTERRUPTED_BACKGROUND_NOTICE_TEXT,
+                        event_type="interrupted_notice",
+                    )
+            if delivery_error:
+                record_channel_delivery(
+                    conn,
+                    run_id,
+                    chat_id,
+                    -3,
+                    None,
+                    None,
+                    thread_id,
+                    INTERRUPTED_BACKGROUND_NOTICE_TEXT,
+                    event_type="interrupted_notice",
+                    delivery_status="failed",
+                    error=delivery_error,
+                )
+            elif not message_ids:
+                record_channel_delivery(
+                    conn,
+                    run_id,
+                    chat_id,
+                    -3,
+                    None,
+                    None,
+                    thread_id,
+                    INTERRUPTED_BACKGROUND_NOTICE_TEXT,
+                    event_type="interrupted_notice",
+                    delivery_status="failed",
+                    error=f"Telegram sendMessage returned no message id after {reason}",
+                )
+        return sent_count
 
     def poll_worker_alarms_once(self) -> int:
         if self.config.engine != "app-server" or self.app_server is None:
@@ -11716,95 +12180,10 @@ class BotService:
             )
             return
 
-        if not defer_group_decision_to_model and self.maybe_send_local_recent_prompt_decline_reaction(
-            conn,
-            chat,
-            chat_row,
-            sender,
-            message_id,
-            thread_id,
-            text,
-            message,
-            policy,
-        ):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_recent_ack_reaction(
-            conn,
-            chat,
-            chat_row,
-            sender,
-            message_id,
-            thread_id,
-            text,
-            message,
-            policy,
-        ):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_media_capability_reply(
-            conn,
-            chat,
-            chat_row,
-            sender,
-            policy,
-            message_id,
-            thread_id,
-            text,
-            message,
-        ):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_channel_status_reply(
-            conn,
-            chat,
-            chat_row,
-            sender,
-            policy,
-            message_id,
-            thread_id,
-            text,
-            message,
-        ):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_directed_reaction(
-            conn,
-            chat,
-            chat_row,
-            sender,
-            message_id,
-            thread_id,
-            text,
-            message,
-            policy,
-        ):
-            return
-
         if not self.should_call_codex(conn, chat, chat_row, sender, text, message, policy):
             return
 
         if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_ack_reaction(
-            conn,
-            chat,
-            message_id,
-            thread_id,
-            text,
-            message,
-        ):
-            return
-
-        if not defer_group_decision_to_model and self.maybe_send_local_presence_reply(
-            conn,
-            chat,
-            message_id,
-            thread_id,
-            text,
-            message,
-        ):
             return
 
         if enriched_text is None:
@@ -11966,8 +12345,12 @@ class BotService:
         trigger_text: str,
         *,
         timeout_seconds: int | None = None,
+        run_id: str | None = None,
     ) -> RunResult:
         with closing(connect_db(self.config)) as conn:
+            run_kwargs: dict[str, Any] = {"timeout_seconds": timeout_seconds}
+            if run_id is not None:
+                run_kwargs["run_id"] = run_id
             return run_codex(
                 conn,
                 self.config,
@@ -11979,7 +12362,7 @@ class BotService:
                 desktop_title_for_context(self.config, chat),
                 desktop_preview_for_context(self.config, chat, trigger_text),
                 self.app_server,
-                timeout_seconds,
+                **run_kwargs,
             )
 
     def deliver_bridge_error(
@@ -12092,17 +12475,19 @@ class BotService:
         message_thread_id: int | None,
         *,
         run_id: str,
+        trigger_text: str,
         allow_silent_reply: bool,
         explicitly_addressed: bool,
     ) -> None:
         if not self.should_send_direct_background_ack(allow_silent_reply, explicitly_addressed):
             return
+        ack_text = direct_background_ack_text(trigger_text)
         delivery_error = ""
         try:
             message_ids = send_message(
                 self.config,
                 chat.chat_id,
-                DIRECT_BACKGROUND_ACK_TEXT,
+                ack_text,
                 message_thread_id=message_thread_id,
             )
         except Exception as exc:
@@ -12119,7 +12504,7 @@ class BotService:
                         telegram_message_id,
                         None,
                         message_thread_id,
-                        DIRECT_BACKGROUND_ACK_TEXT,
+                        ack_text,
                         event_type="background_ack",
                     )
             if delivery_error:
@@ -12131,7 +12516,7 @@ class BotService:
                     None,
                     None,
                     message_thread_id,
-                    DIRECT_BACKGROUND_ACK_TEXT,
+                    ack_text,
                     event_type="background_ack",
                     delivery_status="failed",
                     error=delivery_error,
@@ -12145,11 +12530,180 @@ class BotService:
                     None,
                     None,
                     message_thread_id,
-                    DIRECT_BACKGROUND_ACK_TEXT,
+                    ack_text,
                     event_type="background_ack",
                     delivery_status="failed",
                     error="Telegram sendMessage returned no message id",
                 )
+
+    def auto_worker_allowed(self, allow_silent_reply: bool, explicitly_addressed: bool) -> bool:
+        return self.config.auto_worker and (not allow_silent_reply or explicitly_addressed)
+
+    def auto_worker_decision_for_single(
+        self,
+        chat: Chat,
+        sender: Sender,
+        message_id: int,
+        message_thread_id: int | None,
+        prompt_text: str,
+        trigger_text: str,
+        *,
+        allow_silent_reply: bool,
+        explicitly_addressed: bool,
+    ) -> AutoWorkerDecision | None:
+        if not self.auto_worker_allowed(allow_silent_reply, explicitly_addressed):
+            return None
+        if chat_has_worker_context(self.config, chat.chat_id):
+            return None
+        reason = auto_worker_heavy_reason(trigger_text, prompt_text)
+        if reason is None:
+            return None
+        title = auto_worker_title(trigger_text or prompt_text, reason)
+        task = build_auto_worker_task(
+            chat,
+            sender,
+            message_id,
+            message_thread_id,
+            prompt_text,
+            trigger_text,
+            reason=reason,
+        )
+        return AutoWorkerDecision(reason=reason, title=title, task=task)
+
+    def auto_worker_decision_for_batch(self, chat: Chat, items: list[BatchItem]) -> AutoWorkerDecision | None:
+        if not self.config.auto_worker or not any(item.explicitly_addressed for item in items):
+            return None
+        batch_text = "\n\n".join(item.text for item in items)
+        reason = auto_worker_batch_reason(items)
+        if reason is None:
+            return None
+        title = auto_worker_title(items[-1].text if items else batch_text, reason)
+        task = build_auto_worker_batch_task(chat, items, reason=reason)
+        return AutoWorkerDecision(reason=reason, title=title, task=task)
+
+    def register_auto_worker_delivery(
+        self,
+        state: dict[str, Any],
+        chat: Chat,
+        message_id: int,
+        message_thread_id: int | None,
+        decision: AutoWorkerDecision,
+    ) -> dict[str, Any]:
+        alarm = schedule_worker_alarm(
+            self.config,
+            task_id=str(state.get("task_id") or ""),
+            seconds=self.config.auto_worker_check_seconds,
+            chat_id=chat.chat_id,
+            message_thread_id=message_thread_id,
+            note=auto_worker_supervision_note(decision.reason),
+        )
+        state["auto_delivery"] = {
+            "status": "supervised",
+            "chat_id": chat.chat_id,
+            "message_id": message_id,
+            "message_thread_id": message_thread_id,
+            "reason": decision.reason,
+            "created_at": utc_now(),
+            "alarm_id": alarm["alarm_id"],
+            "alarm_due_at": alarm["due_at"],
+        }
+        write_worker_state(self.config, state)
+        return state
+
+    def send_auto_worker_ack(
+        self,
+        chat: Chat,
+        message_id: int,
+        message_thread_id: int | None,
+        *,
+        decision: AutoWorkerDecision,
+        allow_silent_reply: bool,
+        explicitly_addressed: bool,
+    ) -> None:
+        if not self.should_send_direct_background_ack(allow_silent_reply, explicitly_addressed):
+            return
+        ack_text = auto_worker_ack_text(decision.reason, decision.title)
+        try:
+            send_message(
+                self.config,
+                chat.chat_id,
+                ack_text,
+                message_thread_id=message_thread_id,
+            )
+        except Exception as exc:
+            print(f"{utc_now()} auto worker ack send error: {exc}", file=sys.stderr, flush=True)
+
+    def maybe_start_auto_worker_for_single(
+        self,
+        chat: Chat,
+        sender: Sender,
+        message_id: int,
+        message_thread_id: int | None,
+        prompt_text: str,
+        trigger_text: str,
+        *,
+        allow_silent_reply: bool,
+        explicitly_addressed: bool,
+    ) -> bool:
+        decision = self.auto_worker_decision_for_single(
+            chat,
+            sender,
+            message_id,
+            message_thread_id,
+            prompt_text,
+            trigger_text,
+            allow_silent_reply=allow_silent_reply,
+            explicitly_addressed=explicitly_addressed,
+        )
+        if decision is None:
+            return False
+        state, error = start_codex_worker(self.config, task=decision.task, title=decision.title)
+        if error or state is None:
+            self.deliver_bridge_error(chat, message_id, message_thread_id, f"worker 启动失败：{error or 'unknown error'}")
+            return True
+        self.register_auto_worker_delivery(state, chat, message_id, message_thread_id, decision)
+        self.send_auto_worker_ack(
+            chat,
+            message_id,
+            message_thread_id,
+            decision=decision,
+            allow_silent_reply=allow_silent_reply,
+            explicitly_addressed=explicitly_addressed,
+        )
+        return True
+
+    def maybe_start_auto_worker_for_batch(self, chat: Chat, items: list[BatchItem]) -> RunResult | None:
+        decision = self.auto_worker_decision_for_batch(chat, items)
+        if decision is None:
+            return None
+        latest = items[-1]
+        state, error = start_codex_worker(self.config, task=decision.task, title=decision.title)
+        if error or state is None:
+            return RunResult(
+                run_id=None,
+                status="error",
+                reply=f"worker 启动失败：{error or 'unknown error'}",
+                session_id_after=None,
+                error=error or "worker start failed",
+                channel_events=[],
+            )
+        self.register_auto_worker_delivery(state, chat, latest.message_id, latest.message_thread_id, decision)
+        self.send_auto_worker_ack(
+            chat,
+            latest.message_id,
+            latest.message_thread_id,
+            decision=decision,
+            allow_silent_reply=True,
+            explicitly_addressed=any(item.explicitly_addressed for item in items),
+        )
+        return RunResult(
+            run_id=None,
+            status="ok",
+            reply=NO_REPLY_SENTINEL,
+            session_id_after=None,
+            error=None,
+            channel_events=[],
+        )
 
     def run_codex_maybe_direct_background(
         self,
@@ -12181,6 +12735,7 @@ class BotService:
 
         done = threading.Event()
         gate = threading.Lock()
+        run_id = safe_run_id(chat.chat_id, message_id)
         state: dict[str, Any] = {
             "mode": "pending",
             "result": None,
@@ -12197,6 +12752,7 @@ class BotService:
                     effort,
                     trigger_text,
                     timeout_seconds=self.config.direct_background_timeout_seconds,
+                    run_id=run_id,
                 )
                 error = None
             except Exception as exc:
@@ -12247,7 +12803,8 @@ class BotService:
             chat,
             message_id,
             message_thread_id,
-            run_id=safe_run_id(chat.chat_id, message_id),
+            run_id=run_id,
+            trigger_text=trigger_text,
             allow_silent_reply=allow_silent_reply,
             explicitly_addressed=explicitly_addressed,
         )
@@ -12272,13 +12829,32 @@ class BotService:
             self.enqueue_batch(chat, sender, message_id, message_thread_id, prompt_text, explicitly_addressed)
             return
 
+        try:
+            chat_row = get_chat(conn, chat.chat_id)
+            if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
+                return
+        except KeyError:
+            pass
+
+        if self.maybe_start_auto_worker_for_single(
+            chat,
+            sender,
+            message_id,
+            message_thread_id,
+            prompt_text,
+            trigger_text,
+            allow_silent_reply=allow_silent_reply,
+            explicitly_addressed=explicitly_addressed,
+        ):
+            return
+
         lock = self.lock_for_chat(chat.chat_id)
         if not lock.acquire(blocking=False):
             if not allow_silent_reply or explicitly_addressed:
                 send_message(
                     self.config,
                     chat.chat_id,
-                    "我还在处理上一条，等一下。",
+                    busy_parallel_reply_text(trigger_text),
                     reply_to_message_id=message_id,
                     message_thread_id=message_thread_id,
                 )
@@ -12513,7 +13089,7 @@ class BotService:
             send_message(
                 self.config,
                 chat.chat_id,
-                "我还在处理上一条，等一下。",
+                "上一条还在后台跑，这个 probe 我先不抢同一个线程；等它回来后再测更准。",
                 reply_to_message_id=message_id,
                 message_thread_id=message_thread_id,
             )
@@ -12667,11 +13243,12 @@ class BotService:
             return self.run_batch(chat, items, revision)
 
         done = threading.Event()
+        run_id = safe_run_id(chat.chat_id, send_to_message_id)
         state: dict[str, Any] = {"result": None, "error": None}
 
         def target() -> None:
             try:
-                state["result"] = self.run_batch(chat, items, revision)
+                state["result"] = self.run_batch(chat, items, revision, run_id=run_id)
             except Exception as exc:
                 state["error"] = exc
             finally:
@@ -12684,7 +13261,8 @@ class BotService:
                 chat,
                 send_to_message_id,
                 send_to_thread_id,
-                run_id=safe_run_id(chat.chat_id, send_to_message_id),
+                run_id=run_id,
+                trigger_text="\n".join(item.text for item in items[-3:]),
                 allow_silent_reply=True,
                 explicitly_addressed=any(item.explicitly_addressed for item in items),
             )
@@ -12748,7 +13326,7 @@ class BotService:
                         if state.items and state.timer is None:
                             self.schedule_batch_locked(chat_id, state, self.config.batch_delay_seconds)
 
-            if result is not None and superseded and result.run_id:
+            if result is not None and superseded and result.run_id and result.status != "ok":
                 reason = "newer Telegram message arrived before delivery"
                 with closing(connect_db(self.config)) as conn:
                     record_superseded_channel_deliveries(
@@ -12768,7 +13346,7 @@ class BotService:
                         result.session_id_after,
                         reason=reason,
                     )
-            if result is None or superseded:
+            if result is None or (superseded and result.status != "ok"):
                 return
             if result.status != "ok":
                 error_reply = visible_error_reply_for_result(
@@ -13252,7 +13830,14 @@ class BotService:
             return True
         return target_chat_id in policy.allowed_chats
 
-    def run_batch(self, chat: Chat, items: list[BatchItem], revision: int) -> RunResult:
+    def run_batch(
+        self,
+        chat: Chat,
+        items: list[BatchItem],
+        revision: int,
+        *,
+        run_id: str | None = None,
+    ) -> RunResult:
         lock = self.lock_for_chat(chat.chat_id)
         if not lock.acquire(blocking=False):
             with self.batch_lock:
@@ -13283,6 +13868,9 @@ class BotService:
                         error=None,
                         channel_events=[],
                     )
+                auto_worker_result = self.maybe_start_auto_worker_for_batch(chat, items)
+                if auto_worker_result is not None:
+                    return auto_worker_result
                 session_id_before = prepare_session_for_turn(conn, self.config, chat_row)
                 prompt = build_batch_prompt(
                     conn,
@@ -13291,6 +13879,13 @@ class BotService:
                     self.config,
                     superseding=revision > 1,
                 )
+                run_kwargs: dict[str, Any] = {
+                    "timeout_seconds": self.config.direct_background_timeout_seconds
+                    if self.config.direct_background
+                    else None
+                }
+                if run_id is not None:
+                    run_kwargs["run_id"] = run_id
                 return run_codex(
                     conn,
                     self.config,
@@ -13302,7 +13897,7 @@ class BotService:
                     desktop_title_for_context(self.config, chat),
                     desktop_preview_for_context(self.config, chat, items[-1].text),
                     self.app_server,
-                    self.config.direct_background_timeout_seconds if self.config.direct_background else None,
+                    **run_kwargs,
                 )
         finally:
             lock.release()
@@ -13336,17 +13931,6 @@ class BotService:
 
     def group_presence_control_allowed(self, chat: Chat, sender: Sender, policy: AccessPolicy) -> bool:
         if chat.chat_type == "private" or not chat_is_allowed(chat, policy):
-            return False
-        if sender.is_chat:
-            return sender_chat_is_allowed(sender, chat, policy)
-        if sender.is_bot:
-            return sender_bot_is_allowed(sender, policy)
-        return sender_is_allowed(sender, policy)
-
-    def local_fast_reply_allowed(self, chat: Chat, sender: Sender, policy: AccessPolicy) -> bool:
-        if chat.chat_type == "private":
-            return sender_is_allowed(sender, policy)
-        if not chat_is_allowed(chat, policy):
             return False
         if sender.is_chat:
             return sender_chat_is_allowed(sender, chat, policy)
@@ -13449,223 +14033,6 @@ class BotService:
         self.send_local_reply_with_delivery_record(conn, chat, message_thread_id, run_id, reply_text)
         return True
 
-    def maybe_send_local_presence_reply(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-    ) -> bool:
-        if not looks_like_presence_ping(text, message, chat, self.config, self.bot_id, self.bot_username):
-            return False
-        reply_text = local_presence_reply_text(text, message_id)
-        run_id = f"local-presence-{chat.chat_id}-{message_id}"
-        self.send_local_reply_with_delivery_record(conn, chat, message_thread_id, run_id, reply_text)
-        return True
-
-    def maybe_send_local_media_capability_reply(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        chat_row: sqlite3.Row,
-        sender: Sender,
-        policy: AccessPolicy,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-    ) -> bool:
-        if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return False
-        if not self.local_fast_reply_allowed(chat, sender, policy):
-            return False
-        if not looks_like_media_capability_question(text, message):
-            return False
-        if not self.should_call_codex(conn, chat, chat_row, sender, text, message, policy):
-            return False
-        reply_text = local_media_capability_reply_text(text)
-        run_id = f"local-capability-{chat.chat_id}-{message_id}"
-        self.send_local_reply_with_delivery_record(conn, chat, message_thread_id, run_id, reply_text)
-        return True
-
-    def maybe_send_local_channel_status_reply(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        chat_row: sqlite3.Row,
-        sender: Sender,
-        policy: AccessPolicy,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-    ) -> bool:
-        if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return False
-        if not self.local_fast_reply_allowed(chat, sender, policy):
-            return False
-        if not looks_like_channel_status_question(text, message):
-            return False
-        if not self.should_call_codex(conn, chat, chat_row, sender, text, message, policy):
-            return False
-        reply_text = local_channel_status_reply_text(conn, chat, chat_row, policy, self.config, text)
-        run_id = f"local-channel-status-{chat.chat_id}-{message_id}"
-        self.send_local_reply_with_delivery_record(conn, chat, message_thread_id, run_id, reply_text)
-        return True
-
-    def maybe_send_local_ack_reaction(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-    ) -> bool:
-        bot_message_id = reply_to_bot_message_id(message, self.bot_id)
-        if bot_message_id is None:
-            return False
-        if not looks_like_short_reaction_feedback(text, message, self.config, self.bot_id):
-            return False
-        run_id = f"local-ack-{chat.chat_id}-{message_id}"
-        self.send_channel_events(
-            chat.chat_id,
-            [
-                {
-                    "type": "react",
-                    "chat_id": chat.chat_id,
-                    "message_id": str(bot_message_id),
-                    "emoji": local_ack_reaction_emoji(text, message, self.config),
-                }
-            ],
-            message_id,
-            run_id,
-            fallback_message_thread_id=message_thread_id,
-        )
-        return True
-
-    def maybe_send_local_recent_prompt_decline_reaction(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        chat_row: sqlite3.Row,
-        sender: Sender,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-        policy: AccessPolicy,
-    ) -> bool:
-        if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return False
-        mode = policy_value(chat_row["mode"] or policy.group_policy or "mention")
-        if not is_ai_decide_policy(mode):
-            return False
-        if not chat_is_allowed(chat, policy) or not sender_is_allowed(sender, policy):
-            return False
-        row = recent_bot_prompt_decline_output_row(conn, chat, sender, text, message, self.config)
-        if row is None:
-            return False
-        run_id = f"local-decline-{chat.chat_id}-{message_id}"
-        self.send_channel_events(
-            chat.chat_id,
-            [
-                {
-                    "type": "react",
-                    "chat_id": chat.chat_id,
-                    "message_id": str(row["telegram_message_id"]),
-                    "emoji": "👍",
-                }
-            ],
-            message_id,
-            run_id,
-            fallback_message_thread_id=message_thread_id,
-        )
-        return True
-
-    def maybe_send_local_recent_ack_reaction(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        chat_row: sqlite3.Row,
-        sender: Sender,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-        policy: AccessPolicy,
-    ) -> bool:
-        if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return False
-        mode = policy_value(chat_row["mode"] or policy.group_policy or "mention")
-        if not is_ai_decide_policy(mode):
-            return False
-        if not chat_is_allowed(chat, policy) or not sender_is_allowed(sender, policy):
-            return False
-        row = recent_bot_reaction_output_row(conn, chat, sender, text, message, self.config)
-        if row is None:
-            return False
-        run_id = f"local-reaction-{chat.chat_id}-{message_id}"
-        self.send_channel_events(
-            chat.chat_id,
-            [
-                {
-                    "type": "react",
-                    "chat_id": chat.chat_id,
-                    "message_id": str(row["telegram_message_id"]),
-                    "emoji": local_ack_reaction_emoji(text, message, self.config),
-                }
-            ],
-            message_id,
-            run_id,
-            fallback_message_thread_id=message_thread_id,
-        )
-        return True
-
-    def maybe_send_local_directed_reaction(
-        self,
-        conn: sqlite3.Connection,
-        chat: Chat,
-        chat_row: sqlite3.Row,
-        sender: Sender,
-        message_id: int,
-        message_thread_id: int | None,
-        text: str,
-        message: dict[str, Any],
-        policy: AccessPolicy,
-    ) -> bool:
-        if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
-            return False
-        if not self.local_fast_reply_allowed(chat, sender, policy):
-            return False
-        if not looks_like_directed_light_reaction(
-            text,
-            message,
-            chat,
-            self.config,
-            self.bot_id,
-            self.bot_username,
-        ):
-            return False
-        run_id = f"local-directed-reaction-{chat.chat_id}-{message_id}"
-        self.send_channel_events(
-            chat.chat_id,
-            [
-                {
-                    "type": "react",
-                    "chat_id": chat.chat_id,
-                    "message_id": str(message_id),
-                    "emoji": local_ack_reaction_emoji(text, message, self.config),
-                }
-            ],
-            message_id,
-            run_id,
-            fallback_message_thread_id=message_thread_id,
-        )
-        return True
-
     def should_call_codex(
         self,
         conn: sqlite3.Connection,
@@ -13762,7 +14129,13 @@ class BotService:
         if not chat_is_allowed(chat, policy):
             return False
         if not sender_is_allowed(sender, policy):
-            return False
+            return is_explicitly_addressed_group_message(
+                text,
+                message,
+                self.config,
+                self.bot_id,
+                self.bot_username,
+            )
         if group_model_decide_for_sender(chat, chat_row, sender, policy, self.config):
             return True
         if should_trigger_group_reply(
