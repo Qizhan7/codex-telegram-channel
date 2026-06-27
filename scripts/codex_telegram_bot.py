@@ -5016,11 +5016,7 @@ def visible_error_reply_for_result(
 ) -> str:
     if chat.chat_type == "private":
         return result.reply
-    if allow_silent_reply and not explicitly_addressed:
-        return ""
-    if "timed out" in (result.error or "").lower():
-        return "这次本地 Codex 调用超时了，我先不把日志刷到群里。"
-    return "这次本地 Codex 调用没跑完，我先不把日志刷到群里。"
+    return ""
 
 
 def is_reply_to_bot(message: dict[str, Any], bot_id: str | None) -> bool:

@@ -148,6 +148,47 @@ def test_parse_command_uses_public_namespace() -> None:
     assert codex_telegram_bot.parse_command("/status", "codex_test_bot") is None
 
 
+def test_group_run_errors_stay_local_instead_of_template_reply() -> None:
+    result = codex_telegram_bot.RunResult(
+        run_id="run-error",
+        status="error",
+        reply="diagnostic details",
+        session_id_after=None,
+        error="app-server bridge failed",
+        channel_events=[],
+    )
+    group = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    private = codex_telegram_bot.Chat("111", "private", "Owner")
+
+    assert (
+        codex_telegram_bot.visible_error_reply_for_result(
+            group,
+            result,
+            allow_silent_reply=False,
+            explicitly_addressed=True,
+        )
+        == ""
+    )
+    assert (
+        codex_telegram_bot.visible_error_reply_for_result(
+            group,
+            result,
+            allow_silent_reply=True,
+            explicitly_addressed=False,
+        )
+        == ""
+    )
+    assert (
+        codex_telegram_bot.visible_error_reply_for_result(
+            private,
+            result,
+            allow_silent_reply=False,
+            explicitly_addressed=True,
+        )
+        == "diagnostic details"
+    )
+
+
 def test_exec_prompt_uses_neutral_public_identity(tmp_path: Path) -> None:
     cfg = _config(tmp_path, engine="exec")
     conn = _conn(tmp_path)
