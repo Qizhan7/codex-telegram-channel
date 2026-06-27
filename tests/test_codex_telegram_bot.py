@@ -349,6 +349,69 @@ def test_codex_thread_rollout_path_closes_state_connection(tmp_path: Path, monke
     assert connections[0].closed
 
 
+def test_replace_rollout_user_prompt_removes_raw_prompt_with_same_display_text(tmp_path: Path) -> None:
+    rollout = tmp_path / "rollout.jsonl"
+    run_id = "run-live"
+    display = "[群 Release Room] Owner: /status"
+    raw_prompt = (
+        "<context>\n"
+        "- earlier context that should stay out of Desktop\n"
+        "</context>\n\n"
+        '<channel source="telegram" chat_id="-100" chat_type="supergroup" chat_title="Release Room" user="Owner">\n'
+        "/status\n"
+        "</channel>"
+    )
+    local_prompt = (
+        '<channel source="telegram" chat_id="-100" chat_type="supergroup" chat_title="Release Room" user="Owner">\n'
+        "/status\n"
+        "</channel>"
+    )
+
+    _write_rollout_record(
+        rollout,
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": display}],
+                "telegram_live_mirror_run_id": run_id,
+            },
+        },
+    )
+    _write_rollout_record(
+        rollout,
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": raw_prompt}],
+            },
+        },
+    )
+    _write_rollout_record(
+        rollout,
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": raw_prompt},
+        },
+    )
+
+    assert codex_telegram_bot.replace_rollout_user_prompt_display(
+        rollout,
+        local_prompt,
+        display,
+        live_mirror_run_id=run_id,
+    )
+
+    text = rollout.read_text(encoding="utf-8")
+    assert "<context>" not in text
+    records = [json.loads(line) for line in text.splitlines()]
+    assert len(records) == 1
+    assert records[0]["payload"]["telegram_live_mirror_run_id"] == run_id
+
+
 def test_mark_superseded_run_updates_delivery_and_rollout(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     conn = _conn(tmp_path)

@@ -3394,7 +3394,7 @@ def replace_rollout_user_prompt_display(
         if record is None:
             output_lines.append(line)
             continue
-        if live_mirror_exists and rollout_user_prompt_record_matches(record, raw_prompt):
+        if live_mirror_exists and rollout_user_prompt_record_matches(record, raw_prompt, display_text):
             changed = True
             continue
         if redact_rollout_user_prompt_record(record, raw_prompt, display_text):
@@ -3419,25 +3419,36 @@ def rollout_live_mirror_run_id(record: dict[str, Any]) -> str | None:
     return str(raw) if raw else None
 
 
-def rollout_user_prompt_record_matches(record: Any, raw_prompt: str) -> bool:
+def rollout_user_prompt_text(record: Any) -> str | None:
     if not isinstance(record, dict):
-        return False
+        return None
     payload = record.get("payload")
     if not isinstance(payload, dict):
-        return False
+        return None
     if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-        return payload.get("message") == raw_prompt
+        return str(payload.get("message") or "")
     if record.get("type") != "response_item":
-        return False
+        return None
     if payload.get("type") != "message" or payload.get("role") != "user":
-        return False
+        return None
     content = payload.get("content")
     if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(item, dict) and item.get("type") == "input_text" and item.get("text") == raw_prompt
+        return None
+    parts = [
+        str(item.get("text") or "")
         for item in content
-    )
+        if isinstance(item, dict) and item.get("type") == "input_text"
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def rollout_user_prompt_record_matches(record: Any, raw_prompt: str, display_text: str) -> bool:
+    text = rollout_user_prompt_text(record)
+    if not text:
+        return False
+    if text == raw_prompt:
+        return True
+    return desktop_prompt_display_text(text) == display_text
 
 
 def append_desktop_live_mirror(rollout_path: Path, display_text: str, run_id: str) -> bool:
@@ -3649,7 +3660,8 @@ def redact_rollout_user_prompt_record(record: Any, raw_prompt: str, display_text
     if not isinstance(payload, dict):
         return False
     if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-        if payload.get("message") == raw_prompt:
+        text = str(payload.get("message") or "")
+        if text == raw_prompt or desktop_prompt_display_text(text) == display_text:
             payload["message"] = display_text
             return True
         return False
@@ -3661,7 +3673,10 @@ def redact_rollout_user_prompt_record(record: Any, raw_prompt: str, display_text
     content = payload.get("content")
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "input_text" and item.get("text") == raw_prompt:
+            if not isinstance(item, dict) or item.get("type") != "input_text":
+                continue
+            text = str(item.get("text") or "")
+            if text == raw_prompt or desktop_prompt_display_text(text) == display_text:
                 item["text"] = display_text
                 changed = True
     return changed
