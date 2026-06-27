@@ -128,6 +128,10 @@ The public build has no dashboard or control panel. Add a group id to
 /codex_mode mention  # traditional @/reply/name-only mode
 ```
 
+Group turns are single-message by default. Use `/codex_batch batch` only when
+you intentionally want a short window of messages merged into one Codex turn;
+use `/codex_batch single` to return to immediate one-by-one handling.
+
 `smart` uses `CODEX_TELEGRAM_WAKE_PHRASES` and the optional
 `CODEX_TELEGRAM_WATCH_PHRASES_PATH` file. Wake phrases are simple consecutive
 substring matches: if `codex` is configured, `codexbot` also wakes the bot and

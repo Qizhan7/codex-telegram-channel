@@ -448,6 +448,19 @@ def test_public_batch_and_message_shape_commands_control_delivery(tmp_path: Path
     codex_telegram_bot.upsert_chat(conn, chat)
     service = codex_telegram_bot.BotService(cfg)
 
+    assert codex_telegram_bot.group_response_mode(conn, chat.chat_id) == "single"
+    assert not service.should_batch_codex(conn, chat, allow_silent_reply=True)
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        _policy(),
+        chat,
+        sender,
+        codex_telegram_bot.Command("codex_batch", ["batch"]),
+    )
+    assert "batch" in reply
+    assert codex_telegram_bot.group_response_mode(conn, chat.chat_id) == "batch"
     assert service.should_batch_codex(conn, chat, allow_silent_reply=True)
 
     reply = codex_telegram_bot.handle_command(

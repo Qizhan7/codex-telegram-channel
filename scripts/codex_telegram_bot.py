@@ -1064,7 +1064,7 @@ def normalize_group_response_mode(raw: str | None) -> str | None:
 
 
 def group_response_mode(conn: sqlite3.Connection, chat_id: str) -> str:
-    return normalize_group_response_mode(get_meta(conn, group_response_mode_key(chat_id))) or "batch"
+    return normalize_group_response_mode(get_meta(conn, group_response_mode_key(chat_id))) or "single"
 
 
 def set_group_response_mode(conn: sqlite3.Connection, chat_id: str, mode: str) -> None:

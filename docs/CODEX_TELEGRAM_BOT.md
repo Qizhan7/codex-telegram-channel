@@ -97,6 +97,10 @@ set each group from Telegram with:
 /codex_mode mention  # traditional @/reply/name-only mode
 ```
 
+Group turns are single-message by default. Use `/codex_batch batch` only when
+you intentionally want a short window of messages merged into one Codex turn;
+use `/codex_batch single` to return to immediate one-by-one handling.
+
 `decide` forwards every allowed group message to Codex. The model then chooses
 whether to send a visible Telegram reply or stay silent.
 
