@@ -1241,6 +1241,41 @@ def test_app_server_reply_tool_uses_turn_immediate_sender(tmp_path: Path) -> Non
     assert events[0]["delivered_immediately"] is True
 
 
+def test_run_codex_forwards_immediate_sender_to_app_server(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, engine="app-server", desktop_sync=False)
+    conn = _conn(tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakeAppServer:
+        def run_turn(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return "session-after", "", None, [], args[1]
+
+    def immediate_sender(events: list[dict[str, object]]) -> None:
+        captured["events"] = events
+
+    result = codex_telegram_bot.run_codex(
+        conn,
+        cfg,
+        "111",
+        None,
+        "prompt text",
+        123,
+        "high",
+        "Desktop title",
+        "Desktop preview",
+        FakeAppServer(),
+        timeout_seconds=30,
+        run_id="run-immediate-forward",
+        immediate_channel_event_sender=immediate_sender,
+    )
+
+    assert result.status == "ok"
+    assert captured["kwargs"]["timeout_seconds"] == 30
+    assert captured["kwargs"]["immediate_channel_event_sender"] is immediate_sender
+
+
 def test_send_message_logs_slow_delivery(tmp_path: Path, monkeypatch, capsys) -> None:
     cfg = _config(tmp_path)
     ticks = iter([100.0, 106.25])

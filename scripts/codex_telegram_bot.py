@@ -9265,6 +9265,7 @@ def run_codex_app_server(
     desktop_preview: str | None = None,
     timeout_seconds: int | None = None,
     run_id: str | None = None,
+    immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> RunResult:
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
@@ -9456,12 +9457,12 @@ def run_codex(
             session_id_before,
             prompt,
             message_id,
-            effort,
-            desktop_title,
-            desktop_preview,
-            timeout_seconds,
-            run_id,
-            immediate_channel_event_sender,
+            effort=effort,
+            desktop_title=desktop_title,
+            desktop_preview=desktop_preview,
+            timeout_seconds=timeout_seconds,
+            run_id=run_id,
+            immediate_channel_event_sender=immediate_channel_event_sender,
         )
     return run_codex_exec(
         conn,
