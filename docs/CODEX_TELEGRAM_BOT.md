@@ -47,7 +47,7 @@ CODEX_TELEGRAM_REPLY_TIMEOUT_SECONDS=300
 CODEX_TELEGRAM_DIRECT_BACKGROUND=1
 CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS=20
 CODEX_TELEGRAM_DIRECT_BACKGROUND_TIMEOUT_SECONDS=3600
-CODEX_TELEGRAM_AUTO_WORKER=1
+CODEX_TELEGRAM_AUTO_WORKER=0
 CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS=5
 CODEX_TELEGRAM_AUTO_WORKER_RESULT_CHARS=3500
 CODEX_TELEGRAM_CONTEXT_MESSAGES=24
@@ -57,7 +57,6 @@ CODEX_TELEGRAM_CONTEXT_TEXT_CHARS=800
 CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000
 CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5
 CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS=1.5
-CODEX_TELEGRAM_GROUP_DECISION_SOURCE=bridge
 CODEX_TELEGRAM_DENY_UNKNOWN=0
 CODEX_TELEGRAM_IGNORE_USER_CONFIG=1
 CODEX_TELEGRAM_CHANNEL_TOOLS=1
@@ -65,6 +64,8 @@ CODEX_TELEGRAM_DESKTOP_SYNC=1
 CODEX_TELEGRAM_DESKTOP_OUTBOUND=1
 CODEX_TELEGRAM_CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
 CODEX_TELEGRAM_WAKE_PHRASES=codex,assistant,bot
+CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES=codex,assistant,bot
+CODEX_TELEGRAM_WATCH_PHRASES_PATH=~/.codex/channels/codex-telegram/watch_phrases.txt
 ```
 
 Example access policy:
@@ -73,30 +74,63 @@ Example access policy:
 {
   "dmPolicy": "allowlist",
   "groupPolicy": "decide",
-  "botPolicy": "ai-decide",
   "allowedUsers": [],
-  "allowedChats": [],
-  "allowedBots": []
+  "allowedChats": []
 }
 ```
 
 Owner ids from `.env` are automatically allowed. Add group chat ids to
-`allowedChats`, and trusted bot ids to `allowedBots` if bot-to-bot context is
-needed.
+`allowedChats`. Group sender identity does not control the group mode: people,
+bots, and anonymous group senders follow the same per-chat strategy.
+Older access files may contain `botPolicy` or `allowedBots`; those fields are
+read for compatibility but do not give bots a separate group-mode strategy.
 
-## Group Decide Mode
+## Group Chat Modes
 
 The bridge always enforces chat access first: group messages only matter inside
-`allowedChats`. In `/codex_mode decide`, `CODEX_TELEGRAM_GROUP_DECISION_SOURCE`
-controls where the social decision happens.
+`allowedChats`. The public build does not include a dashboard or control panel;
+set each group from Telegram with:
 
-With `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, owner/allowlist messages in
-an allowed group enter Codex so the model can choose whether to reply or stay
-silent. A non-allowlist human can also wake Codex when the message explicitly
-addresses the bot by `@username`, replies to a bot message, or contains one of
-the configured `CODEX_TELEGRAM_WAKE_PHRASES`. Each group turn includes a
-`<recent_chat_window>` block with the last five same-chat messages before the
-trigger or batch, so Codex has the local conversation lead-in when deciding.
+```text
+/codex_mode decide   # free mode: every allowed group message enters Codex
+/codex_mode smart    # wake words/watch phrases open a 3-minute decide window
+/codex_mode mention  # traditional @/reply/name-only mode
+```
+
+`decide` forwards every allowed group message to Codex. The model then chooses
+whether to send a visible Telegram reply or stay silent.
+
+`smart` is wake-based. A message wakes the bot when it mentions the bot by
+`@username`, replies to a bot message, contains a configured
+`CODEX_TELEGRAM_WAKE_PHRASES` entry, or matches an item in the watch phrase
+file. Once awake, every message in that chat enters Codex for
+`DEFAULT_WAKE_WINDOW_SECONDS` (three minutes). A visible bot reply extends the
+window by another three minutes; three minutes without a bot reply closes it.
+
+Wake phrases use plain consecutive-character matching. For example, configuring
+`codex` means `codexbot` also wakes the bot. Waking only forwards the message to
+Codex; it does not force a reply.
+
+The optional watch phrase file is loaded from `CODEX_TELEGRAM_WATCH_PHRASES_PATH`.
+Use one item per line and `|` for aliases:
+
+```text
+codex|assistant
+project alpha|alpha
+```
+
+`mention` is the traditional mode. It forwards only `@` mentions, replies to
+the bot, and identity-name calls. Identity-name calls use
+`CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES`; keep that list to names for the bot if
+your `CODEX_TELEGRAM_WAKE_PHRASES` list includes topical words for `smart`.
+
+Each group turn can include a `<recent_chat_window>` block with the last five
+same-chat messages before the trigger or batch, so Codex has the local
+conversation lead-in when deciding.
+
+For `decide` and `smart` to receive ordinary group messages, disable Telegram
+BotFather privacy mode for the bot or otherwise make sure the bot can read all
+group messages.
 
 ## Prompt Contract
 
@@ -132,29 +166,27 @@ used after a turn moves into that background path. This is separate from Codex
 worker tools: the task stays in the Telegram-backed Codex thread instead of
 opening a separate worker session.
 
-## Auto Worker Delegation
+## Worker Tools And Supervision
 
-`CODEX_TELEGRAM_AUTO_WORKER=1` keeps the shared Telegram Codex thread lean by
-delegating heavier execution requests before they enter the shared app-server
-session. Debugging, log/database inspection, broad file work, tests, deployment,
-implementation tasks, multi-step requests, and consecutive addressed task
-batches are started as separate Codex workers. The Telegram thread receives a
-short task-specific acknowledgement, then the bridge schedules a private worker
-alarm for the Telegram resident. At each alarm, the resident inspects the same
-worker task, continues that worker session when needed, sets another alarm if it
-is still running, and decides whether a visible Telegram reply helps. When a new
-Telegram message arrives while related worker context exists, the resident gets
-a private worker summary and decides whether to continue the existing worker
-session or start a separate worker.
+Telegram messages enter the resident Codex thread first. The bridge no longer
+starts workers from keyword or text-pattern matches. The resident decides from
+the conversation whether a separate worker would help, asks the owner for
+confirmation in natural wording, and only calls `codex_worker_start` after the
+owner confirms that route.
 
 Workers run with Telegram channel tools disabled. They only write private worker
 output; Telegram messages always come from the Telegram resident through the
-normal channel tools.
+normal channel tools. When the resident starts a worker, the bridge schedules a
+private supervisor alarm. At each alarm, the resident inspects the worker with
+`codex_worker_status`, continues the same worker session when needed, sets
+another alarm if it is still running, and decides whether a visible Telegram
+reply helps.
 
-Short chat, simple answers, and explicit tiny edits such as one-line wording or
-typo fixes stay in the shared Telegram thread. `CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS`
-sets the first automatic worker check delay. Worker result text is read through
-`codex_worker_status` by the resident before anything is sent to Telegram.
+`CODEX_TELEGRAM_AUTO_WORKER=0` is the default. The legacy auto-worker
+supervision loop can still be enabled to migrate old `auto_delivery` records,
+but it is not a text-triggered dispatch path. `CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS`
+sets the first supervisor check delay for workers started from Telegram and for
+legacy pending auto-delivery records.
 
 ## Shared Desktop Thread
 
@@ -210,10 +242,7 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind the chat or shared context to a session.
 - `/codex_rollover`: start a clean shared session with a bounded handoff.
-- `/codex_mode mention|all|decide`: set group trigger behavior. With
-  `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, `decide` forwards
-  owner/allowlist messages and explicit configured-name calls so Codex can
-  choose whether to reply or stay silent.
+- `/codex_mode decide|smart|mention`: set group trigger behavior.
 - `/codex_batch single|batch|status`: switch group batching behavior.
 - `/codex auto|single|multi|status`: switch visible reply bubble shape.
 - `/codex_debug on|off|status`: show or hide raw Desktop prompts.

@@ -20,20 +20,24 @@ the repo.
     shared Desktop thread back to the current active Telegram chat.
 - Visible Telegram tools: `reply`, `send_photos`, `send_files`, `react`, and
   `edit_message`.
-- Group decide mode can defer social judgment to Codex: owner/allowlist
-  messages enter the model, explicit name calls from other group members can
-  wake it, and group turns include the last five same-chat messages before the
-  trigger.
+- Three group chat modes:
+  - `decide`: every allowed group message enters Codex; the model decides
+    whether a visible reply helps.
+  - `smart`: wake words, watch phrases, `@` mentions, or replies wake the bot;
+    after wake, every group message enters Codex for three minutes. A visible
+    bot reply extends the window.
+  - `mention`: traditional mention mode; only `@`, replies to the bot, or
+    identity-name calls enter Codex.
 - Direct background continuation for long turns: quick tasks finish inline; if a
   single-message or batched group Codex turn runs past
   `CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS`, the bridge sends a short,
   task-specific acknowledgement, keeps the same Codex task running, and delivers
   the final result back to the original Telegram chat with the normal channel
   tools.
-- Auto-worker supervision for larger tasks: workers run without Telegram channel
-  tools; the Telegram resident sets scheduled worker checks, inspects the same
-  task, continues it when needed, decides whether a new request belongs in that
-  worker or a new one, and decides what to say in Telegram.
+- Worker supervision without text-triggered dispatch: Telegram messages enter the
+  resident Codex thread first. If the resident judges that a separate worker
+  would help, it asks for owner confirmation naturally; only after confirmation
+  does it start a worker and supervise it with private checks.
 - Public, neutral base prompt: the model is a generic Codex collaborator reached
   through Telegram, with no private persona dependency.
 
@@ -107,14 +111,42 @@ launchctl kickstart -k gui/$(id -u)/com.codex.telegram
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind to a Codex session.
 - `/codex_rollover`: start a clean shared session with a short handoff.
-- `/codex_mode mention|all|decide`: set group trigger mode. With
-  `CODEX_TELEGRAM_GROUP_DECISION_SOURCE=model`, `decide` forwards
-  owner/allowlist messages and explicit configured-name calls so Codex can
-  choose whether to reply or stay silent.
+- `/codex_mode decide|smart|mention`: set group trigger mode.
 - `/codex_batch single|batch|status`: set group batching.
 - `/codex auto|single|multi|status`: set visible reply bubble shape.
 - `/codex_debug on|off|status`: show or hide raw Desktop prompts.
 - `/codex_off` / `/codex_on`: disable or re-enable the chat.
+
+## Group Modes
+
+The public build has no dashboard or control panel. Add a group id to
+`allowedChats`, then use `/codex_mode` in that Telegram group:
+
+```text
+/codex_mode decide   # free mode: pass every allowed group message to Codex
+/codex_mode smart    # wake words/watch phrases open a 3-minute decide window
+/codex_mode mention  # traditional @/reply/name-only mode
+```
+
+`smart` uses `CODEX_TELEGRAM_WAKE_PHRASES` and the optional
+`CODEX_TELEGRAM_WATCH_PHRASES_PATH` file. Wake phrases are simple consecutive
+substring matches: if `codex` is configured, `codexbot` also wakes the bot and
+lets Codex decide whether to reply. A watch phrase file contains one item per
+line; use `|` to separate aliases:
+
+```text
+codex|assistant
+project alpha|alpha
+```
+
+`mention` uses `@`, replies to bot messages, and
+`CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES`. Keep identity phrases to names for the
+bot, especially if `CODEX_TELEGRAM_WAKE_PHRASES` includes topical words for
+`smart`.
+
+For `decide` and `smart` to receive ordinary group messages, disable Telegram
+BotFather privacy mode for the bot or make sure your bot can read all group
+messages.
 
 ## Notes
 
