@@ -17,19 +17,68 @@ own Telegram bot token and keeps runtime state outside the repository.
 
 ## First-Time Setup
 
+Requirements:
+
+- Python 3.12.
+- Codex installed and signed in. The bridge can use `codex` from `PATH` or the
+  binary bundled with the Codex/ChatGPT macOS app.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather) and the
+  owner's numeric Telegram user id.
+
+From a fresh checkout, create a virtual environment and install the test-only
+dependency:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install "pytest>=8"
+```
+
 Create the private config skeleton:
 
 ```bash
-python3.12 scripts/codex_telegram_bot.py init-config
+.venv/bin/python scripts/codex_telegram_bot.py init-config
 ```
 
-Create a Telegram bot with BotFather, then set the token and owner id in:
+Set the token and owner id in:
 
 ```text
 ~/.codex/channels/codex-telegram/.env
 ```
 
-Example:
+At minimum:
+
+```env
+TELEGRAM_BOT_TOKEN=<telegram-bot-token>
+TELEGRAM_OWNER_IDS=<telegram-user-id>
+```
+
+Confirm `CODEX_TELEGRAM_CWD` and `CODEX_TELEGRAM_CODEX_BIN` in the generated
+file if the repository or Codex binary is not in the detected location. Then
+verify the bot and configuration:
+
+```bash
+.venv/bin/python scripts/codex_telegram_bot.py get-me
+.venv/bin/python scripts/codex_telegram_bot.py doctor
+.venv/bin/python -m py_compile scripts/codex_telegram_bot.py
+.venv/bin/python -m pytest -q tests/test_codex_telegram_bot.py
+```
+
+Start the foreground service and send the bot a private message:
+
+```bash
+.venv/bin/python scripts/codex_telegram_bot.py serve
+```
+
+In another terminal, verify the chat and delivery. A private chat id is the
+owner's Telegram user id:
+
+```bash
+.venv/bin/python scripts/codex_telegram_bot.py status --chat-id <telegram-chat-id>
+.venv/bin/python scripts/codex_telegram_bot.py verify-channel \
+  --chat-id <telegram-chat-id> --expect reply
+```
+
+The generated `.env` includes the following reference configuration:
 
 ```env
 TELEGRAM_BOT_TOKEN=<telegram-bot-token>

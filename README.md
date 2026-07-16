@@ -23,9 +23,8 @@ the repo.
 - Three group chat modes:
   - `decide`: every allowed group message enters Codex; the model decides
     whether a visible reply helps.
-  - `smart`: wake words, watch phrases, `@` mentions, or replies wake the bot;
-    after wake, every group message enters Codex for three minutes. A visible
-    bot reply extends the window.
+  - `smart`: only messages that match wake words, watch phrases, `@` mentions,
+    or replies to the bot enter Codex.
   - `mention`: traditional mention mode; only `@`, replies to the bot, or
     identity-name calls enter Codex.
 - Direct background continuation for long turns: quick tasks finish inline; if a
@@ -55,45 +54,87 @@ config/*.example                   # safe config examples
 
 ## Quick Start
 
-Create the private runtime config:
+### 1. Prepare Codex, Python, and Telegram
+
+You need:
+
+- Python 3.12.
+- Codex installed and signed in. The bridge can use `codex` from `PATH` or the
+  binary bundled with the Codex/ChatGPT macOS app.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather) and your
+  numeric Telegram user id.
+
+Clone the repository and create an isolated Python environment:
 
 ```bash
-python3.12 scripts/codex_telegram_bot.py init-config
+git clone https://github.com/Qizhan7/codex-telegram-channel.git
+cd codex-telegram-channel
+python3.12 -m venv .venv
+.venv/bin/python -m pip install "pytest>=8"
 ```
 
-Then edit:
+The app-server path has no third-party runtime dependency; `pytest` is only for
+the included verification suite.
+
+### 2. Create the private runtime config
+
+```bash
+.venv/bin/python scripts/codex_telegram_bot.py init-config
+```
+
+This creates private state outside the repository. Edit:
 
 ```text
 ~/.codex/channels/codex-telegram/.env
 ~/.codex/channels/codex-telegram/access.json
 ```
 
-At minimum, set:
+Set the two required values in `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=<telegram-bot-token>
 TELEGRAM_OWNER_IDS=<telegram-user-id>
-CODEX_TELEGRAM_CWD=/path/to/codex-telegram-channel
 ```
 
-Run checks:
+`init-config` fills in the current repository path and a detected Codex binary.
+If the repository moves or Codex is installed elsewhere, update
+`CODEX_TELEGRAM_CWD` or `CODEX_TELEGRAM_CODEX_BIN` in `.env`.
+
+Owner ids are automatically allowed in private chat. For a group, add its
+numeric chat id to `allowedChats` in `access.json` before starting the bridge.
+
+### 3. Verify the setup
+
+Confirm the token reaches the expected bot, inspect configuration health, and
+run the included checks:
 
 ```bash
-python3.12 -m py_compile scripts/codex_telegram_bot.py
-python3.12 -m pytest -q tests/test_codex_telegram_bot.py
+.venv/bin/python scripts/codex_telegram_bot.py get-me
+.venv/bin/python scripts/codex_telegram_bot.py doctor
+.venv/bin/python -m py_compile scripts/codex_telegram_bot.py
+.venv/bin/python -m pytest -q tests/test_codex_telegram_bot.py
 ```
 
-Run one poll pass:
+Fix any `doctor` failure before continuing.
+
+### 4. Start the bridge and send a private message
 
 ```bash
-python3.12 scripts/codex_telegram_bot.py poll-once
+.venv/bin/python scripts/codex_telegram_bot.py serve
 ```
 
-Run the service in the foreground:
+Send the bot a private Telegram message. In another terminal, verify the stored
+chat and successful delivery; for a private chat, the chat id is your Telegram
+user id:
 
 ```bash
-python3.12 scripts/codex_telegram_bot.py serve
+.venv/bin/python scripts/codex_telegram_bot.py status --chat-id <telegram-chat-id>
+.venv/bin/python scripts/codex_telegram_bot.py verify-channel \
+  --chat-id <telegram-chat-id> --expect reply
 ```
+
+For a one-shot polling diagnostic instead of the resident service, use
+`poll-once`. Once the foreground flow works, install the LaunchAgent below.
 
 ## Launchd
 
