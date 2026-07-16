@@ -37,7 +37,9 @@ the repo.
 - Worker supervision without text-triggered dispatch: Telegram messages enter the
   resident Codex thread first. If the resident judges that a separate worker
   would help, it asks for owner confirmation naturally; only after confirmation
-  does it start a worker and supervise it with private checks.
+  does it start a worker. Running checks are bridge-only, transient failures get
+  at most one retry, hard failures open a circuit, and every terminal state gets
+  one visible closure update.
 - Public, neutral base prompt: the model is a generic Codex collaborator reached
   through Telegram, with no private persona dependency.
 
@@ -124,13 +126,20 @@ The public build has no dashboard or control panel. Add a group id to
 
 ```text
 /codex_mode decide   # free mode: pass every allowed group message to Codex
-/codex_mode smart    # wake words/watch phrases open a 3-minute decide window
+/codex_mode smart    # only matching wake words/watch phrases invoke Codex
 /codex_mode mention  # traditional @/reply/name-only mode
 ```
 
 Group turns are single-message by default. Use `/codex_batch batch` only when
 you intentionally want a short window of messages merged into one Codex turn;
 use `/codex_batch single` to return to immediate one-by-one handling.
+
+Private messages use a separate 2-second quiet window by default
+(`CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS=2`). Messages sent together are
+passed to Codex as one ordered batch; group behavior is unchanged.
+
+For shared app-server sessions, two consecutive stream/remote-compact failures
+retire the unhealthy thread and create a continuity handoff for the next turn.
 
 `smart` uses `CODEX_TELEGRAM_WAKE_PHRASES` and the optional
 `CODEX_TELEGRAM_WATCH_PHRASES_PATH` file. Wake phrases are simple consecutive
@@ -156,6 +165,9 @@ messages.
 
 - Keep real tokens out of this repo.
 - `CODEX_TELEGRAM_ENGINE=app-server` is the recommended path.
+- With `CODEX_TELEGRAM_IGNORE_USER_CONFIG=1`, Telegram app-server turns use a
+  minimal state-local Codex home, keeping unrelated user MCP/plugin processes out
+  of the resident thread while preserving shared SQLite/Desktop metadata.
 - `CODEX_TELEGRAM_SESSION_SCOPE=shared`,
   `CODEX_TELEGRAM_DESKTOP_SYNC=1`, and
   `CODEX_TELEGRAM_DESKTOP_OUTBOUND=1` are enabled in the example config so the

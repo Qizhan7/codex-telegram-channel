@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import queue
 import sqlite3
 import sys
 import threading
@@ -33,6 +34,7 @@ def _config(tmp_path: Path, **overrides):
         "model": "gpt-5.5",
         "engine": "app-server",
         "effort": "high",
+        "private_effort": "high",
         "task_effort": "xhigh",
         "session_scope": "shared",
         "cwd": ROOT,
@@ -46,6 +48,7 @@ def _config(tmp_path: Path, **overrides):
         "context_text_chars": 800,
         "rollover_input_tokens": 200000,
         "batch_delay_seconds": 2.5,
+        "private_batch_delay_seconds": 0.0,
         "deny_unknown": False,
         "ignore_user_config": True,
         "bypass_permissions": True,
@@ -86,6 +89,86 @@ def _clear_wake_window(chat_id: str) -> None:
 def _write_rollout_record(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _telegram_update(update_id: int, chat_id: int, chat_type: str, text: str) -> dict:
+    chat: dict[str, object] = {"id": chat_id, "type": chat_type}
+    if chat_type != "private":
+        chat["title"] = "Group"
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id + 100,
+            "date": int(time.time()),
+            "chat": chat,
+            "from": {"id": 111, "is_bot": False, "first_name": "Owner"},
+            "text": text,
+        },
+    }
+
+
+def test_updates_private_first_preserves_relative_order() -> None:
+    updates = [
+        _telegram_update(10, -100, "supergroup", "group 1"),
+        _telegram_update(11, 111, "private", "dm 1"),
+        _telegram_update(12, -100, "supergroup", "group 2"),
+        _telegram_update(13, 111, "private", "dm 2"),
+    ]
+
+    ordered = codex_telegram_bot.updates_private_first(updates)
+
+    assert [update["update_id"] for update in ordered] == [11, 13, 10, 12]
+
+
+def test_enqueue_pulled_updates_keeps_one_batch_for_durable_checkpoint(tmp_path: Path) -> None:
+    service = codex_telegram_bot.BotService(_config(tmp_path))
+    update_queue: queue.Queue[list[dict]] = queue.Queue()
+    updates = [
+        _telegram_update(10, -100, "supergroup", "group"),
+        _telegram_update(11, 111, "private", "dm"),
+        _telegram_update(12, -100, "supergroup", "group 2"),
+    ]
+
+    assert service.enqueue_pulled_updates(update_queue, updates) == 3
+    queued_batch = update_queue.get_nowait()
+    assert [update["update_id"] for update in queued_batch] == [11, 10, 12]
+    assert update_queue.empty()
+
+
+def test_poll_once_prioritizes_private_updates_and_advances_offset_after_batch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    codex_telegram_bot.set_meta(conn, "telegram_offset", "10")
+    codex_telegram_bot.set_meta(conn, "bot_id", "8600")
+    codex_telegram_bot.set_meta(conn, "bot_username", "codex_test_bot")
+    conn.close()
+    updates = [
+        _telegram_update(10, -100, "supergroup", "group 1"),
+        _telegram_update(11, 111, "private", "dm"),
+        _telegram_update(12, -100, "supergroup", "group 2"),
+    ]
+    seen: list[int] = []
+
+    def fake_get_updates(config, offset):
+        assert offset == 10
+        return updates
+
+    def fake_process_update(self, conn_arg, update):
+        seen.append(update["update_id"])
+        assert codex_telegram_bot.get_meta(conn_arg, "telegram_offset") == "10"
+        return True
+
+    monkeypatch.setattr(codex_telegram_bot, "get_updates", fake_get_updates)
+    monkeypatch.setattr(codex_telegram_bot.BotService, "process_update", fake_process_update)
+
+    assert codex_telegram_bot.BotService(cfg).poll_once() == 3
+
+    conn = _conn(tmp_path)
+    assert seen == [11, 10, 12]
+    assert codex_telegram_bot.get_meta(conn, "telegram_offset") == "13"
 
 
 def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
@@ -148,6 +231,31 @@ def test_parse_command_uses_public_namespace() -> None:
     assert codex_telegram_bot.parse_command("/status", "codex_test_bot") is None
 
 
+def test_poll_error_backoff_respects_telegram_retry_after() -> None:
+    exc = codex_telegram_bot.TelegramAPIError(
+        "rate limited",
+        method="getUpdates",
+        code=429,
+        retry_after=17,
+    )
+
+    assert codex_telegram_bot.poll_error_backoff_seconds(exc, consecutive_errors=4) == 17.0
+
+
+def test_poll_error_backoff_slows_down_port_exhaustion() -> None:
+    exc = codex_telegram_bot.urllib.error.URLError(OSError(49, "Can't assign requested address"))
+
+    assert codex_telegram_bot.looks_like_port_exhaustion(exc)
+    assert codex_telegram_bot.poll_error_backoff_seconds(exc, consecutive_errors=1) == 120.0
+    assert codex_telegram_bot.poll_error_backoff_seconds(exc, consecutive_errors=2) == 240.0
+    assert codex_telegram_bot.poll_error_backoff_seconds(exc, consecutive_errors=4) == 900.0
+    assert codex_telegram_bot.poll_error_backoff_seconds(exc, consecutive_errors=99) == 900.0
+
+
+def test_poll_error_backoff_keeps_short_delay_for_plain_errors() -> None:
+    assert codex_telegram_bot.poll_error_backoff_seconds(RuntimeError("temporary failure")) == 5.0
+
+
 def test_group_run_errors_stay_local_instead_of_template_reply() -> None:
     result = codex_telegram_bot.RunResult(
         run_id="run-error",
@@ -185,7 +293,7 @@ def test_group_run_errors_stay_local_instead_of_template_reply() -> None:
             allow_silent_reply=False,
             explicitly_addressed=True,
         )
-        == "diagnostic details"
+        == "这次 Codex 调用没跑完，我没有拿到完整结果。直接续发一句，我会从当前上下文接着处理。"
     )
 
 
@@ -222,6 +330,36 @@ def test_app_server_base_instructions_are_public_and_include_tools(tmp_path: Pat
     assert "do not use a stock phrase" in instructions
 
 
+def test_app_server_uses_isolated_home_when_ignoring_user_config(tmp_path: Path, monkeypatch) -> None:
+    state_dir = tmp_path / "state"
+    main_home = tmp_path / "main-codex"
+    main_home.mkdir()
+    (main_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(main_home))
+    monkeypatch.delenv("CODEX_SQLITE_HOME", raising=False)
+    cfg = _config(state_dir, codex_bin="/opt/codex", ignore_user_config=True)
+
+    assert codex_telegram_bot.app_server_command(cfg) == ["/opt/codex", "app-server", "--stdio"]
+    env = codex_telegram_bot.app_server_environment(cfg)
+    isolated = state_dir / "codex-home"
+    assert env["CODEX_HOME"] == str(isolated)
+    assert env["CODEX_SQLITE_HOME"] == str(main_home)
+    assert (isolated / "auth.json").resolve() == (main_home / "auth.json").resolve()
+    config_text = (isolated / "config.toml").read_text(encoding="utf-8")
+    assert "apps = false" in config_text
+    assert "plugins = false" in config_text
+    assert "memories = false" in config_text
+
+
+def test_app_server_command_allows_user_config_when_requested(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_HOME", "/custom/codex-home")
+    cfg = _config(tmp_path, codex_bin="/opt/codex", ignore_user_config=False)
+
+    assert codex_telegram_bot.app_server_command(cfg) == ["/opt/codex", "app-server", "--stdio"]
+    assert codex_telegram_bot.app_server_environment(cfg)["CODEX_HOME"] == "/custom/codex-home"
+    assert not (tmp_path / "codex-home").exists()
+
+
 def test_desktop_titles_include_merged_shared_thread(tmp_path: Path) -> None:
     shared_cfg = _config(tmp_path, session_scope="shared")
     per_chat_cfg = _config(tmp_path, session_scope="per-chat")
@@ -238,8 +376,21 @@ def test_desktop_outbound_filters_non_user_records() -> None:
     assert not codex_telegram_bot.is_desktop_outbound_user_text(
         '<channel source="telegram" chat_id="111">\nhello\n</channel>'
     )
+    assert not codex_telegram_bot.is_desktop_outbound_user_text(
+        "# AGENTS.md instructions\n\n"
+        "<INSTRUCTIONS>\n"
+        "你是本机的私有 Codex 助手。\n"
+        "这是一段足够长的本地说明，不能被桌面转发到 Telegram 群里。\n"
+        "</INSTRUCTIONS>"
+    )
 
     assert codex_telegram_bot.is_desktop_outbound_agent_text("Assistant final answer")
+    assert not codex_telegram_bot.is_desktop_outbound_agent_text(
+        "# AGENTS.md instructions\n\n"
+        "<INSTRUCTIONS>\n"
+        "Assistant accidentally echoed local instructions, which must stay private.\n"
+        "</INSTRUCTIONS>"
+    )
     assert not codex_telegram_bot.is_desktop_outbound_agent_text("TG sent: hello")
     assert not codex_telegram_bot.is_desktop_outbound_agent_text("TG skipped: hello")
     assert not codex_telegram_bot.is_desktop_outbound_agent_text("(silent)")
@@ -673,8 +824,8 @@ def test_group_modes_route_as_decide_smart_or_mention(tmp_path: Path) -> None:
     assert not service.should_call_codex(conn, chat, row, sender, "普通闲聊一句", {"message_id": 2}, policy)
     assert service.should_allow_silent_reply(chat, row, sender, policy)
     assert service.should_call_codex(conn, chat, row, sender, "codexbot 怎么回事", {"message_id": 3, "text": "codexbot 怎么回事"}, policy)
-    assert codex_telegram_bot.wake_window_active(chat.chat_id)
-    assert service.should_call_codex(conn, chat, row, sender, "普通跟一句", {"message_id": 4, "text": "普通跟一句"}, policy)
+    assert not codex_telegram_bot.wake_window_active(chat.chat_id)
+    assert not service.should_call_codex(conn, chat, row, sender, "普通跟一句", {"message_id": 4, "text": "普通跟一句"}, policy)
 
     _clear_wake_window(chat.chat_id)
     codex_telegram_bot.set_chat_mode(conn, chat.chat_id, "mention")
@@ -683,6 +834,115 @@ def test_group_modes_route_as_decide_smart_or_mention(tmp_path: Path) -> None:
     assert not service.should_call_codex(conn, chat, row, sender, "project alpha开局了吗", {"message_id": 5, "text": "project alpha开局了吗"}, policy)
     assert service.should_call_codex(conn, chat, row, sender, "codex 在吗", {"message_id": 6, "text": "codex 在吗"}, policy)
     assert not codex_telegram_bot.wake_window_active(chat.chat_id)
+
+
+def test_short_stale_identity_call_still_reaches_codex(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(
+        tmp_path,
+        wake_phrases=("助手", "项目甲"),
+        identity_wake_phrases=("助手", "小助手", "codex"),
+        group_decision_source="model",
+    )
+    (tmp_path / "access.json").write_text(
+        json.dumps(
+            {
+                "dmPolicy": "allowlist",
+                "groupPolicy": "decide",
+                "botPolicy": "ai-decide",
+                "allowedUsers": [],
+                "allowedChats": ["-100"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = _conn(tmp_path)
+    codex_telegram_bot.set_meta(conn, "bot_id", "8600")
+    codex_telegram_bot.set_meta(conn, "bot_username", "codex_test_bot")
+    service = codex_telegram_bot.BotService(cfg)
+    service.bot_id = "8600"
+    service.bot_username = "codex_test_bot"
+    now = 10_000.0
+    service._boot_wall_ts = now
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+    calls: list[dict] = []
+
+    def fake_run_single_message(
+        self,
+        conn_arg,
+        chat,
+        sender,
+        message_id,
+        message_thread_id,
+        prompt_text,
+        trigger_text,
+        allow_silent_reply,
+        explicitly_addressed,
+        **kwargs,
+    ):
+        calls.append(
+            {
+                "message_id": message_id,
+                "trigger_text": trigger_text,
+                "explicitly_addressed": explicitly_addressed,
+            }
+        )
+
+    monkeypatch.setattr(codex_telegram_bot.BotService, "run_single_message", fake_run_single_message)
+    direct_update = {
+        "update_id": 1,
+        "message": {
+            "message_id": 101,
+            "date": int(now - codex_telegram_bot.STALE_ACT_MAX_AGE_SECONDS - 1),
+            "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+            "from": {"id": 111, "is_bot": False, "first_name": "Owner"},
+            "text": "助手～测试一下",
+        },
+    }
+
+    service.handle_update(conn, direct_update)
+
+    assert calls == [{"message_id": 101, "trigger_text": "助手～测试一下", "explicitly_addressed": True}]
+
+
+def test_short_stale_background_group_message_is_not_replayed(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, wake_phrases=("助手",), group_decision_source="model")
+    (tmp_path / "access.json").write_text(
+        json.dumps(
+            {
+                "dmPolicy": "allowlist",
+                "groupPolicy": "decide",
+                "botPolicy": "ai-decide",
+                "allowedUsers": [],
+                "allowedChats": ["-100"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    now = 10_000.0
+    service._boot_wall_ts = now
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+    calls: list[int] = []
+
+    def fake_run_single_message(self, conn_arg, chat, sender, message_id, *args, **kwargs):
+        calls.append(message_id)
+
+    monkeypatch.setattr(codex_telegram_bot.BotService, "run_single_message", fake_run_single_message)
+    background_update = {
+        "update_id": 2,
+        "message": {
+            "message_id": 102,
+            "date": int(now - codex_telegram_bot.STALE_ACT_MAX_AGE_SECONDS - 1),
+            "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+            "from": {"id": 222, "is_bot": False, "first_name": "Friend"},
+            "text": "普通闲聊一句",
+        },
+    }
+
+    service.handle_update(conn, background_update)
+
+    assert calls == []
 
 
 def test_auto_is_not_a_chat_mode_alias() -> None:
@@ -735,7 +995,7 @@ def test_group_bots_follow_chat_modes_like_humans(tmp_path: Path) -> None:
         {"message_id": 3, "text": "codexbot 在吗"},
         policy,
     )
-    assert codex_telegram_bot.wake_window_active(chat.chat_id)
+    assert not codex_telegram_bot.wake_window_active(chat.chat_id)
 
     _clear_wake_window(chat.chat_id)
     codex_telegram_bot.set_chat_mode(conn, chat.chat_id, "mention")
@@ -784,7 +1044,7 @@ def test_legacy_mention_strict_alias_maps_to_traditional_mention(tmp_path: Path)
     )
 
 
-def test_smart_mode_opens_window_on_name(tmp_path: Path) -> None:
+def test_smart_mode_name_trigger_is_single_message(tmp_path: Path) -> None:
     cfg = _config(tmp_path, wake_phrases=("codex",))
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("-9002", "supergroup", "Smart Room")
@@ -797,10 +1057,10 @@ def test_smart_mode_opens_window_on_name(tmp_path: Path) -> None:
     assert codex_telegram_bot.should_trigger_group_reply(
         "codex 在吗", {"message_id": 1, "text": "codex 在吗"}, row, policy, cfg, None, None, sender,
     )
-    assert codex_telegram_bot.wake_window_active(chat.chat_id)
+    assert not codex_telegram_bot.wake_window_active(chat.chat_id)
 
 
-def test_smart_mode_watch_phrase_opens_window_and_allows_following_message(tmp_path: Path) -> None:
+def test_smart_mode_watch_phrase_triggers_only_matching_message(tmp_path: Path) -> None:
     (tmp_path / "watch_phrases.txt").write_text("project alpha\n", encoding="utf-8")
     cfg = _config(tmp_path, wake_phrases=("codex",))
     conn = _conn(tmp_path)
@@ -815,9 +1075,9 @@ def test_smart_mode_watch_phrase_opens_window_and_allows_following_message(tmp_p
     assert codex_telegram_bot.should_trigger_group_reply(
         "project alpha刚说了这句", {"message_id": 1, "text": "project alpha刚说了这句"}, row, policy, cfg, None, None, sender,
     )
-    assert codex_telegram_bot.wake_window_active(chat.chat_id)
+    assert not codex_telegram_bot.wake_window_active(chat.chat_id)
 
-    assert codex_telegram_bot.should_trigger_group_reply(
+    assert not codex_telegram_bot.should_trigger_group_reply(
         "然后呢", {"message_id": 2, "text": "然后呢"}, row, policy, cfg, None, None, sender,
     )
 
@@ -852,7 +1112,7 @@ def test_addressed_quiet_request_reaches_model_in_smart_mode(tmp_path: Path) -> 
         {"message_id": 2, "text": "codex先别回"},
         policy,
     )
-    assert codex_telegram_bot.wake_window_active(chat.chat_id)
+    assert not codex_telegram_bot.wake_window_active(chat.chat_id)
 
 
 def test_wake_window_extends_when_bot_sends_message(tmp_path: Path, monkeypatch) -> None:
@@ -1304,6 +1564,38 @@ def test_app_server_reply_tool_uses_turn_immediate_sender(tmp_path: Path) -> Non
     assert events[0]["delivered_immediately"] is True
 
 
+def test_app_server_reply_tool_blocks_system_prompt_echo(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+    delivered: list[list[dict[str, object]]] = []
+
+    def immediate_sender(events: list[dict[str, object]]) -> None:
+        delivered.append([dict(event) for event in events])
+
+    client.current_turn_chat_id = "111"
+    client.current_turn_immediate_channel_event_sender = immediate_sender
+    events: list[dict[str, object]] = []
+
+    result = client.record_dynamic_tool_call(
+        {
+            "tool": "reply",
+            "arguments": {
+                "text": (
+                    "# AGENTS.md instructions\n\n"
+                    "<INSTRUCTIONS>\n"
+                    "这是一段足够长的本地说明，不应该通过 reply 工具直接发到 Telegram。\n"
+                    "</INSTRUCTIONS>"
+                )
+            },
+        },
+        events,
+    )
+
+    assert result["success"] is False
+    assert delivered == []
+    assert events == []
+
+
 def test_run_codex_forwards_immediate_sender_to_app_server(tmp_path: Path) -> None:
     cfg = _config(tmp_path, engine="app-server", desktop_sync=False)
     conn = _conn(tmp_path)
@@ -1514,6 +1806,122 @@ def test_direct_background_waits_for_model_reply_without_bridge_ack(tmp_path: Pa
     )
 
 
+def test_direct_background_keeps_typing_until_background_delivery(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(
+        tmp_path,
+        direct_background=True,
+        direct_background_after_seconds=0.01,
+        direct_background_timeout_seconds=60,
+        auto_worker=False,
+    )
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+    sent: list[str] = []
+    stop_events: list[threading.Event] = []
+    run_can_finish = threading.Event()
+
+    def fake_start_typing_feedback(config, chat_id, *, message_thread_id=None):
+        stop = threading.Event()
+        stop_events.append(stop)
+        return stop
+
+    def fake_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        sent.append(text)
+        return [len(sent)]
+
+    def fake_run_codex(*args, **kwargs):
+        assert run_can_finish.wait(1)
+        return codex_telegram_bot.RunResult(
+            run_id=kwargs.get("run_id") or "run-bg",
+            status="ok",
+            reply="回来了。",
+            session_id_after=None,
+            error=None,
+            channel_events=[],
+        )
+
+    monkeypatch.setattr(codex_telegram_bot, "start_typing_feedback", fake_start_typing_feedback)
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fake_send_message)
+    monkeypatch.setattr(codex_telegram_bot, "run_codex", fake_run_codex)
+
+    service.run_single_message(
+        conn,
+        chat,
+        sender,
+        45,
+        None,
+        "慢一点也要回",
+        "慢一点也要回",
+        False,
+        True,
+    )
+
+    assert stop_events and not stop_events[0].is_set()
+    assert sent == []
+    run_can_finish.set()
+    deadline = time.monotonic() + 1
+    while sent != ["回来了。"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert sent == ["回来了。"]
+    assert stop_events[0].is_set()
+
+
+def test_explicit_single_message_starts_typing_before_waiting_for_chat_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path, direct_background=False, auto_worker=False)
+    conn = sqlite3.connect(tmp_path / "chats.sqlite", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    codex_telegram_bot.init_db(conn)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Room")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+    typing_started = threading.Event()
+    stop_events: list[threading.Event] = []
+
+    def fake_start_typing_feedback(config, chat_id, *, message_thread_id=None):
+        typing_started.set()
+        stop = threading.Event()
+        stop_events.append(stop)
+        return stop
+
+    def fake_run_codex(*args, **kwargs):
+        return codex_telegram_bot.RunResult(
+            run_id="run-lock",
+            status="ok",
+            reply=codex_telegram_bot.NO_REPLY_SENTINEL,
+            session_id_after=args[3],
+            error=None,
+            channel_events=[],
+        )
+
+    monkeypatch.setattr(codex_telegram_bot, "start_typing_feedback", fake_start_typing_feedback)
+    monkeypatch.setattr(codex_telegram_bot, "run_codex", fake_run_codex)
+
+    lock = service.lock_for_chat(chat.chat_id)
+    lock.acquire()
+    thread = threading.Thread(
+        target=service.run_single_message,
+        args=(conn, chat, sender, 44, None, "助手你看这条", "助手你看这条", True, True),
+    )
+    thread.start()
+    try:
+        assert typing_started.wait(0.5)
+        assert thread.is_alive()
+    finally:
+        lock.release()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert stop_events and stop_events[0].is_set()
+
+
 def test_user_visible_task_ack_copy_keeps_internal_routing_private() -> None:
     visible = [
         codex_telegram_bot.INTERRUPTED_BACKGROUND_NOTICE_TEXT,
@@ -1686,6 +2094,72 @@ def test_existing_worker_context_lets_resident_choose_continue_or_new_worker(tmp
     assert "codex_worker_continue" in prompt
     assert "Ask the owner for natural confirmation before starting" in prompt
     assert "start a new worker only after confirmation" in prompt
+
+
+def test_terminal_worker_without_live_alarm_leaves_resident_context(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "closed-task",
+        "title": "Old failed worker",
+        "status": "failed",
+        "pid": 0,
+        "session_id": "worker-session-1",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": codex_telegram_bot.utc_now(),
+        "turn_count": 1,
+        "failure_count": 1,
+        "last_error": "hard failure",
+        "circuit_open": True,
+        "terminal_notified_at": "",
+        "output_path": str(tmp_path / "workers" / "closed-task.last.txt"),
+        "jsonl_path": str(tmp_path / "workers" / "closed-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "closed-task.stderr.log"),
+        "auto_delivery": {"chat_id": "111"},
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+
+    assert codex_telegram_bot.active_worker_context_block(cfg, "111") == ""
+
+
+def test_worker_context_ignores_finished_alarm_metadata(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "needs-input-task",
+        "title": "Worker awaiting a choice",
+        "status": "needs_input",
+        "pid": 0,
+        "session_id": "worker-session-1",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": codex_telegram_bot.utc_now(),
+        "turn_count": 1,
+        "output_path": str(tmp_path / "workers" / "needs-input-task.last.txt"),
+        "jsonl_path": str(tmp_path / "workers" / "needs-input-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "needs-input-task.stderr.log"),
+        "auto_delivery": {"chat_id": "111"},
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+    alarm = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="needs-input-task",
+        seconds=60,
+        chat_id="111",
+        message_thread_id=None,
+        note="old supervisor note",
+    )
+    alarm["status"] = "done"
+    codex_telegram_bot.write_worker_alarm(cfg, alarm)
+
+    context = codex_telegram_bot.active_worker_context_block(cfg, "111")
+
+    assert "task_id=needs-input-task" in context
+    assert "next_alarm=" not in context
+    assert "old supervisor note" not in context
 
 
 def test_group_setting_task_enters_resident_instead_of_auto_worker(tmp_path: Path, monkeypatch) -> None:
@@ -2038,6 +2512,273 @@ def test_refresh_worker_state_marks_missing_process_without_output_failed(tmp_pa
     assert "worker process ended" in codex_telegram_bot.format_worker_state(refreshed)
 
 
+def test_worker_command_does_not_use_removed_ignore_user_config_flag(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex")
+    output = tmp_path / "worker.txt"
+
+    initial = codex_telegram_bot.codex_worker_command(cfg, ROOT, output)
+    resumed = codex_telegram_bot.codex_worker_command(cfg, ROOT, output, session_id="session-1")
+
+    assert "--ignore-user-config" not in initial
+    assert "--ignore-user-config" not in resumed
+
+
+def test_schedule_worker_alarm_deduplicates_pending_task_alarm(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+
+    first = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="task-1",
+        seconds=60,
+        chat_id="111",
+        message_thread_id=None,
+        note="first",
+    )
+    second = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="task-1",
+        seconds=120,
+        chat_id="111",
+        message_thread_id=9,
+        note="updated",
+    )
+
+    assert second["alarm_id"] == first["alarm_id"]
+    assert second["message_thread_id"] == 9
+    assert second["note"] == "updated"
+    assert len(codex_telegram_bot.list_worker_alarms(cfg)) == 1
+
+
+def test_nonretryable_worker_failure_opens_continue_circuit(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    task_id = "hard-failure"
+    jsonl = tmp_path / "workers" / f"{task_id}.jsonl"
+    codex_telegram_bot.write_private_text(
+        jsonl,
+        json.dumps({"type": "error", "message": "Too many open files (os error 24)"}) + "\n",
+    )
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": task_id,
+        "title": "hard failure",
+        "status": "running",
+        "pid": 0,
+        "session_id": "session-1",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": "",
+        "turn_count": 1,
+        "returncode": 1,
+        "output_path": str(tmp_path / "workers" / f"{task_id}.last.txt"),
+        "jsonl_path": str(jsonl),
+        "stderr_path": str(tmp_path / "workers" / f"{task_id}.stderr.log"),
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+
+    refreshed = codex_telegram_bot.refresh_worker_state(cfg, state)
+    assert refreshed["failure_count"] == 1
+    assert refreshed["circuit_open"] is True
+    assert "Too many open files" in refreshed["last_error"]
+
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+    result = client.record_worker_tool_call(
+        "codex_worker_continue",
+        {"task_id": task_id, "prompt": "try again"},
+    )
+    assert result["success"] is False
+    assert "retry circuit is open" in result["contentItems"][0]["text"]
+
+
+def test_retryable_worker_failure_opens_after_second_attempt(tmp_path: Path) -> None:
+    jsonl = tmp_path / "worker.jsonl"
+    codex_telegram_bot.write_private_text(
+        jsonl,
+        json.dumps({"type": "error", "message": "stream disconnected before completion"}) + "\n",
+    )
+    state = {
+        "status": "running",
+        "failure_count": 1,
+        "jsonl_path": str(jsonl),
+        "output_path": str(tmp_path / "worker.txt"),
+        "stderr_path": str(tmp_path / "worker.stderr"),
+    }
+
+    codex_telegram_bot.finish_worker_attempt(state, "", 1)
+
+    assert state["status"] == "failed"
+    assert state["failure_count"] == codex_telegram_bot.WORKER_MAX_FAILED_ATTEMPTS
+    assert state["circuit_open"] is True
+
+
+def test_running_worker_alarm_rechecks_without_model_turn(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, auto_worker_check_seconds=5)
+    conn = _conn(tmp_path)
+    codex_telegram_bot.upsert_chat(conn, codex_telegram_bot.Chat("111", "private", "Owner"))
+    conn.close()
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "running-task",
+        "title": "running task",
+        "status": "running",
+        "pid": 123,
+        "session_id": "session-1",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": "",
+        "turn_count": 1,
+        "output_path": str(tmp_path / "workers" / "running-task.last.txt"),
+        "jsonl_path": str(tmp_path / "workers" / "running-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "running-task.stderr.log"),
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+    alarm = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="running-task",
+        seconds=5,
+        chat_id="111",
+        message_thread_id=None,
+    )
+    monkeypatch.setattr(codex_telegram_bot, "worker_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "run_codex",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("running check must not open a model turn")),
+    )
+    service = codex_telegram_bot.BotService(cfg)
+
+    assert service.handle_worker_alarm(alarm) is True
+    stored = codex_telegram_bot.read_worker_alarm(cfg, alarm["alarm_id"])
+    assert stored is not None
+    assert stored["status"] == "pending"
+    assert stored["run_id"] == ""
+    assert len(codex_telegram_bot.list_worker_alarms(cfg)) == 1
+
+
+def test_failed_worker_alarm_closes_once_without_model_retry(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    codex_telegram_bot.upsert_chat(conn, codex_telegram_bot.Chat("111", "private", "Owner"))
+    conn.close()
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "failed-task",
+        "title": "failed task",
+        "status": "failed",
+        "pid": 0,
+        "session_id": "session-1",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": codex_telegram_bot.utc_now(),
+        "turn_count": 1,
+        "failure_count": 1,
+        "last_error": "Too many open files (os error 24)",
+        "circuit_open": True,
+        "terminal_notified_at": "",
+        "output_path": str(tmp_path / "workers" / "failed-task.last.txt"),
+        "jsonl_path": str(tmp_path / "workers" / "failed-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "failed-task.stderr.log"),
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+    alarm = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="failed-task",
+        seconds=5,
+        chat_id="111",
+        message_thread_id=None,
+    )
+    duplicate = dict(alarm)
+    duplicate["alarm_id"] = "duplicate-alarm"
+    codex_telegram_bot.write_worker_alarm(cfg, duplicate)
+    sent: list[str] = []
+
+    def fake_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        sent.append(text)
+        return [901]
+
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fake_send_message)
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "run_codex",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hard failure must not open a model turn")),
+    )
+    service = codex_telegram_bot.BotService(cfg)
+
+    assert service.handle_worker_alarm(alarm) is True
+    assert len(sent) == 1
+    assert "已停止" in sent[0]
+    assert "Too many open files" in sent[0]
+    closed = codex_telegram_bot.read_worker_state(cfg, "failed-task")
+    assert closed is not None and closed["terminal_notified_at"]
+    assert codex_telegram_bot.read_worker_alarm(cfg, alarm["alarm_id"])["status"] == "done"
+    assert codex_telegram_bot.read_worker_alarm(cfg, "duplicate-alarm")["status"] == "cancelled"
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as check_conn:
+        row = check_conn.execute(
+            "SELECT telegram_message_id, event_type FROM channel_deliveries WHERE event_type = 'worker_supervision'"
+        ).fetchone()
+    assert row["telegram_message_id"] == 901
+
+
+def test_complete_worker_alarm_reviews_on_shared_resident_thread(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    codex_telegram_bot.upsert_chat(conn, codex_telegram_bot.Chat("111", "private", "Owner"))
+    codex_telegram_bot.set_meta(conn, "shared_codex_session_id:app-server", "shared-thread")
+    conn.close()
+    output = tmp_path / "workers" / "complete-task.last.txt"
+    codex_telegram_bot.write_private_text(output, "changed: scripts/a.py\nchecks: pytest passed")
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "complete-task",
+        "title": "complete task",
+        "status": "complete",
+        "pid": 0,
+        "session_id": "worker-session",
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": codex_telegram_bot.utc_now(),
+        "turn_count": 1,
+        "failure_count": 0,
+        "terminal_notified_at": "",
+        "output_path": str(output),
+        "jsonl_path": str(tmp_path / "workers" / "complete-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "complete-task.stderr.log"),
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+    alarm = codex_telegram_bot.schedule_worker_alarm(
+        cfg,
+        task_id="complete-task",
+        seconds=5,
+        chat_id="111",
+        message_thread_id=None,
+    )
+    calls: list[tuple] = []
+
+    def fake_run_codex(*args, **kwargs):
+        calls.append(args)
+        return codex_telegram_bot.RunResult(
+            run_id="resident-review",
+            status="ok",
+            reply=codex_telegram_bot.NO_REPLY_SENTINEL,
+            session_id_after="shared-thread",
+            error=None,
+            channel_events=[{"type": "reply", "chat_id": "current", "text": "验收完成"}],
+        )
+
+    monkeypatch.setattr(codex_telegram_bot, "run_codex", fake_run_codex)
+    monkeypatch.setattr(service := codex_telegram_bot.BotService(cfg), "send_channel_events", lambda *a, **k: True)
+
+    assert service.handle_worker_alarm(alarm) is True
+    assert len(calls) == 1
+    assert calls[0][3] == "shared-thread"
+    closed = codex_telegram_bot.read_worker_state(cfg, "complete-task")
+    assert closed is not None and closed["terminal_notified_at"]
+    assert codex_telegram_bot.read_worker_alarm(cfg, alarm["alarm_id"])["status"] == "done"
+
+
 def test_interrupted_background_run_notifies_chat(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     conn = _conn(tmp_path)
@@ -2102,6 +2843,120 @@ def test_interrupted_background_run_notifies_chat(tmp_path: Path, monkeypatch) -
     assert row["telegram_message_id"] == 777
     assert row["delivery_status"] == "sent"
     assert row["message_thread_id"] == 12
+
+
+def test_interrupted_private_run_hides_desktop_prompt_and_notifies_when_no_delivery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    run_id = "interrupted-private"
+    prompt_text = (
+        '<channel source="telegram" chat_id="111" message_id="9" user="Owner" owner="true">\n'
+        "hello\n"
+        "</channel>"
+    )
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+    codex_telegram_bot.create_run(
+        conn,
+        run_id,
+        "111",
+        "thread-before",
+        prompt_path,
+        tmp_path / "reply.txt",
+        tmp_path / "run.jsonl",
+    )
+    rows = codex_telegram_bot.running_runs(conn)
+    hidden: list[tuple[str | None, str, str | None]] = []
+    sent: list[dict[str, object]] = []
+
+    def fake_hide(conn_arg, config, session_id, raw_prompt, *, live_mirror_run_id=None):
+        hidden.append((session_id, raw_prompt, live_mirror_run_id))
+
+    def fake_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_to_message_id": reply_to_message_id,
+                "message_thread_id": message_thread_id,
+            }
+        )
+        return [778]
+
+    monkeypatch.setattr(codex_telegram_bot, "maybe_hide_desktop_prompt_display", fake_hide)
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fake_send_message)
+
+    assert codex_telegram_bot.mark_running_runs_interrupted(conn, "daemon restarted before run completed") == 1
+    assert service.hide_interrupted_desktop_prompt_mirrors(conn, rows) == 1
+    assert service.notify_interrupted_visible_runs(conn, rows, "daemon restarted before run completed") == 1
+
+    assert hidden == [("thread-before", prompt_text, run_id)]
+    assert sent == [
+        {
+            "chat_id": "111",
+            "text": codex_telegram_bot.INTERRUPTED_TURN_NOTICE_TEXT,
+            "reply_to_message_id": None,
+            "message_thread_id": None,
+        }
+    ]
+    row = conn.execute(
+        """
+        SELECT event_type, telegram_message_id, delivery_status
+        FROM channel_deliveries
+        WHERE run_id = ? AND event_type = 'interrupted_notice'
+        """,
+        (run_id,),
+    ).fetchone()
+    assert row["event_type"] == "interrupted_notice"
+    assert row["telegram_message_id"] == 778
+    assert row["delivery_status"] == "sent"
+
+
+def test_interrupted_private_run_notice_skips_existing_visible_delivery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    run_id = "interrupted-private-visible"
+    codex_telegram_bot.create_run(
+        conn,
+        run_id,
+        "111",
+        "thread-before",
+        tmp_path / "prompt.txt",
+        tmp_path / "reply.txt",
+        tmp_path / "run.jsonl",
+    )
+    codex_telegram_bot.record_channel_delivery(
+        conn,
+        run_id,
+        "111",
+        0,
+        779,
+        None,
+        None,
+        "already visible",
+        event_type="reply",
+    )
+    rows = codex_telegram_bot.running_runs(conn)
+
+    def fail_send_message(*args, **kwargs):
+        raise AssertionError("send_message should not be called")
+
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fail_send_message)
+
+    assert codex_telegram_bot.mark_running_runs_interrupted(conn, "daemon restarted before run completed") == 1
+    assert service.notify_interrupted_visible_runs(conn, rows, "daemon restarted before run completed") == 0
 
 
 def test_batch_direct_background_continues_silently_before_late_delivery(tmp_path: Path, monkeypatch) -> None:
@@ -2313,6 +3168,172 @@ def test_batch_ok_result_delivers_when_newer_message_arrives(tmp_path: Path, mon
         if state.timer is not None:
             state.timer.cancel()
 
+
+def test_batch_reschedules_next_pile_after_running_batch_finishes(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, channel_tools=False, direct_background=False)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    service = codex_telegram_bot.BotService(cfg)
+    scheduled: list[tuple[str, int, float, list[int]]] = []
+
+    def fake_run_batch(chat_arg, items_arg, revision_arg):
+        with service.batch_lock:
+            state = service.batches[chat.chat_id]
+            state.items.append(
+                codex_telegram_bot.BatchItem(
+                    message_id=78,
+                    message_thread_id=None,
+                    sender=sender,
+                    text="next pile",
+                    explicitly_addressed=False,
+                    created_at=codex_telegram_bot.utc_now(),
+                )
+            )
+            state.revision += 1
+            state.timer = None
+        return codex_telegram_bot.RunResult(
+            run_id="batch-run",
+            status="ok",
+            reply=codex_telegram_bot.NO_REPLY_SENTINEL,
+            session_id_after="thread-1",
+            error=None,
+            channel_events=[],
+        )
+
+    def fake_schedule(chat_id, state, delay):
+        scheduled.append((chat_id, state.revision, delay, [item.message_id for item in state.items]))
+
+    monkeypatch.setattr(service, "run_batch", fake_run_batch)
+    monkeypatch.setattr(service, "schedule_batch_locked", fake_schedule)
+    with service.batch_lock:
+        service.batches[chat.chat_id] = codex_telegram_bot.BatchState(
+            chat=chat,
+            items=[
+                codex_telegram_bot.BatchItem(
+                    message_id=77,
+                    message_thread_id=None,
+                    sender=sender,
+                    text="first pile",
+                    explicitly_addressed=False,
+                    created_at=codex_telegram_bot.utc_now(),
+                )
+            ],
+            revision=1,
+            running=False,
+            timer=None,
+        )
+
+    service.flush_batch(chat.chat_id, 1)
+
+    assert scheduled == [(chat.chat_id, 2, cfg.batch_delay_seconds, [78])]
+
+
+
+def test_private_messages_use_two_second_batch_window(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, private_batch_delay_seconds=2.0)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    service = codex_telegram_bot.BotService(cfg)
+    scheduled: list[tuple[str, float, list[int]]] = []
+
+    def fake_schedule(chat_id, state, delay):
+        scheduled.append((chat_id, delay, [item.message_id for item in state.items]))
+
+    monkeypatch.setattr(service, "schedule_batch_locked", fake_schedule)
+
+    assert service.should_batch_codex(conn, chat, allow_silent_reply=False)
+    service.enqueue_batch(chat, sender, 10, None, "第一条", True)
+    service.enqueue_batch(chat, sender, 11, None, "第二条", True)
+
+    assert scheduled == [(chat.chat_id, 2.0, [10]), (chat.chat_id, 2.0, [10, 11])]
+    with service.batch_lock:
+        assert [item.message_id for item in service.batches[chat.chat_id].items] == [10, 11]
+
+
+def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, private_batch_delay_seconds=2.0)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    prompt = codex_telegram_bot.build_batch_prompt(
+        conn,
+        chat,
+        [
+            codex_telegram_bot.BatchItem(10, None, sender, "第一条", True, codex_telegram_bot.utc_now()),
+            codex_telegram_bot.BatchItem(11, None, sender, "第二条", True, codex_telegram_bot.utc_now()),
+        ],
+        cfg,
+    )
+
+    assert 'message_id="10"' in prompt
+    assert 'message_id="11"' in prompt
+    assert "第一条" in prompt and "第二条" in prompt
+    assert "Private: normally call reply(text)" in prompt
+
+
+def test_consecutive_shared_stream_failures_roll_over_session(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, engine="app-server", session_scope="shared")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    codex_telegram_bot.set_session_for_config(conn, chat.chat_id, session_id, cfg)
+    error = "stream disconnected before completion: network error"
+    for index in range(2):
+        run_id = f"run-{index}"
+        codex_telegram_bot.create_run(
+            conn,
+            run_id,
+            chat.chat_id,
+            session_id,
+            tmp_path / f"{run_id}.prompt",
+            tmp_path / f"{run_id}.reply",
+            tmp_path / f"{run_id}.log",
+        )
+        codex_telegram_bot.finish_run(conn, run_id, "error", session_id, error)
+
+    assert codex_telegram_bot.maybe_rollover_failed_shared_session(conn, cfg, session_id, error)
+    assert codex_telegram_bot.shared_session_for_engine(conn, cfg.engine) is None
+    handoff = codex_telegram_bot.shared_handoff_for_engine(conn, cfg.engine)
+    assert handoff is not None
+    assert "2 consecutive app-server stream/compact failures" in handoff
+
+
+def test_success_between_stream_failures_prevents_rollover(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, engine="app-server", session_scope="shared")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    codex_telegram_bot.set_session_for_config(conn, chat.chat_id, session_id, cfg)
+    rows = [("old-error", "error", "stream disconnected before completion"), ("ok", "ok", None), ("new-error", "error", "stream disconnected before completion")]
+    for run_id, status, error in rows:
+        codex_telegram_bot.create_run(conn, run_id, chat.chat_id, session_id, tmp_path / run_id, tmp_path / (run_id+"r"), tmp_path / (run_id+"l"))
+        codex_telegram_bot.finish_run(conn, run_id, status, session_id, error)
+
+    assert not codex_telegram_bot.maybe_rollover_failed_shared_session(
+        conn, cfg, session_id, "stream disconnected before completion"
+    )
+    assert codex_telegram_bot.shared_session_for_engine(conn, cfg.engine) == session_id
+
+
+def test_private_capacity_error_is_short_and_does_not_expose_log_path() -> None:
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    result = codex_telegram_bot.RunResult(
+        run_id="run",
+        status="error",
+        reply="这次 Codex app-server 调用没跑完。\nlog: /private/path/run.jsonl",
+        session_id_after="session",
+        error="Selected model is at capacity. Please try a different model.",
+        channel_events=[],
+    )
+
+    visible = codex_telegram_bot.visible_error_reply_for_result(
+        chat, result, allow_silent_reply=False, explicitly_addressed=True
+    )
+    assert "模型满载" in visible
+    assert "/private/path" not in visible
 
 def test_public_sources_do_not_expose_private_prompt_names() -> None:
     checked_paths = [

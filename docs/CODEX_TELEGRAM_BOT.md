@@ -37,6 +37,7 @@ TELEGRAM_OWNER_IDS=<telegram-user-id>
 CODEX_TELEGRAM_MODEL=gpt-5.5
 CODEX_TELEGRAM_ENGINE=app-server
 CODEX_TELEGRAM_EFFORT=high
+CODEX_TELEGRAM_PRIVATE_EFFORT=high
 CODEX_TELEGRAM_TASK_EFFORT=xhigh
 CODEX_TELEGRAM_SESSION_SCOPE=shared
 CODEX_TELEGRAM_CWD=/path/to/codex-telegram-channel
@@ -56,6 +57,7 @@ CODEX_TELEGRAM_STEADY_CONTEXT_MESSAGES=0
 CODEX_TELEGRAM_CONTEXT_TEXT_CHARS=800
 CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000
 CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5
+CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS=2
 CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS=1.5
 CODEX_TELEGRAM_DENY_UNKNOWN=0
 CODEX_TELEGRAM_IGNORE_USER_CONFIG=1
@@ -93,7 +95,7 @@ set each group from Telegram with:
 
 ```text
 /codex_mode decide   # free mode: every allowed group message enters Codex
-/codex_mode smart    # wake words/watch phrases open a 3-minute decide window
+/codex_mode smart    # only matching wake words/watch phrases invoke Codex
 /codex_mode mention  # traditional @/reply/name-only mode
 ```
 
@@ -104,12 +106,12 @@ use `/codex_batch single` to return to immediate one-by-one handling.
 `decide` forwards every allowed group message to Codex. The model then chooses
 whether to send a visible Telegram reply or stay silent.
 
-`smart` is wake-based. A message wakes the bot when it mentions the bot by
+`smart` is edge-triggered. A message wakes the bot when it mentions the bot by
 `@username`, replies to a bot message, contains a configured
 `CODEX_TELEGRAM_WAKE_PHRASES` entry, or matches an item in the watch phrase
-file. Once awake, every message in that chat enters Codex for
-`DEFAULT_WAKE_WINDOW_SECONDS` (three minutes). A visible bot reply extends the
-window by another three minutes; three minutes without a bot reply closes it.
+file. Only that matching message enters Codex; later ordinary messages remain
+cached as shared context but do not invoke another turn unless they match on
+their own.
 
 Wake phrases use plain consecutive-character matching. For example, configuring
 `codex` means `codexbot` also wakes the bot. Waking only forwards the message to
@@ -127,6 +129,8 @@ project alpha|alpha
 the bot, and identity-name calls. Identity-name calls use
 `CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES`; keep that list to names for the bot if
 your `CODEX_TELEGRAM_WAKE_PHRASES` list includes topical words for `smart`.
+
+Private messages sent within the configured 2-second quiet window are merged into one Codex turn, so short multi-message thoughts are read together. Group batching remains controlled per chat with `/codex_batch`.
 
 Each group turn can include a `<recent_chat_window>` block with the last five
 same-chat messages before the trigger or batch, so Codex has the local
@@ -181,10 +185,12 @@ owner confirms that route.
 Workers run with Telegram channel tools disabled. They only write private worker
 output; Telegram messages always come from the Telegram resident through the
 normal channel tools. When the resident starts a worker, the bridge schedules a
-private supervisor alarm. At each alarm, the resident inspects the worker with
-`codex_worker_status`, continues the same worker session when needed, sets
-another alarm if it is still running, and decides whether a visible Telegram
-reply helps.
+private supervisor alarm. Running workers are rechecked by the bridge without
+opening resident model turns. A clearly transient failure is retried once;
+configuration, version, permission, and file-descriptor failures open the retry
+circuit immediately. Completion and needs-input states enter the shared resident
+thread once for review. If that review emits no visible message, the bridge sends
+a deterministic terminal summary so the task cannot disappear silently.
 
 `CODEX_TELEGRAM_AUTO_WORKER=0` is the default. The legacy auto-worker
 supervision loop can still be enabled to migrate old `auto_delivery` records,
@@ -195,6 +201,12 @@ legacy pending auto-delivery records.
 ## Shared Desktop Thread
 
 `CODEX_TELEGRAM_ENGINE=app-server` uses Codex's local app-server protocol.
+
+With `CODEX_TELEGRAM_IGNORE_USER_CONFIG=1`, the app-server child uses a minimal
+Codex home under `<state-dir>/codex-home`. Authentication and SQLite state remain
+connected to the main Codex home, while user MCP servers, plugins, apps, and
+memories stay out of Telegram turns. This prevents each supervisor/thread start
+from accumulating unrelated MCP child processes and file descriptors.
 
 With `CODEX_TELEGRAM_SESSION_SCOPE=shared`, private chats and group chats use
 one shared Codex session. Recent context remains source-labeled by chat id, chat
