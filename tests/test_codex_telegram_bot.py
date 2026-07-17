@@ -773,7 +773,10 @@ def test_app_server_uses_isolated_home_when_ignoring_user_config(tmp_path: Path,
     isolated = state_dir / "codex-home"
     assert env["CODEX_HOME"] == str(isolated)
     assert env["CODEX_SQLITE_HOME"] == str(main_home)
-    assert (isolated / "auth.json").resolve() == (main_home / "auth.json").resolve()
+    if sys.platform == "win32":
+        assert (isolated / "auth.json").read_bytes() == (main_home / "auth.json").read_bytes()
+    else:
+        assert (isolated / "auth.json").resolve() == (main_home / "auth.json").resolve()
     config_text = (isolated / "config.toml").read_text(encoding="utf-8")
     assert "apps = false" in config_text
     assert "plugins = false" in config_text
@@ -829,6 +832,28 @@ def test_app_server_command_allows_user_config_when_requested(tmp_path: Path, mo
     assert codex_telegram_bot.app_server_command(cfg) == ["/opt/codex", "app-server", "--stdio"]
     assert codex_telegram_bot.app_server_environment(cfg)["CODEX_HOME"] == "/custom/codex-home"
     assert not (tmp_path / "codex-home").exists()
+
+
+def test_sender_alias_uses_numeric_user_id_and_preserves_telegram_name(tmp_path: Path) -> None:
+    aliases_path = tmp_path / "identity_aliases.json"
+    aliases_path.write_text(
+        json.dumps(
+            {
+                "7541487750": {
+                    "name": "云 / 兮兮",
+                    "aliases": ["云", "兮兮"],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    sender = codex_telegram_bot.Sender("7541487750", "@current_username", False)
+
+    mapped = codex_telegram_bot.sender_with_configured_alias(sender, aliases_path)
+
+    assert mapped.user_id == "7541487750"
+    assert mapped.name == "云 / 兮兮 [Telegram: @current_username]"
 
 
 def test_desktop_titles_include_merged_shared_thread(tmp_path: Path) -> None:
@@ -2398,6 +2423,9 @@ def test_direct_background_continues_silently_and_delivers_later(tmp_path: Path,
 
     assert elapsed < 0.08
     assert sent == []
+    deadline = time.monotonic() + 1
+    while timeouts != [60] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert timeouts == [60]
 
     deadline = time.monotonic() + 1
