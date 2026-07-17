@@ -831,6 +831,130 @@ def test_app_server_command_allows_user_config_when_requested(tmp_path: Path, mo
     assert not (tmp_path / "codex-home").exists()
 
 
+def test_sender_alias_uses_numeric_user_id_and_preserves_telegram_name(tmp_path: Path) -> None:
+    aliases_path = tmp_path / "identity_aliases.json"
+    aliases_path.write_text(
+        json.dumps(
+            {
+                "7541487750": {
+                    "name": "云 / 兮兮",
+                    "aliases": ["云", "兮兮"],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    sender = codex_telegram_bot.Sender("7541487750", "@current_username", False)
+
+    mapped = codex_telegram_bot.sender_with_configured_alias(sender, aliases_path)
+
+    assert mapped.user_id == "7541487750"
+    assert mapped.name == "云 / 兮兮 [Telegram: @current_username]"
+
+
+def test_persona_is_loaded_into_app_server_base_instructions(tmp_path: Path) -> None:
+    persona_path = tmp_path / "CODEX_PERSONA.md"
+    persona_path.write_text("# 人格\n你是阿祈。", encoding="utf-8")
+    cfg = _config(tmp_path, persona_path=persona_path)
+
+    instructions = codex_telegram_bot.app_server_base_instructions(cfg)
+
+    assert "<codex_persona sha256=" in instructions
+    assert "你是阿祈。" in instructions
+
+
+def test_memory_scope_is_bound_to_chat_type_and_owner_user_id(tmp_path: Path) -> None:
+    shared_path = tmp_path / "MEMORY_SHARED.md"
+    private_path = tmp_path / "MEMORY_PRIVATE.md"
+    shared_path.write_text("# 群聊记忆\n木栖也叫小鸟。", encoding="utf-8")
+    private_path.write_text("# 私人记忆\n只有兮兮私聊可见。", encoding="utf-8")
+    cfg = _config(
+        tmp_path,
+        shared_memory_path=shared_path,
+        private_memory_path=private_path,
+        memory_recall_max_chars=6000,
+    )
+    owner = codex_telegram_bot.Sender("111", "兮兮", False)
+    outsider = codex_telegram_bot.Sender("222", "其他人", False)
+
+    group_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("-100", "supergroup", "群"),
+        owner,
+        "木栖是谁",
+    )
+    owner_private_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("111", "private", "兮兮"),
+        owner,
+        "你记得我吗",
+    )
+    outsider_private_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("222", "private", "其他人"),
+        outsider,
+        "你记得我吗",
+    )
+
+    assert 'scope="shared-only"' in group_block
+    assert "木栖也叫小鸟" in group_block
+    assert "只有兮兮私聊可见" not in group_block
+    assert 'scope="owner-private"' in owner_private_block
+    assert "木栖也叫小鸟" in owner_private_block
+    assert "只有兮兮私聊可见" in owner_private_block
+    assert "只有兮兮私聊可见" not in outsider_private_block
+
+
+def test_memory_file_changes_are_visible_on_the_next_recall(tmp_path: Path) -> None:
+    shared_path = tmp_path / "MEMORY_SHARED.md"
+    shared_path.write_text("# 共享\n第一版", encoding="utf-8")
+    cfg = _config(tmp_path, shared_memory_path=shared_path, memory_recall_max_chars=6000)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "群")
+    sender = codex_telegram_bot.Sender("111", "兮兮", False)
+
+    first = codex_telegram_bot.memory_context_block(cfg, chat, sender, "测试")
+    shared_path.write_text("# 共享\n第二版", encoding="utf-8")
+    second = codex_telegram_bot.memory_context_block(cfg, chat, sender, "测试")
+
+    assert "第一版" in first
+    assert "第二版" in second
+    assert first != second
+
+
+def test_persona_revision_starts_a_fresh_per_chat_session(tmp_path: Path) -> None:
+    persona_path = tmp_path / "CODEX_PERSONA.md"
+    persona_path.write_text("# 人格\n第一版", encoding="utf-8")
+    cfg = _config(tmp_path, session_scope="per-chat", persona_path=persona_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "session-old", "app-server")
+
+    first = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert first is None
+
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "session-current", "app-server")
+    unchanged = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert unchanged == "session-current"
+
+    persona_path.write_text("# 人格\n第二版", encoding="utf-8")
+    changed = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert changed is None
+
+
 def test_desktop_titles_include_merged_shared_thread(tmp_path: Path) -> None:
     shared_cfg = _config(tmp_path, session_scope="shared")
     per_chat_cfg = _config(tmp_path, session_scope="per-chat")

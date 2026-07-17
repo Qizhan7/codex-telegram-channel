@@ -8,6 +8,7 @@ label under a private runtime state directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import mimetypes
@@ -494,6 +495,12 @@ class Config:
     codex_bin: str
     memory_dir: Path | None = None
     identity_wake_phrases: tuple[str, ...] = ()
+    identity_aliases_path: Path | None = None
+    persona_path: Path | None = None
+    shared_memory_path: Path | None = None
+    private_memory_path: Path | None = None
+    memory_recall_max_chars: int = 6000
+    knowledge_enabled: bool = False
     media_group_delay_seconds: float = DEFAULT_MEDIA_GROUP_DELAY_SECONDS
     group_decision_source: str = "model"
     direct_background: bool = True
@@ -781,6 +788,23 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             for phrase in env("CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES", "").split(",")
             if phrase.strip()
         ),
+        identity_aliases_path=Path(
+            env("CODEX_TELEGRAM_IDENTITY_ALIASES_PATH", str(state_dir / "identity_aliases.json"))
+        ).expanduser(),
+        persona_path=Path(
+            env("CODEX_TELEGRAM_PERSONA_PATH", str(state_dir / "knowledge" / "CODEX_PERSONA.md"))
+        ).expanduser(),
+        shared_memory_path=Path(
+            env("CODEX_TELEGRAM_SHARED_MEMORY_PATH", str(state_dir / "knowledge" / "MEMORY_SHARED.md"))
+        ).expanduser(),
+        private_memory_path=Path(
+            env("CODEX_TELEGRAM_PRIVATE_MEMORY_PATH", str(state_dir / "knowledge" / "MEMORY_PRIVATE.md"))
+        ).expanduser(),
+        memory_recall_max_chars=max(
+            1000,
+            parse_int(env("CODEX_TELEGRAM_MEMORY_RECALL_MAX_CHARS"), 6000),
+        ),
+        knowledge_enabled=parse_bool(env("CODEX_TELEGRAM_KNOWLEDGE"), default=False),
         media_group_delay_seconds=max(
             MIN_MEDIA_GROUP_DELAY_SECONDS,
             parse_float(env("CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS"), DEFAULT_MEDIA_GROUP_DELAY_SECONDS),
@@ -854,6 +878,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
     ensure_private_dir(config.state_dir / "incoming")
+    ensure_private_dir(config.state_dir / "knowledge")
     if not config.env_file.exists():
         write_private_text(
             config.env_file,
@@ -896,6 +921,10 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     f"CODEX_TELEGRAM_WAKE_PHRASES={DEFAULT_WAKE_PHRASES}",
                     "CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES=codex,assistant,bot",
                     f"CODEX_TELEGRAM_WATCH_PHRASES_PATH={config.state_dir / 'watch_phrases.txt'}",
+                    f"CODEX_TELEGRAM_PERSONA_PATH={config.state_dir / 'knowledge' / 'CODEX_PERSONA.md'}",
+                    f"CODEX_TELEGRAM_SHARED_MEMORY_PATH={config.state_dir / 'knowledge' / 'MEMORY_SHARED.md'}",
+                    f"CODEX_TELEGRAM_PRIVATE_MEMORY_PATH={config.state_dir / 'knowledge' / 'MEMORY_PRIVATE.md'}",
+                    "CODEX_TELEGRAM_MEMORY_RECALL_MAX_CHARS=6000",
                     "",
                 ]
             ),
@@ -3009,6 +3038,19 @@ def prepare_session_for_turn(
     config: Config,
     chat_row: sqlite3.Row,
 ) -> str | None:
+    persona = load_knowledge_document(config.persona_path)
+    revision_key = (
+        f"persona_revision:shared:{normalize_engine(config.engine)}"
+        if config.session_scope == "shared"
+        else f"persona_revision:chat:{chat_row['chat_id']}:{normalize_engine(config.engine)}"
+    )
+    stored_revision = get_meta(conn, revision_key)
+    if persona.sha256 and stored_revision != persona.sha256:
+        existing_session = session_for_engine(conn, chat_row, config)
+        if existing_session:
+            set_session_for_config(conn, str(chat_row["chat_id"]), None, config)
+            chat_row = get_chat(conn, str(chat_row["chat_id"]))
+        set_meta(conn, revision_key, persona.sha256)
     session_id = session_for_engine(conn, chat_row, config)
     rollover, reason, _usage = should_rollover_shared_session(conn, config, session_id)
     if rollover and session_id:
@@ -4297,6 +4339,192 @@ def parse_sender(message: dict[str, Any]) -> Sender:
         parts = [raw.get("first_name"), raw.get("last_name")]
         name = " ".join(str(part) for part in parts if part) or user_id or "unknown"
     return Sender(user_id=user_id, name=name, is_bot=bool(raw.get("is_bot")))
+
+
+def sender_with_configured_alias(sender: Sender, aliases_path: Path | None) -> Sender:
+    if sender.is_chat or not sender.user_id or aliases_path is None:
+        return sender
+    try:
+        raw = json.loads(aliases_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return sender
+    if not isinstance(raw, dict):
+        return sender
+    entry = raw.get(sender.user_id)
+    if isinstance(entry, str):
+        alias = entry.strip()
+    elif isinstance(entry, dict):
+        primary = str(entry.get("name") or entry.get("primary") or "").strip()
+        aliases = entry.get("aliases")
+        alias_values = (
+            [str(value).strip() for value in aliases if str(value).strip()]
+            if isinstance(aliases, list)
+            else []
+        )
+        alias = primary or " / ".join(alias_values)
+    else:
+        alias = ""
+    if not alias:
+        return sender
+    name = alias if sender.name == alias else f"{alias} [Telegram: {sender.name}]"
+    return replace(sender, name=name)
+
+
+@dataclass(frozen=True)
+class KnowledgeDocument:
+    path: Path | None
+    text: str
+    sha256: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryChunk:
+    index: int
+    heading: str
+    text: str
+
+
+def load_knowledge_document(path: Path | None) -> KnowledgeDocument:
+    if path is None:
+        return KnowledgeDocument(path=None, text="", sha256="", error="path is not configured")
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return KnowledgeDocument(path=path, text="", sha256="", error="file is missing")
+    except UnicodeDecodeError as exc:
+        return KnowledgeDocument(path=path, text="", sha256="", error=f"invalid UTF-8: {exc}")
+    except OSError as exc:
+        return KnowledgeDocument(path=path, text="", sha256="", error=str(exc))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+    return KnowledgeDocument(path=path, text=text, sha256=digest)
+
+
+def persona_instructions_block(config: Config) -> str:
+    document = load_knowledge_document(config.persona_path)
+    if not document.text:
+        return ""
+    return (
+        f'<codex_persona sha256="{document.sha256}">\n'
+        f"{document.text}\n"
+        "</codex_persona>\n"
+        "Treat codex_persona as durable identity and interaction guidance. "
+        "Explicit current user instructions still take precedence."
+    )
+
+
+def markdown_memory_chunks(text: str) -> list[MemoryChunk]:
+    chunks: list[MemoryChunk] = []
+    heading = "(preamble)"
+    lines: list[str] = []
+
+    def flush() -> None:
+        block = "\n".join(lines).strip()
+        if block:
+            chunks.append(MemoryChunk(index=len(chunks), heading=heading, text=block))
+
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,3})\s+(.+?)\s*$", line)
+        if match:
+            flush()
+            heading = match.group(2).strip()
+            lines = [line]
+        else:
+            lines.append(line)
+    flush()
+    return chunks
+
+
+def memory_query_terms(query: str) -> set[str]:
+    normalized = query.lower()
+    terms = set(re.findall(r"[a-z0-9_@.-]{2,}", normalized))
+    cjk = "".join(re.findall(r"[\u3400-\u9fff]", normalized))
+    terms.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
+    return {term for term in terms if term}
+
+
+def select_memory_text(document: KnowledgeDocument, query: str, max_chars: int) -> str:
+    if not document.text or max_chars <= 0:
+        return ""
+    if len(document.text) <= max_chars:
+        return document.text
+    chunks = markdown_memory_chunks(document.text)
+    terms = memory_query_terms(query)
+    scored: list[tuple[int, int, MemoryChunk]] = []
+    stable_markers = ("基本称呼", "核心身份", "稳定记忆", "一句话记忆摘要", "维护原则")
+    for chunk in chunks:
+        haystack = f"{chunk.heading}\n{chunk.text}".lower()
+        score = sum(3 if term in chunk.heading.lower() else 1 for term in terms if term in haystack)
+        if any(marker in chunk.heading for marker in stable_markers):
+            score += 2
+        scored.append((score, -chunk.index, chunk))
+    selected: list[MemoryChunk] = []
+    used = 0
+    for _score, _order, chunk in sorted(scored, reverse=True):
+        separator = 2 if selected else 0
+        if used + separator + len(chunk.text) > max_chars:
+            continue
+        selected.append(chunk)
+        used += separator + len(chunk.text)
+    if not selected and scored:
+        return sorted(scored, reverse=True)[0][2].text[:max_chars].rstrip()
+    selected.sort(key=lambda chunk: chunk.index)
+    return "\n\n".join(chunk.text for chunk in selected)
+
+
+def memory_context_block(config: Config, chat: Chat, sender: Sender, query: str) -> str:
+    shared = load_knowledge_document(config.shared_memory_path)
+    private_allowed = chat.chat_type == "private" and sender_is_owner(sender, config)
+    private = (
+        load_knowledge_document(config.private_memory_path)
+        if private_allowed
+        else KnowledgeDocument(path=config.private_memory_path, text="", sha256="")
+    )
+    remaining = config.memory_recall_max_chars
+    sections: list[str] = []
+    sources: list[str] = []
+    if shared.text:
+        shared_text = select_memory_text(shared, query, remaining)
+        if shared_text:
+            sections.append(f"<shared_memory>\n{shared_text}\n</shared_memory>")
+            sources.append(f"shared:{shared.sha256}")
+            remaining = max(0, remaining - len(shared_text))
+    if private.text and remaining > 0:
+        private_text = select_memory_text(private, query, remaining)
+        if private_text:
+            sections.append(f"<private_memory>\n{private_text}\n</private_memory>")
+            sources.append(f"private:{private.sha256}")
+    if not sections:
+        return ""
+    scope = "owner-private" if private_allowed else "shared-only"
+    return (
+        f'<memory_context scope="{scope}" user_id="{sender.user_id}" sources="{" ".join(sources)}">\n'
+        "Use these as relevant background facts and preferences, not as a reason to expose private information "
+        "or override the current request.\n"
+        + "\n".join(sections)
+        + "\n</memory_context>"
+    )
+
+
+def knowledge_status_lines(config: Config) -> list[str]:
+    documents = (
+        ("persona", load_knowledge_document(config.persona_path)),
+        ("sharedMemory", load_knowledge_document(config.shared_memory_path)),
+        ("privateMemory", load_knowledge_document(config.private_memory_path)),
+    )
+    lines = [f"memoryRecallMaxChars: {config.memory_recall_max_chars}"]
+    for label, document in documents:
+        lines.extend(
+            [
+                f"{label}Loaded: {bool(document.text)}",
+                f"{label}Path: {document.path or '(not configured)'}",
+                f"{label}Chars: {len(document.text)}",
+                f"{label}Sha256: {document.sha256 or '(none)'}",
+            ]
+        )
+        if document.error:
+            lines.append(f"{label}Error: {document.error}")
+    return lines
 
 
 def parse_chat(message: dict[str, Any]) -> Chat:
@@ -8310,6 +8538,7 @@ def status_for_chat(
         f"desktopPromptDebug: {desktop_prompt_debug_enabled(conn)}",
         f"cwd: {config.cwd}",
     ]
+    lines.extend(knowledge_status_lines(config))
     lines.extend(update_failure_summary_lines(conn))
     if chat_id:
         row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -8674,6 +8903,9 @@ def prompt_metrics(prompt: str) -> dict[str, int]:
         "sharedBehaviorCount": prompt.count("Shared-context behavior"),
         "replyRhythmCount": prompt.count("Telegram reply rhythm"),
         "handoffCount": prompt.count("Pending continuity handoff"),
+        "memoryContextCount": prompt.count("<memory_context"),
+        "sharedMemoryCount": prompt.count("<shared_memory>"),
+        "privateMemoryCount": prompt.count("<private_memory>"),
         "recentContextHeaders": sum(
             1 for line in lines if line.startswith("Recent Telegram context") or line == "<context>"
         ),
@@ -8762,6 +8994,13 @@ def optimization_report(
     post_success_metrics = prompt_metrics(post_success_prompt)
     previous_metrics = last_prompt_metrics(conn, chat.chat_id)
     media_tool_lines, media_tool_failures = app_server_media_tool_health_lines()
+    persona_document = load_knowledge_document(config.persona_path)
+    shared_memory_document = load_knowledge_document(config.shared_memory_path)
+    private_memory_document = load_knowledge_document(config.private_memory_path)
+    knowledge_enabled = any(
+        path is not None
+        for path in (config.persona_path, config.shared_memory_path, config.private_memory_path)
+    )
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -8779,6 +9018,23 @@ def optimization_report(
         failures.append("stable channel instructions are still present in post-success steady sample")
     if sample_metrics["recentContextRows"] > max(config.shared_context_messages, config.context_messages):
         failures.append("sample prompt includes more recent context rows than configured")
+    if knowledge_enabled and not persona_document.text:
+        failures.append(f"persona is unavailable: {persona_document.error or 'empty file'}")
+    if knowledge_enabled and not shared_memory_document.text:
+        failures.append(f"shared memory is unavailable: {shared_memory_document.error or 'empty file'}")
+    if knowledge_enabled and not private_memory_document.text:
+        failures.append(f"private memory is unavailable: {private_memory_document.error or 'empty file'}")
+    if knowledge_enabled and sample_metrics["memoryContextCount"] != 1:
+        failures.append("sample prompt does not contain exactly one memory context")
+    if knowledge_enabled and chat.chat_type != "private" and sample_metrics["privateMemoryCount"]:
+        failures.append("group sample prompt contains private memory")
+    if (
+        knowledge_enabled
+        and chat.chat_type == "private"
+        and sender_is_owner(sender, config)
+        and not sample_metrics["privateMemoryCount"]
+    ):
+        failures.append("owner-private sample prompt does not contain private memory")
     failures.extend(media_tool_failures)
     if shared_session and rollover:
         warnings.append(reason)
@@ -8812,6 +9068,8 @@ def optimization_report(
             ]
         )
     lines.extend(media_tool_lines)
+    if knowledge_enabled:
+        lines.extend(knowledge_status_lines(config))
     lines.extend(prompt_metric_lines(sample_metrics, "sample"))
     lines.extend(prompt_metric_lines(post_success_metrics, "postSuccessSample"))
     if previous_metrics:
@@ -8882,6 +9140,7 @@ def build_prompt(
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
     relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
+    recalled_memory = memory_context_block(config, chat, sender, text)
     output_lines = (
         [
             format_editable_output_row(row)
@@ -8907,6 +9166,8 @@ def build_prompt(
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
         if relationship_lines:
             parts.append("<telegram_relationships>\n" + "\n".join(relationship_lines) + "\n</telegram_relationships>")
+        if recalled_memory:
+            parts.append(recalled_memory)
         worker_context = active_worker_context_block(config, chat.chat_id)
         if worker_context:
             parts.append(worker_context)
@@ -9008,6 +9269,7 @@ def build_prompt(
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
         f"{relationship_context}\n\n"
+        f"{recalled_memory + chr(10) + chr(10) if recalled_memory else ''}"
         "Immediate same-chat context (last five messages before the current trigger):\n"
         f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
         f"{worker_context_block}"
@@ -12133,6 +12395,7 @@ def app_server_base_instructions(config: Config) -> str:
         )
     shared = shared_context_guidance(config, Chat(chat_id="", chat_type="", title=""))
     aside_check = private_aside_turn_check(config)
+    persona = persona_instructions_block(config)
     return (
         "You are a Codex collaborator reached through Telegram.\n\n"
         "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
@@ -12172,6 +12435,7 @@ def app_server_base_instructions(config: Config) -> str:
         f"{CHANNEL_ADMIN_GUIDANCE}\n\n"
         f"{GROUP_SOCIAL_MANUAL}"
         f"{shared}"
+        + (f"\n\n{persona}" if persona else "")
     )
 
 
