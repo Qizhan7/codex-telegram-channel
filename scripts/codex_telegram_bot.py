@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -466,6 +467,7 @@ class Config:
     watch_phrases_path: Path
     codex_bin: str
     identity_wake_phrases: tuple[str, ...] = ()
+    identity_aliases_path: Path | None = None
     media_group_delay_seconds: float = DEFAULT_MEDIA_GROUP_DELAY_SECONDS
     group_decision_source: str = "model"
     direct_background: bool = True
@@ -683,7 +685,10 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
     def env(name: str, default: str = "") -> str:
         return os.environ.get(name, env_values.get(name, default))
 
-    token = env("TELEGRAM_BOT_TOKEN")
+    # Accept the previous Node bridge's token name so an existing private
+    # runtime configuration can be migrated without printing or re-entering
+    # the BotFather secret.
+    token = env("TELEGRAM_BOT_TOKEN", env("CODEX_TELEGRAM_BOT_TOKEN"))
     owner_ids = parse_csv_set(env("TELEGRAM_OWNER_IDS"))
     reply_timeout_seconds = parse_int(env("CODEX_TELEGRAM_REPLY_TIMEOUT_SECONDS"), 300)
     config = Config(
@@ -751,6 +756,9 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             for phrase in env("CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES", "").split(",")
             if phrase.strip()
         ),
+        identity_aliases_path=Path(
+            env("CODEX_TELEGRAM_IDENTITY_ALIASES_PATH", str(state_dir / "identity_aliases.json"))
+        ).expanduser(),
         media_group_delay_seconds=max(
             MIN_MEDIA_GROUP_DELAY_SECONDS,
             parse_float(env("CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS"), DEFAULT_MEDIA_GROUP_DELAY_SECONDS),
@@ -4192,6 +4200,35 @@ def parse_sender(message: dict[str, Any]) -> Sender:
         parts = [raw.get("first_name"), raw.get("last_name")]
         name = " ".join(str(part) for part in parts if part) or user_id or "unknown"
     return Sender(user_id=user_id, name=name, is_bot=bool(raw.get("is_bot")))
+
+
+def sender_with_configured_alias(sender: Sender, aliases_path: Path | None) -> Sender:
+    if sender.is_chat or not sender.user_id or aliases_path is None:
+        return sender
+    try:
+        raw = json.loads(aliases_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return sender
+    if not isinstance(raw, dict):
+        return sender
+    entry = raw.get(sender.user_id)
+    if isinstance(entry, str):
+        alias = entry.strip()
+    elif isinstance(entry, dict):
+        primary = str(entry.get("name") or entry.get("primary") or "").strip()
+        aliases = entry.get("aliases")
+        alias_values = (
+            [str(value).strip() for value in aliases if str(value).strip()]
+            if isinstance(aliases, list)
+            else []
+        )
+        alias = primary or " / ".join(alias_values)
+    else:
+        alias = ""
+    if not alias:
+        return sender
+    name = alias if sender.name == alias else f"{alias} [Telegram: {sender.name}]"
+    return replace(sender, name=name)
 
 
 def parse_chat(message: dict[str, Any]) -> Chat:
@@ -10751,6 +10788,7 @@ def start_codex_worker(
             stdout=stdout_handle,
             stderr=stderr_handle,
             text=True,
+            encoding="utf-8",
             cwd=str(workdir),
             env=worker_env,
         )
@@ -11492,6 +11530,14 @@ def prepare_app_server_isolated_home(config: Config) -> Path:
     source_auth = main_home / "auth.json"
     target_auth = home / "auth.json"
     if source_auth.exists():
+        if os.name == "nt":
+            # Creating symlinks on Windows normally requires Developer Mode or
+            # elevation. Refreshing a private copy on app-server startup keeps
+            # the isolated home usable for ordinary desktop users.
+            if target_auth.is_symlink():
+                target_auth.unlink()
+            shutil.copy2(source_auth, target_auth)
+            return home
         already_linked = False
         if target_auth.is_symlink():
             try:
@@ -11562,6 +11608,7 @@ class CodexAppServerClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 bufsize=1,
                 cwd=str(self.config.cwd),
                 env=app_server_environment(self.config),
@@ -12992,7 +13039,7 @@ class BotService:
             return
         message_id = int(message.get("message_id", 0) or 0)
         thread_id = message_thread_id(message)
-        sender = parse_sender(message)
+        sender = sender_with_configured_alias(parse_sender(message), self.config.identity_aliases_path)
         chat = parse_chat(message)
         if not chat.chat_id:
             return
@@ -13489,6 +13536,8 @@ class BotService:
             if not deliver_in_background:
                 return
             try:
+                if stop_typing is not None:
+                    stop_typing.set()
                 if error is not None:
                     self.deliver_bridge_error(chat, message_id, message_thread_id, error)
                 elif result is not None:
