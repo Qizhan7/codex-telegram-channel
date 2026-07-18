@@ -1271,13 +1271,18 @@ def test_wake_window_extends_when_bot_sends_message(tmp_path: Path, monkeypatch)
     assert not codex_telegram_bot.wake_window_active(chat_id)
 
 
-def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, wake_phrases=("codex",), group_decision_source="model")
+def test_new_per_chat_thread_bootstraps_only_a_bounded_context_tail(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        wake_phrases=("codex",),
+        group_decision_source="model",
+        session_scope="per-chat",
+    )
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
     sender = codex_telegram_bot.Sender("111", "Owner", False)
     codex_telegram_bot.upsert_chat(conn, chat)
-    for message_id in range(1, 7):
+    for message_id in range(1, 11):
         codex_telegram_bot.store_new_message(
             conn,
             message_id,
@@ -1285,17 +1290,68 @@ def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_p
             sender,
             f"history message {message_id}",
         )
-    codex_telegram_bot.store_new_message(conn, 7, chat.chat_id, sender, "codex 当前消息")
+    codex_telegram_bot.store_new_message(conn, 11, chat.chat_id, sender, "codex 当前消息")
 
-    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 7, "codex 当前消息", cfg, allow_silent_reply=True)
-    start = prompt.index("<recent_chat_window")
-    end = prompt.index("</recent_chat_window>")
-    recent_block = prompt[start:end]
+    prompt = codex_telegram_bot.build_prompt(
+        conn,
+        chat,
+        sender,
+        11,
+        "codex 当前消息",
+        cfg,
+        allow_silent_reply=True,
+    )
+    start = prompt.index("<context>")
+    end = prompt.index("</context>")
+    context_block = prompt[start:end]
 
-    assert "history message 1" not in recent_block
-    for message_id in range(2, 7):
-        assert f"history message {message_id}" in recent_block
-    assert "codex 当前消息" not in recent_block
+    assert ": history message 1\n" not in context_block
+    assert ": history message 2\n" not in context_block
+    for message_id in range(3, 11):
+        assert f"history message {message_id}" in context_block
+    assert "codex 当前消息" not in context_block
+    assert "<recent_chat_window" not in prompt
+
+
+def test_existing_per_chat_thread_injects_only_messages_after_last_successful_turn(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, session_scope="per-chat")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    sender = codex_telegram_bot.Sender("222", "Alice", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "thread-current", "app-server")
+    codex_telegram_bot.store_new_message(conn, 1, chat.chat_id, sender, "already seen")
+    codex_telegram_bot.store_new_message(conn, 2, chat.chat_id, sender, "silent unseen message")
+    conn.execute(
+        "UPDATE messages SET created_at = ? WHERE chat_id = ? AND telegram_message_id = ?",
+        ("2026-01-01T00:00:01+00:00", chat.chat_id, 1),
+    )
+    conn.execute(
+        "UPDATE messages SET created_at = ? WHERE chat_id = ? AND telegram_message_id = ?",
+        ("2026-01-01T00:00:03+00:00", chat.chat_id, 2),
+    )
+    codex_telegram_bot.create_run(
+        conn,
+        "run-ok",
+        chat.chat_id,
+        "thread-current",
+        tmp_path / "prompt.txt",
+        tmp_path / "reply.txt",
+        tmp_path / "run.jsonl",
+    )
+    codex_telegram_bot.finish_run(conn, "run-ok", "ok", "thread-current", None)
+    conn.execute(
+        "UPDATE runs SET started_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:02+00:00", "run-ok"),
+    )
+    conn.commit()
+
+    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 3, "current trigger", cfg)
+
+    assert "already seen" not in prompt
+    assert "silent unseen message" in prompt
+    assert "Alice [user_id=222]" in prompt
+    assert "<recent_chat_window" not in prompt
 
 
 def test_wake_trigger_names_phrase_when_directly_addressed(tmp_path: Path) -> None:
@@ -1368,7 +1424,7 @@ def test_chat_sender_relationships_track_first_seen_senders(tmp_path: Path) -> N
     assert row["message_count"] == 2
 
 
-def test_prompt_includes_known_chat_sender_relationships(tmp_path: Path) -> None:
+def test_prompt_uses_unseen_rows_instead_of_relationship_dump(tmp_path: Path) -> None:
     cfg = _config(tmp_path, session_scope="per-chat")
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
@@ -1379,8 +1435,8 @@ def test_prompt_includes_known_chat_sender_relationships(tmp_path: Path) -> None
 
     prompt = codex_telegram_bot.build_prompt(conn, chat, current_sender, 2, "codex 当前消息", cfg)
 
-    assert "<telegram_relationships>" in prompt
-    assert "[supergroup -100 Release Room] Alice (user, id=222); messages=1;" in prompt
+    assert "<telegram_relationships>" not in prompt
+    assert "Alice [user_id=222]: previous context" in prompt
 
 
 def test_app_server_prompt_omits_telegram_outputs_for_ordinary_chat(tmp_path: Path) -> None:
@@ -3382,7 +3438,13 @@ def test_private_messages_use_two_second_batch_window(tmp_path: Path, monkeypatc
 
 
 def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, private_batch_delay_seconds=2.0)
+    shared_memory_path = tmp_path / "MEMORY_SHARED.md"
+    shared_memory_path.write_text("# Shared identity\n111 = Owner\n", encoding="utf-8")
+    cfg = _config(
+        tmp_path,
+        private_batch_delay_seconds=2.0,
+        shared_memory_path=shared_memory_path,
+    )
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("111", "private", "Owner")
     sender = codex_telegram_bot.Sender("111", "Owner", False)
@@ -3398,6 +3460,9 @@ def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path:
 
     assert 'message_id="10"' in prompt
     assert 'message_id="11"' in prompt
+    assert 'user_id="111"' in prompt
+    assert "<memory_context" in prompt
+    assert "111 = Owner" in prompt
     assert "第一条" in prompt and "第二条" in prompt
     assert "Private: normally call reply(text)" in prompt
 
