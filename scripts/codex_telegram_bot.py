@@ -39,6 +39,7 @@ DEFAULT_STATE_DIR = Path.home() / ".codex" / "channels" / SERVICE_NAME
 DEFAULT_WAKE_PHRASES = "codex,assistant,bot"
 PUBLIC_COMMAND_PREFIX = "codex"
 DEFAULT_CONTEXT_MESSAGES = 24
+PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES = 8
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
@@ -365,7 +366,6 @@ GROUP_RESPONSE_MODE_KEY_PREFIX = "group_response_mode:"
 GROUP_RESPONSE_MODES = {"batch", "single"}
 MESSAGE_SHAPE_KEY_PREFIX = "message_shape:"
 MESSAGE_SHAPES = {"auto", "single", "multi"}
-RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES = 5
 RECENT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CHAT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CONTINUATION_OUTPUT_SECONDS = 20 * 60
@@ -1926,6 +1926,7 @@ def recent_context_messages(
               m.chat_id,
               COALESCE(c.chat_type, 'unknown') AS chat_type,
               COALESCE(c.title, '') AS chat_title,
+              m.sender_id,
               m.sender_name,
               m.text,
               m.created_at
@@ -1954,6 +1955,7 @@ def recent_context_messages(
               m.chat_id,
               COALESCE(c.chat_type, 'unknown') AS chat_type,
               COALESCE(c.title, '') AS chat_title,
+              m.sender_id,
               m.sender_name,
               m.text,
               m.created_at
@@ -2041,6 +2043,30 @@ def prompt_context_rows(
     *,
     exclude: set[tuple[str, int]] | None = None,
 ) -> list[sqlite3.Row]:
+    if config.session_scope != "shared":
+        chat_row = conn.execute(
+            "SELECT * FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        session_id = session_for_engine(conn, chat_row, config) if chat_row else None
+        last_run_started_at = latest_successful_run_started_at(conn, chat_id, config)
+        if not session_id or last_run_started_at is None:
+            return recent_context_messages(
+                conn,
+                chat_id,
+                min(config.context_messages, PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES),
+                config,
+                exclude=exclude,
+            )
+        return recent_context_messages(
+            conn,
+            chat_id,
+            config.context_messages,
+            config,
+            exclude=exclude,
+            after=last_run_started_at,
+        )
+
     mode = prompt_context_mode(conn, config)
     if mode != "steady":
         return recent_context_messages(
@@ -2084,7 +2110,6 @@ def prompt_context_rows(
         merged[row_identity(row)] = row
     max_rows = max(config.steady_context_messages, len(unseen))
     return sort_context_rows(list(merged.values()))[-max_rows:]
-
 
 def recent_relationship_rows(
     conn: sqlite3.Connection,
@@ -2215,27 +2240,11 @@ def format_context_row(row: sqlite3.Row, text_limit: int = DEFAULT_CONTEXT_TEXT_
     title = str(row["chat_title"] or "").replace("\n", " ").strip()
     title_part = f" {title}" if title else ""
     source = f"{row['chat_type']} {row['chat_id']}{title_part}"
-    return f"- {row['created_at']} [{source}] {row['sender_name']}: {clean_text}"
-
-
-def recent_group_trigger_context_lines(
-    conn: sqlite3.Connection,
-    chat: Chat,
-    config: Config,
-    *,
-    exclude: set[tuple[str, int]] | None = None,
-) -> list[str]:
-    if chat.chat_type == "private":
-        return []
-    return [
-        format_context_row(row, config.context_text_chars)
-        for row in recent_same_chat_context_rows(
-            conn,
-            chat.chat_id,
-            RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES,
-            exclude=exclude,
-        )
-    ]
+    sender_id = str(row["sender_id"] or "").strip()
+    sender = str(row["sender_name"])
+    if sender_id:
+        sender += f" [user_id={sender_id}]"
+    return f"- {row['created_at']} [{source}] {sender}: {clean_text}"
 
 
 def owner_private_destinations(config: Config) -> str:
@@ -3563,7 +3572,7 @@ def compact_channel_event(
         attrs.append(('chat_type', chat.chat_type))
     if chat.chat_type != "private" and chat.title:
         attrs.append(('chat_title', chat.title))
-    if sender.user_id != chat.chat_id:
+    if sender.user_id and not sender.is_chat:
         attrs.append(('user_id', sender.user_id))
     if sender.is_bot:
         attrs.append(('is_bot', 'true'))
@@ -8515,7 +8524,8 @@ def status_for_chat(
         f"effort: {config.effort}",
         f"privateEffort: {config.private_effort}",
         f"taskEffort: {config.task_effort}",
-        f"contextMessages: {config.context_messages}",
+        f"unseenContextMessagesCap: {config.context_messages}",
+        f"perChatBootstrapContextMessages: {PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES}",
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
@@ -9045,7 +9055,8 @@ def optimization_report(
         f"chatType: {chat.chat_type}",
         f"engine: {config.engine}",
         f"sessionScope: {config.session_scope}",
-        f"contextMessages: {config.context_messages}",
+        f"unseenContextMessagesCap: {config.context_messages}",
+        f"perChatBootstrapContextMessages: {PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES}",
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
@@ -9129,12 +9140,6 @@ def build_prompt(
             exclude={(chat.chat_id, message_id)},
         )
     )
-    recent_group_lines = recent_group_trigger_context_lines(
-        conn,
-        chat,
-        config,
-        exclude={(chat.chat_id, message_id)},
-    )
     for row in rows:
         context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
@@ -9164,19 +9169,11 @@ def build_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
-        if relationship_lines:
-            parts.append("<telegram_relationships>\n" + "\n".join(relationship_lines) + "\n</telegram_relationships>")
         if recalled_memory:
             parts.append(recalled_memory)
         worker_context = active_worker_context_block(config, chat.chat_id)
         if worker_context:
             parts.append(worker_context)
-        if recent_group_lines:
-            parts.append(
-                '<recent_chat_window last="5" purpose="immediate group context before the current trigger">\n'
-                + "\n".join(recent_group_lines)
-                + "\n</recent_chat_window>"
-            )
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -9270,8 +9267,6 @@ def build_prompt(
         "Known Telegram relationships:\n"
         f"{relationship_context}\n\n"
         f"{recalled_memory + chr(10) + chr(10) if recalled_memory else ''}"
-        "Immediate same-chat context (last five messages before the current trigger):\n"
-        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
         f"{worker_context_block}"
         f"{reaction_feedback_block}"
         f"{turn_attention_block}"
@@ -9357,12 +9352,6 @@ def build_batch_prompt(
 ) -> str:
     context_lines: list[str] = []
     exclude_keys = {(chat.chat_id, item.message_id) for item in items}
-    recent_group_lines = recent_group_trigger_context_lines(
-        conn,
-        chat,
-        config,
-        exclude=exclude_keys,
-    )
     for row in prompt_context_rows(
         conn,
         chat.chat_id,
@@ -9373,6 +9362,9 @@ def build_batch_prompt(
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
     relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
+    latest_sender = items[-1].sender if items else diagnostic_sender_for_chat(config, chat)
+    memory_query = "\n".join(item.text for item in items)
+    recalled_memory = memory_context_block(config, chat, latest_sender, memory_query)
     output_lines = (
         [
             format_editable_output_row(row)
@@ -9418,14 +9410,8 @@ def build_batch_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
-        if relationship_lines:
-            parts.append("<telegram_relationships>\n" + "\n".join(relationship_lines) + "\n</telegram_relationships>")
-        if recent_group_lines:
-            parts.append(
-                '<recent_chat_window last="5" purpose="immediate group context before this batch">\n'
-                + "\n".join(recent_group_lines)
-                + "\n</recent_chat_window>"
-            )
+        if recalled_memory:
+            parts.append(recalled_memory)
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -9498,8 +9484,7 @@ def build_batch_prompt(
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
         f"{relationship_context}\n\n"
-        "Immediate same-chat context (last five messages before this batch):\n"
-        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
+        f"{recalled_memory + chr(10) + chr(10) if recalled_memory else ''}"
         f"{reaction_feedback_block}"
         f"{turn_attention_block}"
         "Latest short batch:\n"

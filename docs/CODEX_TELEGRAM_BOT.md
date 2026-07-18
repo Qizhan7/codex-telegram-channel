@@ -159,9 +159,10 @@ whether to send a visible Telegram reply or stay silent.
 `smart` is edge-triggered. A message wakes the bot when it mentions the bot by
 `@username`, replies to a bot message, contains a configured
 `CODEX_TELEGRAM_WAKE_PHRASES` entry, or matches an item in the watch phrase
-file. Only that matching message enters Codex; later ordinary messages remain
-cached as shared context but do not invoke another turn unless they match on
-their own.
+file. Only that matching message starts a Codex turn. Later ordinary messages
+remain in the bridge's SQLite inbox without invoking Codex. The next matching
+message adds only those thread-unseen Telegram messages to the existing Codex
+thread.
 
 Wake phrases use plain consecutive-character matching. For example, configuring
 `codex` means `codexbot` also wakes the bot. Waking only forwards the message to
@@ -182,9 +183,12 @@ your `CODEX_TELEGRAM_WAKE_PHRASES` list includes topical words for `smart`.
 
 Private messages sent within the configured 2-second quiet window are merged into one Codex turn, so short multi-message thoughts are read together. Group batching remains controlled per chat with `/codex_batch`.
 
-Each group turn can include a `<recent_chat_window>` block with the last five
-same-chat messages before the trigger or batch, so Codex has the local
-conversation lead-in when deciding.
+An existing per-chat Codex thread already owns its prior turns, so the bridge
+does not replay a fixed recent-chat window on every request. It only attaches
+Telegram messages received after the last successful Codex turn that the thread
+has not seen. A brand-new per-chat thread receives at most eight recent messages
+as bootstrap context. `CODEX_TELEGRAM_CONTEXT_MESSAGES` is the safety cap for
+unseen messages, not a repeated history window.
 
 For `decide` and `smart` to receive ordinary group messages, disable Telegram
 BotFather privacy mode for the bot or otherwise make sure the bot can read all
@@ -324,7 +328,11 @@ type, title, sender, and message id, so the model can distinguish where each
 message came from while keeping one continuous thread.
 
 Set `CODEX_TELEGRAM_SESSION_SCOPE=per-chat` if each Telegram chat should use its
-own Codex thread.
+own Codex thread. In this mode, the thread is the short-term conversation
+history. Persona stays in app-server base instructions; stable identities,
+preferences, and interpretation rules are recalled from the shared/private
+Markdown memory files. Current sender ids and access control still come from
+the Telegram event and bridge policy rather than from memory.
 
 ## Desktop Sync
 
