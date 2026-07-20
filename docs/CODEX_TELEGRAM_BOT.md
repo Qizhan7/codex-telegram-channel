@@ -152,8 +152,24 @@ Group turns are single-message by default. Use `/codex_batch batch` only when
 you intentionally want a short window of messages merged into one Codex turn;
 use `/codex_batch single` to return to immediate one-by-one handling.
 
-`decide` forwards every allowed group message to Codex. The model then chooses
-whether to send a visible Telegram reply or stay silent.
+`decide` is adaptive when `CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES` is positive.
+An owner message or reaction opens the owner-presence window (15 minutes by
+default). While it is active, allowed group messages enter Codex and the model
+chooses whether to reply or stay silent. After the window expires, the group
+automatically uses smart/weak wake: background messages remain stored in SQLite
+but only mentions, replies, wake phrases, and relevant follow-ups start Codex.
+The next real wake receives thread-unseen stored messages as context.
+
+The owner can override the window from the group:
+
+```text
+/codex_here       # reopen the configured owner-presence window
+/codex_here 30    # stay in normal wake for 30 minutes
+/codex_away       # enter weak wake immediately
+```
+
+Set `CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES=0` to restore the old always-on
+`decide` behavior.
 
 `smart` is edge-triggered. A message wakes the bot when it mentions the bot by
 `@username`, replies to a bot message, contains a configured

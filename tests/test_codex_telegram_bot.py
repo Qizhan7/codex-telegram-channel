@@ -58,6 +58,7 @@ def _config(tmp_path: Path, **overrides):
         "wake_phrases": ("codex", "assistant", "bot"),
         "watch_phrases_path": tmp_path / "watch_phrases.txt",
         "codex_bin": "codex",
+        "owner_presence_minutes": 0.0,
     }
     values.update(overrides)
     return codex_telegram_bot.Config(**values)
@@ -179,6 +180,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
         "CODEX_TELEGRAM_DESKTOP_OUTBOUND",
         "CODEX_TELEGRAM_WAKE_PHRASES",
         "CODEX_TELEGRAM_GROUP_DECISION_SOURCE",
+        "CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES",
     ):
         monkeypatch.delenv(name, raising=False)
     cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
@@ -196,6 +198,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
     assert cfg.auto_worker_result_chars == codex_telegram_bot.DEFAULT_AUTO_WORKER_RESULT_CHARS
     assert cfg.wake_phrases == ("codex", "assistant", "bot")
     assert cfg.group_decision_source == "model"
+    assert cfg.owner_presence_minutes == codex_telegram_bot.DEFAULT_OWNER_PRESENCE_MINUTES
 
 
 def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
@@ -207,6 +210,7 @@ def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
     assert "CODEX_TELEGRAM_DESKTOP_OUTBOUND=1" in env_text
     assert "CODEX_TELEGRAM_DIRECT_BACKGROUND=1" in env_text
     assert "CODEX_TELEGRAM_AUTO_WORKER=0" in env_text
+    assert "CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES=15" in env_text
     assert "CODEX_TELEGRAM_GROUP_DECISION_SOURCE" not in env_text
     access = json.loads((tmp_path / "access.json").read_text(encoding="utf-8"))
     assert access == {
@@ -929,6 +933,157 @@ def test_unlisted_group_humans_follow_chat_modes(tmp_path: Path) -> None:
     row = codex_telegram_bot.get_chat(conn, chat.chat_id)
     assert not service.should_call_codex(conn, chat, row, sender, "普通闲聊一句", {"message_id": 4}, policy)
     assert service.should_call_codex(conn, chat, row, sender, "codex 在吗", {"message_id": 5, "text": "codex 在吗"}, policy)
+
+
+def test_adaptive_decide_uses_owner_presence_window_for_normal_or_weak_wake(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        wake_phrases=("codex",),
+        group_decision_source="model",
+        owner_presence_minutes=15.0,
+    )
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    friend = codex_telegram_bot.Sender("222", "Friend", False)
+    other_bot = codex_telegram_bot.Sender("333", "Other Bot", True)
+    policy = _policy()
+    service = codex_telegram_bot.BotService(cfg)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_mode(conn, chat.chat_id, "decide")
+    row = codex_telegram_bot.get_chat(conn, chat.chat_id)
+    now = 10_000.0
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "smart"
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "普通闲聊一句",
+        {"message_id": 1, "text": "普通闲聊一句"},
+        policy,
+    )
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        other_bot,
+        "机器人背景闲聊",
+        {"message_id": 2, "text": "机器人背景闲聊"},
+        policy,
+    )
+    assert service.should_call_codex(
+        conn,
+        chat,
+        row,
+        other_bot,
+        "codex 在吗",
+        {"message_id": 3, "text": "codex 在吗"},
+        policy,
+    )
+
+    codex_telegram_bot.mark_owner_present(conn, chat.chat_id, 15, now=now)
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "decide"
+    assert service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "普通闲聊一句",
+        {"message_id": 4, "text": "普通闲聊一句"},
+        policy,
+    )
+
+    now += 901
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "smart"
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "窗口过期后的闲聊",
+        {"message_id": 5, "text": "窗口过期后的闲聊"},
+        policy,
+    )
+
+
+def test_owner_message_automatically_opens_presence_window(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(
+        tmp_path,
+        owner_presence_minutes=15.0,
+        group_decision_source="model",
+    )
+    (tmp_path / "access.json").write_text(
+        json.dumps(
+            {
+                "dmPolicy": "allowlist",
+                "groupPolicy": "decide",
+                "allowedUsers": ["111"],
+                "allowedChats": ["-100"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    captured: list[str] = []
+    monkeypatch.setattr(service, "run_single_message", lambda *_args, **_kwargs: captured.append("run"))
+
+    background = _telegram_update(99, -100, "supergroup", "你们先聊")
+    background["message"]["from"] = {
+        "id": 222,
+        "is_bot": False,
+        "first_name": "Friend",
+    }
+    service.handle_update(conn, background)
+
+    assert captured == []
+    assert codex_telegram_bot.message_exists(conn, 199, "-100")
+
+    service.handle_update(conn, _telegram_update(100, -100, "supergroup", "我回来啦"))
+
+    assert codex_telegram_bot.owner_presence_active(conn, "-100")
+    assert captured == ["run"]
+
+
+def test_owner_here_and_away_commands_control_presence(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, owner_presence_minutes=15.0)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    policy = _policy()
+    codex_telegram_bot.upsert_chat(conn, chat)
+    now = 20_000.0
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_here", ["30"]),
+    )
+    assert "30" in reply
+    assert 1799 <= codex_telegram_bot.owner_presence_remaining_seconds(conn, chat.chat_id) <= 1800
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_away", []),
+    )
+    assert "弱唤醒" in reply
+    assert not codex_telegram_bot.owner_presence_active(conn, chat.chat_id)
+    status = codex_telegram_bot.status_for_chat(conn, cfg, policy, chat.chat_id)
+    assert "effectiveMode: smart" in status
+    assert "ownerPresence: away (weak wake)" in status
 
 
 def test_group_modes_route_as_decide_smart_or_mention(tmp_path: Path) -> None:

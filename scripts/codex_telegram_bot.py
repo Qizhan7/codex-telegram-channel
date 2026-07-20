@@ -44,6 +44,7 @@ PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES = 8
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
+DEFAULT_OWNER_PRESENCE_MINUTES = 15.0
 REPLY_CONTEXT_TEXT_CHARS = 180
 DEFAULT_ROLLOVER_INPUT_TOKENS = 200_000
 HANDOFF_MAX_INBOUND_MESSAGES = 6
@@ -482,6 +483,7 @@ class Config:
     auto_worker_check_seconds: int = DEFAULT_AUTO_WORKER_CHECK_SECONDS
     auto_worker_result_chars: int = DEFAULT_AUTO_WORKER_RESULT_CHARS
     wake_window_seconds: float = DEFAULT_WAKE_WINDOW_SECONDS
+    owner_presence_minutes: float = DEFAULT_OWNER_PRESENCE_MINUTES
 
 
 @dataclass(frozen=True)
@@ -782,6 +784,13 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             parse_float(env("CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS"), DEFAULT_MEDIA_GROUP_DELAY_SECONDS),
         ),
         group_decision_source=normalize_group_decision_source(env("CODEX_TELEGRAM_GROUP_DECISION_SOURCE", "model")),
+        owner_presence_minutes=max(
+            0.0,
+            parse_float(
+                env("CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES"),
+                DEFAULT_OWNER_PRESENCE_MINUTES,
+            ),
+        ),
         direct_background=parse_bool(env("CODEX_TELEGRAM_DIRECT_BACKGROUND"), default=True),
         direct_background_after_seconds=max(
             0.0,
@@ -883,6 +892,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     "CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000",
                     "CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5",
                     f"CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS={DEFAULT_MEDIA_GROUP_DELAY_SECONDS:g}",
+                    f"CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES={DEFAULT_OWNER_PRESENCE_MINUTES:g}",
                     "CODEX_TELEGRAM_DENY_UNKNOWN=0",
                     "CODEX_TELEGRAM_IGNORE_USER_CONFIG=1",
                     "CODEX_TELEGRAM_CHANNEL_TOOLS=1",
@@ -1102,6 +1112,60 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+def owner_presence_until_key(chat_id: str) -> str:
+    return f"owner_presence_until:{chat_id}"
+
+
+def owner_presence_remaining_seconds(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    *,
+    now: float | None = None,
+) -> int:
+    raw = get_meta(conn, owner_presence_until_key(chat_id))
+    try:
+        until = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    remaining = until - (time.time() if now is None else now)
+    return max(0, int(remaining))
+
+
+def owner_presence_active(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    return owner_presence_remaining_seconds(conn, chat_id, now=now) > 0
+
+
+def mark_owner_present(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    minutes: float,
+    *,
+    now: float | None = None,
+) -> None:
+    current = time.time() if now is None else now
+    duration = max(0.0, minutes) * 60.0
+    set_meta(conn, owner_presence_until_key(chat_id), f"{current + duration:.3f}")
+
+
+def mark_owner_away(conn: sqlite3.Connection, chat_id: str) -> None:
+    set_meta(conn, owner_presence_until_key(chat_id), "0")
+
+
+def owner_presence_summary(conn: sqlite3.Connection, chat_id: str, config: Config) -> str:
+    if config.owner_presence_minutes <= 0:
+        return "disabled"
+    remaining = owner_presence_remaining_seconds(conn, chat_id)
+    if remaining <= 0:
+        return "away (weak wake)"
+    minutes = max(1, (remaining + 59) // 60)
+    return f"active ({minutes}m remaining)"
 
 
 def desktop_prompt_debug_enabled(conn: sqlite3.Connection) -> bool:
@@ -4806,6 +4870,18 @@ def is_ai_decide_policy(value: str | None) -> bool:
     return normalize_chat_mode(value) == CHAT_MODE_DECIDE
 
 
+def effective_group_trigger_mode(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    configured_mode: str | None,
+    config: Config,
+) -> str:
+    mode = normalize_chat_mode(configured_mode or CHAT_MODE_MENTION)
+    if mode != CHAT_MODE_DECIDE or config.owner_presence_minutes <= 0:
+        return mode
+    return CHAT_MODE_DECIDE if owner_presence_active(conn, chat_id) else CHAT_MODE_SMART
+
+
 def is_silent_reply(reply: str) -> bool:
     stripped = reply.strip()
     if not stripped:
@@ -7975,8 +8051,12 @@ def should_trigger_group_reply(
     bot_id: str | None,
     bot_username: str | None,
     sender: Sender | None = None,
+    *,
+    mode_override: str | None = None,
 ) -> bool:
-    mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
+    mode = normalize_chat_mode(
+        mode_override or chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION
+    )
     if mode == CHAT_MODE_DECIDE:
         return True
     if mode == CHAT_MODE_SMART:
@@ -7987,6 +8067,7 @@ def should_trigger_group_reply(
 
 
 def group_model_decide_for_sender(
+    conn: sqlite3.Connection,
     chat: Chat,
     chat_row: sqlite3.Row,
     sender: Sender,
@@ -8002,7 +8083,12 @@ def group_model_decide_for_sender(
         return False
     if config.group_decision_source != "model":
         return False
-    mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
+    mode = effective_group_trigger_mode(
+        conn,
+        chat.chat_id,
+        chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION,
+        config,
+    )
     return mode == CHAT_MODE_DECIDE
 
 
@@ -8032,6 +8118,8 @@ def handle_command(
             "/codex_resume <session_id> - bind this chat to a Codex session (owner)\n"
             "/codex_rollover - start a clean shared session with a short handoff (owner)\n"
             "/codex_mode decide|smart|mention - set group trigger mode (owner)\n"
+            "/codex_here [minutes] - keep owner-present normal wake active (owner)\n"
+            "/codex_away - switch this group to weak wake now (owner)\n"
             "/codex_batch single|batch|status - set group single-message or batched response mode (owner)\n"
             "/codex auto|single|multi|status - set/show reply bubble shape for this chat (owner)\n"
             "/codex_debug on|off|status - show or hide raw Desktop prompts (owner)\n"
@@ -8083,7 +8171,38 @@ def handle_command(
         if normalized == CHAT_MODE_DECIDE and chat.chat_type == "private":
             return "私聊不需要 decide 模式，每条消息都会触发。"
         set_chat_mode(conn, chat.chat_id, normalized)
+        if normalized == CHAT_MODE_DECIDE and config.owner_presence_minutes > 0:
+            return (
+                f"已切到自适应 decide：owner 活跃时正常唤醒，离开 "
+                f"{config.owner_presence_minutes:g} 分钟后自动弱唤醒。"
+            )
         return f"已切到 {normalized} 模式。"
+
+    if command.name == "codex_here":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        if chat.chat_type == "private":
+            return "这个命令用于群聊；私聊每条消息都会触发。"
+        if config.owner_presence_minutes <= 0:
+            return "Owner 活跃窗口当前被配置为关闭。"
+        minutes = config.owner_presence_minutes
+        if command.args:
+            try:
+                minutes = float(command.args[0])
+            except ValueError:
+                return "用法：/codex_here 或 /codex_here <分钟数>"
+            if minutes < 1 or minutes > 1440:
+                return "分钟数需要在 1 到 1440 之间。"
+        mark_owner_present(conn, chat.chat_id, minutes)
+        return f"好，未来 {minutes:g} 分钟按 owner 在场处理；你再次发言会自动续期。"
+
+    if command.name == "codex_away":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        if chat.chat_type == "private":
+            return "这个命令用于群聊；私聊不需要弱唤醒。"
+        mark_owner_away(conn, chat.chat_id)
+        return "已进入弱唤醒：普通消息只记录，不启动 Codex；点名、回复、唤醒词和必要跟进仍会启动。"
 
     if command.name == "codex_batch":
         if not owner:
@@ -8173,6 +8292,7 @@ def status_for_chat(
         f"effort: {config.effort}",
         f"privateEffort: {config.private_effort}",
         f"taskEffort: {config.task_effort}",
+        f"ownerPresenceMinutes: {config.owner_presence_minutes:g}",
         f"unseenContextMessagesCap: {config.context_messages}",
         f"perChatBootstrapContextMessages: {PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES}",
         f"sharedContextMessages: {config.shared_context_messages}",
@@ -8205,12 +8325,27 @@ def status_for_chat(
             shared_session = shared_session_for_engine(conn, config.engine)
             handoff = shared_handoff_for_engine(conn, config.engine)
             usage = latest_session_token_usage(conn, shared_session) if shared_session else None
+            configured_mode = normalize_chat_mode(row["mode"] or policy.group_policy)
+            is_group = str(row["chat_type"] or "") != "private"
+            effective_mode = (
+                effective_group_trigger_mode(
+                    conn,
+                    chat_id,
+                    configured_mode,
+                    config,
+                )
+                if is_group
+                else "private"
+            )
+            presence = owner_presence_summary(conn, chat_id, config) if is_group else "n/a"
             lines.extend(
                 [
                     f"chat: {chat_id}",
                     f"enabled: {bool(row['enabled'])}",
                     f"botActive: {bool(row['bot_active'])}",
-                    f"mode: {normalize_chat_mode(row['mode'] or policy.group_policy)}",
+                    f"mode: {configured_mode}",
+                    f"effectiveMode: {effective_mode}",
+                    f"ownerPresence: {presence}",
                     f"groupBatchMode: {group_response_mode(conn, chat_id)}",
                     f"messageShape: {message_shape(conn, chat_id)}",
                     f"lastMessageReaction: {get_meta(conn, last_message_reaction_key(chat_id)) or '(none)'}",
@@ -13190,6 +13325,17 @@ class BotService:
             return
         if should_store and not is_new_message:
             return
+        if (
+            chat.chat_type != "private"
+            and self.config.owner_presence_minutes > 0
+            and sender_is_owner(sender, self.config)
+            and chat_is_allowed(chat, policy)
+        ):
+            mark_owner_present(
+                conn,
+                chat.chat_id,
+                self.config.owner_presence_minutes,
+            )
         if is_context_only_message(message):
             return
 
@@ -13208,7 +13354,14 @@ class BotService:
             )
             return
 
-        defer_group_decision_to_model = group_model_decide_for_sender(chat, chat_row, sender, policy, self.config)
+        defer_group_decision_to_model = group_model_decide_for_sender(
+            conn,
+            chat,
+            chat_row,
+            sender,
+            policy,
+            self.config,
+        )
         explicitly_addressed_by_identity = is_explicitly_addressed_group_message(
             text,
             message,
@@ -13350,6 +13503,16 @@ class BotService:
         else:
             allowed = chat_is_allowed(chat, policy)
         if allowed:
+            if (
+                chat.chat_type != "private"
+                and self.config.owner_presence_minutes > 0
+                and sender_is_owner(sender, self.config)
+            ):
+                mark_owner_present(
+                    conn,
+                    chat.chat_id,
+                    self.config.owner_presence_minutes,
+                )
             message_id = event.get("message_id") if isinstance(event.get("message_id"), int) else None
             base_summary = message_reaction_summary(event)
             summary = reaction_summary_with_target_preview(
@@ -14785,7 +14948,13 @@ class BotService:
             return False
         if not chat_is_allowed(chat, policy):
             return False
-        if group_model_decide_for_sender(chat, chat_row, sender, policy, self.config):
+        effective_mode = effective_group_trigger_mode(
+            conn,
+            chat.chat_id,
+            chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION,
+            self.config,
+        )
+        if group_model_decide_for_sender(conn, chat, chat_row, sender, policy, self.config):
             return True
         if should_trigger_group_reply(
             text,
@@ -14796,8 +14965,11 @@ class BotService:
             self.bot_id,
             self.bot_username,
             sender,
+            mode_override=effective_mode,
         ):
             return True
+        if effective_mode == CHAT_MODE_SMART and sender.is_bot:
+            return False
         group_mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
         if is_ai_decide_policy(group_mode) and should_wake_recent_bot_continuation(
             conn,
