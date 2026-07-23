@@ -3774,7 +3774,7 @@ def test_private_messages_use_two_second_batch_window(tmp_path: Path, monkeypatc
         assert [item.message_id for item in service.batches[chat.chat_id].items] == [10, 11]
 
 
-def test_private_batch_prompt_contains_all_messages_and_allows_semantic_silence(tmp_path: Path) -> None:
+def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path: Path) -> None:
     cfg = _config(tmp_path, private_batch_delay_seconds=2.0)
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("111", "private", "Owner")
@@ -3792,67 +3792,7 @@ def test_private_batch_prompt_contains_all_messages_and_allows_semantic_silence(
     assert 'message_id="10"' in prompt
     assert 'message_id="11"' in prompt
     assert "第一条" in prompt and "第二条" in prompt
-    assert "Private batch reply judgment" in prompt
-    assert "new question, request, decision, substantive update, or unresolved thought" in prompt
-    assert "A trailing laugh, emoji, acknowledgement, filler, or tone-only follow-up" in prompt
-    assert "finish privately with `(silent)`" in prompt
-
-
-def test_private_batch_semantic_silence_sends_no_visible_fallback(tmp_path: Path, monkeypatch) -> None:
-    cfg = _config(
-        tmp_path,
-        private_batch_delay_seconds=2.0,
-        channel_tools=True,
-        direct_background=False,
-    )
-    conn = _conn(tmp_path)
-    chat = codex_telegram_bot.Chat("111", "private", "Owner")
-    sender = codex_telegram_bot.Sender("111", "Owner", False)
-    codex_telegram_bot.upsert_chat(conn, chat)
-    service = codex_telegram_bot.BotService(cfg)
-    sent: list[str] = []
-
-    monkeypatch.setattr(
-        codex_telegram_bot,
-        "send_message",
-        lambda _config, _chat_id, text, **_kwargs: sent.append(text) or [1],
-    )
-    monkeypatch.setattr(
-        codex_telegram_bot,
-        "start_typing_feedback",
-        lambda *_args, **_kwargs: threading.Event(),
-    )
-    monkeypatch.setattr(
-        service,
-        "run_batch",
-        lambda *_args, **_kwargs: codex_telegram_bot.RunResult(
-            run_id="private-silent-run",
-            status="ok",
-            reply="(silent)",
-            session_id_after="thread-1",
-            error=None,
-            channel_events=[],
-        ),
-    )
-    with service.batch_lock:
-        service.batches[chat.chat_id] = codex_telegram_bot.BatchState(
-            chat=chat,
-            items=[
-                codex_telegram_bot.BatchItem(
-                    message_id=77,
-                    message_thread_id=None,
-                    sender=sender,
-                    text="哈哈",
-                    explicitly_addressed=True,
-                    created_at=codex_telegram_bot.utc_now(),
-                )
-            ],
-            revision=1,
-        )
-
-    service.flush_batch(chat.chat_id, 1)
-
-    assert sent == []
+    assert "Private: normally call reply(text)" in prompt
 
 
 def test_consecutive_shared_stream_failures_roll_over_session(tmp_path: Path) -> None:
