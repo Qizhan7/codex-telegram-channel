@@ -102,6 +102,28 @@ CHAT_MODE_MENTION = "mention"
 # invoke Codex unless they independently match a trigger.
 _WAKE_WINDOW: dict[str, float] = {}
 _WAKE_WINDOW_LOCK = threading.Lock()
+_DB_SCHEMA_INIT_LOCK = threading.Lock()
+_DB_SCHEMA_READY_PATHS: set[str] = set()
+_DESKTOP_FINALIZATION_LOCK = threading.Lock()
+_DB_SCHEMA_TABLES = frozenset(
+    {
+        "meta",
+        "chats",
+        "messages",
+        "chat_sender_relationships",
+        "message_attachments",
+        "runs",
+        "channel_deliveries",
+        "telegram_update_failures",
+    }
+)
+_DB_SCHEMA_COLUMNS = {
+    "chats": frozenset({"codex_engine", "bot_active"}),
+    "channel_deliveries": frozenset(
+        {"message_thread_id", "event_type", "delivery_status", "error"}
+    ),
+    "message_attachments": frozenset({"media_group_id"}),
+}
 WAKE_WINDOW_OUTBOUND_METHODS = frozenset(
     {
         "sendMessage",
@@ -373,17 +395,18 @@ TASK_INTAKE_GUIDANCE = (
     "question or request looks likely to take a while, first send one natural current-chat reply with reply(text=...) "
     "that names the specific thing you are about to check or do; keep it to one sentence, do not use a stock phrase, "
     "and do not mention routing mechanics. Then continue the work and send the real result when it is ready. For a "
-    "separate Codex worker, first decide from the conversation that a separate worker would actually help, then ask "
-    "the owner for confirmation in natural wording. Only call a worker start tool after the owner has clearly "
-    "confirmed that separate-worker route; a clear owner execution request can be that confirmation when the task "
-    "itself already asks you to do the work."
+    "separate Codex worker, first decide from the conversation that a separate worker would actually help. For a "
+    "clearly confirmed multi-step implementation, investigation, or long verification, start that worker early so "
+    "the resident conversation remains responsive. Only call codex_worker_start after the owner confirms the work; "
+    "a clear owner execution request can be that confirmation. Put the one-sentence natural acknowledgement in the "
+    "tool's ack field so it is delivered as the worker starts."
 )
 DIRECT_BACKGROUND_GUIDANCE = (
     "Direct background continuation: Use the same Telegram-backed Codex thread for chat, short answers, and tiny "
     "localized edits. If a small turn runs past the visible Telegram wait window, let it keep running in the same "
     "Codex turn. Any preliminary visible sentence should come from your own reply(text=...) call before the longer "
-    "work, based on the actual request, not from stock copy. Keep this as the default long-turn path. Use a separate "
-    "Codex worker only when the model judges that a separate session is useful and the owner confirms that route. Keep "
+    "work, based on the actual request, not from stock copy. Keep this path for turns that are still genuinely small. "
+    "For clearly confirmed multi-step work, prefer a separate Codex worker when it keeps the resident available. Keep "
     "routing mechanics private: Telegram should not see worker IDs, alarms, supervision details, background plumbing, "
     "or internal handoff chatter unless the owner is explicitly discussing those mechanics."
 )
@@ -391,8 +414,10 @@ WORKER_DELEGATION_GUIDANCE = (
     "Codex worker delegation: First judge by natural context whether the user is chatting, discussing, exploring, "
     "or clearly asking for execution. Do not delegate from keyword matches, file names, logs, or topic labels alone. "
     "Handle normal chat, exploration, mechanism discussion, small edits, and ordinary execution in the Telegram "
-    "resident thread. When a task looks large enough that a separate worker would help, ask the owner for confirmation "
-    "in natural wording; there is no required sentence. Only call codex_worker_start after the owner confirms. Keep "
+    "resident thread. When a clearly requested task is multi-step or likely to occupy the resident for a while, a "
+    "separate worker is preferred. The execution request itself can confirm the work; ask a natural clarifying question "
+    "only when the user is still exploring or the intended action is genuinely ambiguous. With codex_worker_start, use "
+    "ack for one specific current-chat sentence about what you are starting, without naming the worker or routing. Keep "
     "delegation details private: never surface worker IDs, routing choices, alarms, supervision, or background plumbing "
     "unless the owner is explicitly discussing those mechanics. When a visible reply is useful, say only the natural "
     "user-facing action/result/caveat. "
@@ -942,17 +967,55 @@ def normalize_id_set(value: Any) -> set[str]:
     return ids
 
 
-def connect_db(config: Config) -> sqlite3.Connection:
+def connect_db(config: Config, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
     ensure_private_dir(config.state_dir)
-    conn = sqlite3.connect(config.db_path, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout = 30000")
+    timeout_seconds = max(0.1, float(timeout_seconds))
+    conn = sqlite3.connect(config.db_path, timeout=timeout_seconds)
+    conn.execute(f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}")
+    conn.execute("PRAGMA synchronous = NORMAL")
     conn.row_factory = sqlite3.Row
-    init_db(conn)
+    db_key = str(config.db_path.resolve())
+    if db_key not in _DB_SCHEMA_READY_PATHS:
+        with _DB_SCHEMA_INIT_LOCK:
+            if db_key not in _DB_SCHEMA_READY_PATHS:
+                if not db_schema_ready(conn):
+                    init_db(conn)
+                _DB_SCHEMA_READY_PATHS.add(db_key)
     try:
         os.chmod(config.db_path, 0o600)
     except OSError:
         pass
     return conn
+
+
+def configure_service_db(conn: sqlite3.Connection) -> str:
+    """Enable the service's concurrent read/write mode once at daemon startup."""
+    if conn.in_transaction:
+        conn.commit()
+    row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+    mode = str(row[0] if row is not None else "").lower()
+    if mode != "wal":
+        raise RuntimeError(f"could not enable SQLite WAL mode (got {mode or 'unknown'})")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    return mode
+
+
+def db_schema_ready(conn: sqlite3.Connection) -> bool:
+    tables = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    if not _DB_SCHEMA_TABLES.issubset(tables):
+        return False
+    for table, required_columns in _DB_SCHEMA_COLUMNS.items():
+        columns = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not required_columns.issubset(columns):
+            return False
+    return True
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -2392,12 +2455,27 @@ def channel_delivery_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3
 
 def channel_run_has_partial_delivery(conn: sqlite3.Connection, run_id: str) -> bool:
     deliveries = channel_delivery_rows(conn, run_id)
-    sent = any(
-        str(row["delivery_status"] or "sent") == "sent" and row["telegram_message_id"] is not None
-        for row in deliveries
-    )
-    failed = any(str(row["delivery_status"] or "sent") != "sent" for row in deliveries)
-    return sent and failed
+    sent = False
+    unresolved_failures: dict[tuple[Any, ...], int] = {}
+    for row in deliveries:
+        delivery_key = (
+            str(row["chat_id"] or ""),
+            str(row["event_type"] or ""),
+            row["reply_to_message_id"],
+            row["message_thread_id"],
+            str(row["text_preview"] or ""),
+        )
+        status = str(row["delivery_status"] or "sent")
+        if status == "sent" and row["telegram_message_id"] is not None:
+            sent = True
+            # Immediate channel delivery gets one final retry when a transient
+            # send fails. A later success for the same logical event resolves
+            # that failed attempt; it is not partial output.
+            if unresolved_failures.get(delivery_key, 0) > 0:
+                unresolved_failures[delivery_key] -= 1
+        elif status != "sent":
+            unresolved_failures[delivery_key] = unresolved_failures.get(delivery_key, 0) + 1
+    return sent and any(count > 0 for count in unresolved_failures.values())
 
 
 def mark_run_superseded(conn: sqlite3.Connection, run_id: str, reason: str) -> None:
@@ -8606,6 +8684,7 @@ def build_prompt(
     config: Config,
     *,
     allow_silent_reply: bool = False,
+    explicitly_addressed: bool = False,
     message_thread_id: int | None = None,
     context_rows_override: list[sqlite3.Row] | None = None,
     handoff_block_override: str | None = None,
@@ -8674,6 +8753,9 @@ def build_prompt(
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
             parts.append("<telegram_feedback>\n" + reaction_feedback + "\n</telegram_feedback>")
+        turn_attention = human_direct_turn_hint(chat, sender, explicitly_addressed)
+        if turn_attention:
+            parts.append(turn_attention)
         parts.append(
             compact_channel_event(
                 chat,
@@ -8738,6 +8820,8 @@ def build_prompt(
     )
     worker_context = active_worker_context_block(config, chat.chat_id)
     worker_context_block = f"Active worker context:\n{worker_context}\n\n" if worker_context else ""
+    turn_attention = human_direct_turn_hint(chat, sender, explicitly_addressed)
+    turn_attention_block = f"{turn_attention}\n\n" if turn_attention else ""
     return (
         f"{stable_instructions}"
         "Telegram inbound message:\n"
@@ -8761,6 +8845,7 @@ def build_prompt(
         f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
         f"{worker_context_block}"
         f"{reaction_feedback_block}"
+        f"{turn_attention_block}"
         f"{wake_block + chr(10) + chr(10) if wake_block else ''}"
         f"{watch_block + chr(10) + chr(10) if watch_block else ''}"
         f"{window_block + chr(10) + chr(10) if window_block else ''}"
@@ -8796,6 +8881,40 @@ GROUP_PRESENCE_TURN_HINT = (
     "a short useful line even when they skip @. Let private banter stay centered on the people having it; "
     "join when you genuinely add warmth."
 )
+
+
+def human_direct_turn_hint(chat: Chat, sender: Sender, explicitly_addressed: bool) -> str:
+    if chat.chat_type == "private" or not explicitly_addressed or sender.is_bot or sender.is_chat:
+        return ""
+    return (
+        "<turn_attention>\n"
+        "A human appears to be handing you the conversational turn. A brief reply or reaction is the natural "
+        "default when their question or request is still open. Silence can still fit when the name is merely "
+        "quoted or mentioned in passing, the command is meant for another bot, the content is duplicate or "
+        "superseded, or a later human message already answered it. Bot receipts and bot chatter do not by "
+        "themselves close an open human turn.\n"
+        "</turn_attention>"
+    )
+
+
+def batch_human_direct_turn_hint(chat: Chat, items: list[BatchItem]) -> str:
+    if chat.chat_type == "private":
+        return ""
+    has_direct_human = any(
+        item.explicitly_addressed and not item.sender.is_bot and not item.sender.is_chat
+        for item in items
+    )
+    if not has_direct_human:
+        return ""
+    return (
+        "<turn_attention>\n"
+        "At least one human in this batch appears to be handing you the conversational turn. A brief reply or "
+        "reaction is the natural default while that question or request remains open. Silence can still fit for "
+        "an incidental or quoted name, a command aimed at another bot, duplicate or superseded content, or a "
+        "later human message that already answered it. Do not let a later bot receipt or bot aside erase an "
+        "open human turn.\n"
+        "</turn_attention>"
+    )
 
 
 def build_batch_prompt(
@@ -8881,6 +9000,9 @@ def build_batch_prompt(
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
             parts.append("<telegram_feedback>\n" + reaction_feedback + "\n</telegram_feedback>")
+        turn_attention = batch_human_direct_turn_hint(chat, items)
+        if turn_attention:
+            parts.append(turn_attention)
         channel_events = [
             compact_channel_event(
                 chat,
@@ -8928,6 +9050,8 @@ def build_batch_prompt(
         if reaction_feedback
         else ""
     )
+    turn_attention = batch_human_direct_turn_hint(chat, items)
+    turn_attention_block = f"{turn_attention}\n\n" if turn_attention else ""
     return (
         f"{stable_instructions}"
         "Telegram short batch:\n"
@@ -8947,6 +9071,7 @@ def build_batch_prompt(
         "Immediate same-chat context (last five messages before this batch):\n"
         f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
         f"{reaction_feedback_block}"
+        f"{turn_attention_block}"
         "Latest short batch:\n"
         f"{chr(10).join(batch_lines)}\n\n"
         f"{message_shape_instruction(conn, chat)}\n\n"
@@ -9429,9 +9554,9 @@ def desktop_live_sync_guard(
     desktop_preview: str | None,
     stop_event: threading.Event,
 ) -> None:
-    while not stop_event.wait(1):
+    while not stop_event.is_set():
         try:
-            with closing(connect_db(config)) as conn:
+            with closing(connect_db(config, timeout_seconds=1.0)) as conn:
                 refresh_desktop_live_sync(
                     conn,
                     config,
@@ -9444,6 +9569,56 @@ def desktop_live_sync_guard(
                 )
         except Exception as exc:
             print(f"{utc_now()} desktop live sync guard failed: {exc}", file=sys.stderr, flush=True)
+        if stop_event.wait(1):
+            break
+
+
+def schedule_desktop_run_finalization(
+    config: Config,
+    session_id: str | None,
+    raw_prompt: str,
+    run_id: str,
+    desktop_title: str | None,
+    desktop_preview: str | None,
+) -> None:
+    if not session_id or config.engine != "app-server" or not config.desktop_sync:
+        return
+
+    def target() -> None:
+        # Finalizers can overlap when the next Telegram turn starts quickly.
+        # Serialize rollout rewrites so one prompt-hide pass cannot overwrite
+        # another, and only let the newest run update Desktop title/preview.
+        with _DESKTOP_FINALIZATION_LOCK:
+            try:
+                with closing(connect_db(config, timeout_seconds=1.0)) as final_conn:
+                    latest_row = final_conn.execute(
+                        """
+                        SELECT id
+                        FROM runs
+                        WHERE codex_session_id_before = ? OR codex_session_id_after = ?
+                        ORDER BY started_at DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (session_id, session_id),
+                    ).fetchone()
+                    if latest_row is None or str(latest_row["id"]) == run_id:
+                        sync_codex_desktop_metadata(
+                            session_id,
+                            desktop_title,
+                            desktop_preview,
+                            config,
+                        )
+                    maybe_hide_desktop_prompt_display(
+                        final_conn,
+                        config,
+                        session_id,
+                        raw_prompt,
+                        live_mirror_run_id=run_id,
+                    )
+            except Exception as exc:
+                print(f"{utc_now()} desktop finalization failed: {exc}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=target, daemon=True, name=f"desktop-finalize-{run_id}").start()
 
 
 def run_codex_app_server(
@@ -9461,6 +9636,7 @@ def run_codex_app_server(
     run_id: str | None = None,
     immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> RunResult:
+    run_started = time.monotonic()
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
     run_id = run_id or safe_run_id(chat_id, message_id)
@@ -9470,16 +9646,6 @@ def run_codex_app_server(
     log_path = config.logs_dir / f"{run_id}.app-server.jsonl"
     write_private_text(prompt_path, prompt)
     create_run(conn, run_id, chat_id, session_id_before, prompt_path, reply_path, log_path)
-    refresh_desktop_live_sync(
-        conn,
-        config,
-        session_id_before,
-        prompt,
-        run_id,
-        desktop_title,
-        desktop_preview,
-        append_mirror=True,
-    )
     live_sync_stop = threading.Event()
     live_sync_thread: threading.Thread | None = None
     if session_id_before and config.engine == "app-server" and config.desktop_sync:
@@ -9512,6 +9678,16 @@ def run_codex_app_server(
             session_id_before,
             "app-server resume failed; continuing in a fresh thread",
         )
+    if conn.in_transaction:
+        conn.commit()
+    pre_model_seconds = time.monotonic() - run_started
+    if pre_model_seconds >= 1.0:
+        print(
+            f"{utc_now()} app-server pre-model delay={pre_model_seconds:.1f}s "
+            f"chat_id={chat_id} run_id={run_id}",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         session_id_after, reply, error, channel_events, actual_prompt = app_client.run_turn(
             session_id_before,
@@ -9539,10 +9715,8 @@ def run_codex_app_server(
         write_private_text(prompt_path, actual_prompt)
     write_private_text(reply_path, reply)
     write_channel_events(channel_events_path, channel_events)
-    maybe_hide_desktop_prompt_display(conn, config, session_id_after, actual_prompt, live_mirror_run_id=run_id)
     if status == "ok" and session_id_after:
         set_session_for_config(conn, chat_id, session_id_after, config)
-        sync_codex_desktop_metadata(session_id_after, desktop_title, desktop_preview, config)
     if status != "ok" and not reply:
         reply = (
             "这次 Codex app-server 调用没跑完。"
@@ -9552,6 +9726,14 @@ def run_codex_app_server(
         )
         write_private_text(reply_path, reply)
     finish_run(conn, run_id, status, session_id_after, error)
+    schedule_desktop_run_finalization(
+        config,
+        session_id_after,
+        actual_prompt,
+        run_id,
+        desktop_title,
+        desktop_preview,
+    )
     if status != "ok":
         maybe_rollover_failed_shared_session(conn, config, session_id_after or session_id_before, error)
     return RunResult(
@@ -11311,7 +11493,8 @@ def app_server_codex_worker_start_tool_spec() -> dict[str, Any]:
         "name": "codex_worker_start",
         "description": (
             "Start a separate Codex worker for larger coding tasks, multi-step debugging, or longer verification. "
-            "Provide the concrete task, useful cwd, relevant files, and the result shape you want back. "
+            "Provide the concrete task, useful cwd, relevant files, result shape, and a short natural Telegram ack. "
+            "The ack is delivered immediately while the separate worker starts; do not mention worker/routing mechanics. "
             "The tool returns a task_id for later codex_worker_status and codex_worker_continue calls."
         ),
         "inputSchema": {
@@ -11320,8 +11503,9 @@ def app_server_codex_worker_start_tool_spec() -> dict[str, Any]:
                 "task": {"type": "string"},
                 "title": {"type": "string"},
                 "cwd": {"type": "string"},
+                "ack": {"type": "string"},
             },
-            "required": ["task"],
+            "required": ["task", "ack"],
             "additionalProperties": False,
         },
     }
@@ -11737,11 +11921,11 @@ class CodexAppServerClient:
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
             return self._dynamic_tool_result(f"{tool} arguments must be an object", success=False)
+        call_id = str(params.get("callId") or params.get("call_id") or "").strip()
         if tool in WORKER_TOOL_NAMES:
-            return self.record_worker_tool_call(tool, arguments)
+            return self.record_worker_tool_call(tool, arguments, channel_events, call_id=call_id)
         if tool == "leave_chat":
             return self.record_leave_chat_tool_call(arguments)
-        call_id = str(params.get("callId") or params.get("call_id") or "").strip()
         if call_id and any(channel_event_call_id(event) == call_id for event in channel_events):
             return self._dynamic_tool_result("Duplicate Telegram channel event already recorded", success=True)
         chat_id = str(arguments.get("chat_id") or "current").strip()
@@ -11869,11 +12053,21 @@ class CodexAppServerClient:
         ]
         return self._dynamic_tool_result(" ".join(details), success=True)
 
-    def record_worker_tool_call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def record_worker_tool_call(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        channel_events: list[dict[str, Any]] | None = None,
+        *,
+        call_id: str = "",
+    ) -> dict[str, Any]:
         if tool == "codex_worker_start":
             task = str(arguments.get("task") or "").strip()
             title = str(arguments.get("title") or "").strip()
             cwd = str(arguments.get("cwd") or "").strip()
+            ack = str(arguments.get("ack") or "").strip()
+            if ack and _looks_like_system_prompt_echo(ack):
+                return self._dynamic_tool_result("Blocked worker ack: looks like system prompt echo", success=False)
             state, error = start_codex_worker(self.config, task=task, title=title, cwd=cwd)
             if error or state is None:
                 return self._dynamic_tool_result(error or "worker start failed", success=False)
@@ -11893,6 +12087,17 @@ class CodexAppServerClient:
                     ),
                 )
                 alarm_text = f"\nSupervisor alarm scheduled: {alarm['alarm_id']} due_at: {alarm['due_at']}"
+            if ack and channel_events is not None:
+                ack_event = {
+                    "type": "reply",
+                    "chat_id": "current",
+                    "text": ack,
+                    "delivery_event_type": "background_ack",
+                    **({"call_id": call_id} if call_id else {}),
+                    "ts": utc_now(),
+                }
+                channel_events.append(ack_event)
+                self.send_immediate_channel_events([ack_event])
             return self._dynamic_tool_result(
                 "Codex worker started:\n" + format_worker_state(state, include_result=False) + alarm_text,
                 success=True,
@@ -12201,10 +12406,79 @@ class CodexAppServerClient:
         return str(response["result"]["turn"]["id"])
 
 
+@dataclass
+class ScheduledTurn:
+    scheduler: "FairTurnScheduler"
+    chat_id: str
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.scheduler.release(self.chat_id)
+
+
+@dataclass(frozen=True)
+class TurnWaiter:
+    sequence: int
+    chat_id: str
+    direct_human: bool
+    enqueued_at: float
+
+
+class FairTurnScheduler:
+    def __init__(self, *, starvation_seconds: float = 30.0) -> None:
+        self.starvation_seconds = max(1.0, float(starvation_seconds))
+        self.condition = threading.Condition()
+        self.waiters: list[TurnWaiter] = []
+        self.active = False
+        self.last_chat_id: str | None = None
+        self.sequence = 0
+
+    def selected_waiter(self, *, now: float | None = None) -> TurnWaiter | None:
+        if not self.waiters:
+            return None
+        current = time.monotonic() if now is None else now
+
+        def key(waiter: TurnWaiter) -> tuple[int, int, int]:
+            aged = current - waiter.enqueued_at >= self.starvation_seconds
+            priority = 2 if aged else int(waiter.direct_human)
+            different_chat = int(waiter.chat_id != self.last_chat_id)
+            return priority, different_chat, -waiter.sequence
+
+        return max(self.waiters, key=key)
+
+    def acquire(self, chat_id: str, *, direct_human: bool = False) -> ScheduledTurn:
+        with self.condition:
+            self.sequence += 1
+            waiter = TurnWaiter(
+                sequence=self.sequence,
+                chat_id=str(chat_id),
+                direct_human=bool(direct_human),
+                enqueued_at=time.monotonic(),
+            )
+            self.waiters.append(waiter)
+            while self.active or self.selected_waiter() is not waiter:
+                self.condition.wait()
+            self.waiters.remove(waiter)
+            self.active = True
+            return ScheduledTurn(self, waiter.chat_id)
+
+    def release(self, chat_id: str) -> None:
+        with self.condition:
+            if not self.active:
+                return
+            self.active = False
+            self.last_chat_id = str(chat_id)
+            self.condition.notify_all()
+
+
 class BotService:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.chat_locks: dict[str, threading.Lock] = {}
+        self.turn_scheduler = FairTurnScheduler()
         self.batch_lock = threading.Lock()
         self.batches: dict[str, BatchState] = {}
         self.media_group_lock = threading.Lock()
@@ -12217,6 +12491,7 @@ class BotService:
         self.desktop_outbound_agent_sent: set[str] = set()
         self.desktop_outbound_lock = threading.Lock()
         self._boot_wall_ts = time.time()
+        self._one_shot_poll = False
 
     def lock_for_chat(self, chat_id: str) -> threading.Lock:
         key = "__shared_codex_session__" if self.config.session_scope == "shared" else chat_id
@@ -12252,6 +12527,8 @@ class BotService:
     def process_update(self, conn: sqlite3.Connection, update: dict[str, Any]) -> bool:
         try:
             self.handle_update(conn, update)
+            if conn.in_transaction:
+                conn.commit()
             return True
         except Exception as exc:
             try:
@@ -12299,6 +12576,8 @@ class BotService:
 
     def serve(self) -> None:
         with closing(connect_db(self.config)) as conn:
+            journal_mode = configure_service_db(conn)
+            print(f"{utc_now()} sqlite journal_mode={journal_mode}", flush=True)
             interrupted_reason = "daemon restarted before run completed"
             interrupted_runs = running_runs(conn)
             interrupted_background_runs = running_runs_with_background_ack(conn)
@@ -12786,7 +13065,7 @@ class BotService:
     def poll_desktop_outbound_once(self) -> int:
         if not self.config.desktop_outbound or self.config.engine != "app-server":
             return 0
-        with closing(connect_db(self.config)) as conn:
+        with closing(connect_db(self.config, timeout_seconds=2.0)) as conn:
             thread_id = shared_session_for_engine(conn, self.config.engine)
             if not thread_id:
                 return 0
@@ -12947,8 +13226,26 @@ class BotService:
             offset_raw = get_meta(conn, "telegram_offset")
             offset = int(offset_raw) if offset_raw and offset_raw.isdigit() else None
             updates = get_updates(self.config, offset)
-            processed = self.process_update_batch(conn, updates)
+            self._one_shot_poll = True
+            try:
+                processed = self.process_update_batch(conn, updates)
+                self.flush_pending_media_groups_now()
+            finally:
+                self._one_shot_poll = False
         return processed
+
+    def flush_pending_media_groups_now(self) -> None:
+        """Finish any album assembled during a foreground poll-once call."""
+        while True:
+            with self.media_group_lock:
+                if not self.media_groups:
+                    return
+                key, state = next(iter(self.media_groups.items()))
+                if state.timer is not None:
+                    state.timer.cancel()
+                    state.timer = None
+                revision = state.revision
+            self.flush_media_group(key, revision)
 
     def _incoming_message_is_stale(self, message: dict[str, Any]) -> bool:
         """Backlog guard. A message that predates this process's startup, or is
@@ -13178,17 +13475,41 @@ class BotService:
             or current_media_action
             or explicitly_addressed_by_identity
         )
-        self.run_single_message(
-            conn,
-            chat,
-            sender,
-            message_id,
-            thread_id,
-            current_prompt_text,
-            text,
-            allow_silent_reply,
-            explicitly_addressed,
-        )
+        if self._one_shot_poll:
+            # poll-once is a foreground diagnostic. Do not hand work to daemon
+            # threads that disappear as soon as the one-shot process exits.
+            self.run_single_message(
+                conn,
+                chat,
+                sender,
+                message_id,
+                thread_id,
+                current_prompt_text,
+                text,
+                allow_silent_reply,
+                explicitly_addressed,
+                skip_batch=True,
+            )
+        elif self.should_batch_codex(conn, chat, allow_silent_reply):
+            self.enqueue_batch(
+                chat,
+                sender,
+                message_id,
+                thread_id,
+                current_prompt_text,
+                explicitly_addressed,
+            )
+        else:
+            self.dispatch_single_message(
+                chat,
+                sender,
+                message_id,
+                thread_id,
+                current_prompt_text,
+                text,
+                allow_silent_reply,
+                explicitly_addressed,
+            )
 
     def handle_message_reaction_update(self, conn: sqlite3.Connection, update: dict[str, Any]) -> bool:
         event = update.get("message_reaction")
@@ -13299,6 +13620,47 @@ class BotService:
                 self.app_server,
                 **run_kwargs,
             )
+
+    def dispatch_single_message(
+        self,
+        chat: Chat,
+        sender: Sender,
+        message_id: int,
+        message_thread_id: int | None,
+        prompt_text: str,
+        trigger_text: str,
+        allow_silent_reply: bool,
+        explicitly_addressed: bool,
+    ) -> None:
+        """Keep the update processor free while a scheduled turn waits or runs."""
+
+        def target() -> None:
+            try:
+                with closing(connect_db(self.config)) as turn_conn:
+                    self.run_single_message(
+                        turn_conn,
+                        chat,
+                        sender,
+                        message_id,
+                        message_thread_id,
+                        prompt_text,
+                        trigger_text,
+                        allow_silent_reply,
+                        explicitly_addressed,
+                    )
+            except Exception as exc:
+                print(
+                    f"{utc_now()} single turn dispatch error chat_id={chat.chat_id} "
+                    f"message_id={message_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        threading.Thread(
+            target=target,
+            daemon=True,
+            name=f"telegram-turn-{chat.chat_id}-{message_id}",
+        ).start()
 
     def immediate_channel_event_sender_for_turn(
         self,
@@ -13428,6 +13790,7 @@ class BotService:
     def run_codex_maybe_direct_background(
         self,
         lock: threading.Lock,
+        scheduled_turn: ScheduledTurn,
         chat: Chat,
         message_id: int,
         message_thread_id: int | None,
@@ -13440,7 +13803,11 @@ class BotService:
         explicitly_addressed: bool,
         stop_typing: threading.Event | None = None,
     ) -> tuple[str, RunResult | None, Exception | None]:
-        if not self.config.direct_background or self.config.direct_background_after_seconds <= 0:
+        if (
+            self._one_shot_poll
+            or not self.config.direct_background
+            or self.config.direct_background_after_seconds <= 0
+        ):
             try:
                 result = self.run_codex_prepared_turn(
                     chat,
@@ -13506,6 +13873,7 @@ class BotService:
                 if stop_typing is not None:
                     stop_typing.set()
                 lock.release()
+                scheduled_turn.release()
 
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
@@ -13559,8 +13927,15 @@ class BotService:
             else None
         )
         lock = self.lock_for_chat(chat.chat_id)
+        if conn.in_transaction:
+            conn.commit()
+        scheduled_turn = self.turn_scheduler.acquire(
+            chat.chat_id,
+            direct_human=explicitly_addressed and not sender.is_bot and not sender.is_chat,
+        )
         lock.acquire()
         release_lock = True
+        release_scheduled_turn = True
         try:
             try:
                 try:
@@ -13584,12 +13959,14 @@ class BotService:
                         prompt_text,
                         self.config,
                         allow_silent_reply=allow_silent_reply,
+                        explicitly_addressed=explicitly_addressed,
                         message_thread_id=message_thread_id,
                         context_rows_override=context_rows_override,
                     )
                     effort = effort_for_message(self.config, trigger_text, prompt_text, chat_type=chat.chat_type)
                     mode, result, error = self.run_codex_maybe_direct_background(
                         lock,
+                        scheduled_turn,
                         chat,
                         message_id,
                         message_thread_id,
@@ -13603,6 +13980,7 @@ class BotService:
                     )
                     if mode == "background":
                         release_lock = False
+                        release_scheduled_turn = False
                         stop_typing = None
                         return
                     if error is not None:
@@ -13626,6 +14004,8 @@ class BotService:
         finally:
             if release_lock:
                 lock.release()
+            if release_scheduled_turn:
+                scheduled_turn.release()
 
     def media_group_key(self, chat_id: str, media_group_id: str) -> str:
         return f"{chat_id}:{media_group_id}"
@@ -13783,6 +14163,7 @@ class BotService:
             )
             return
         lock = self.lock_for_chat(chat.chat_id)
+        scheduled_turn = self.turn_scheduler.acquire(chat.chat_id, direct_human=True)
         lock.acquire()
         try:
             stop_typing = start_typing_feedback(
@@ -13857,6 +14238,7 @@ class BotService:
                 stop_typing.set()
         finally:
             lock.release()
+            scheduled_turn.release()
 
     def should_batch_codex(self, conn: sqlite3.Connection, chat: Chat, allow_silent_reply: bool) -> bool:
         if chat.chat_type == "private":
@@ -14304,6 +14686,7 @@ class BotService:
 
             if event_type == "reply":
                 text = str(event.get("text") or "").strip()
+                delivery_event_type = str(event.get("delivery_event_type") or event_type).strip()
                 if _looks_like_system_prompt_echo(text):
                     if run_id:
                         with closing(connect_db(self.config)) as conn:
@@ -14340,7 +14723,7 @@ class BotService:
                                     reply_to,
                                     thread_id,
                                     text,
-                                    event_type=event_type,
+                                    event_type=delivery_event_type,
                                 )
                         if delivery_error:
                             record_channel_delivery(
@@ -14352,7 +14735,7 @@ class BotService:
                                 reply_to,
                                 thread_id,
                                 text,
-                                event_type=event_type,
+                                event_type=delivery_event_type,
                                 delivery_status="failed",
                                 error=delivery_error,
                             )
@@ -14366,7 +14749,7 @@ class BotService:
                                 reply_to,
                                 thread_id,
                                 text,
-                                event_type=event_type,
+                                event_type=delivery_event_type,
                                 delivery_status="failed",
                                 error="Telegram sendMessage returned no message id",
                             )
@@ -14539,6 +14922,13 @@ class BotService:
         *,
         run_id: str | None = None,
     ) -> RunResult:
+        scheduled_turn = self.turn_scheduler.acquire(
+            chat.chat_id,
+            direct_human=any(
+                item.explicitly_addressed and not item.sender.is_bot and not item.sender.is_chat
+                for item in items
+            ),
+        )
         lock = self.lock_for_chat(chat.chat_id)
         lock.acquire()
         try:
@@ -14590,6 +14980,7 @@ class BotService:
                 )
         finally:
             lock.release()
+            scheduled_turn.release()
 
     def should_allow_silent_reply(
         self,

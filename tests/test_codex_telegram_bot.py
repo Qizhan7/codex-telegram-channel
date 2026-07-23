@@ -91,6 +91,26 @@ def _write_rollout_record(path: Path, record: dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def test_connect_db_initializes_schema_only_once_per_path(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    real_init_db = codex_telegram_bot.init_db
+    calls = 0
+
+    def tracked_init_db(conn: sqlite3.Connection) -> None:
+        nonlocal calls
+        calls += 1
+        real_init_db(conn)
+
+    monkeypatch.setattr(codex_telegram_bot, "init_db", tracked_init_db)
+
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as first:
+        assert codex_telegram_bot.db_schema_ready(first) is True
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as second:
+        assert codex_telegram_bot.db_schema_ready(second) is True
+
+    assert calls == 1
+
+
 def _telegram_update(update_id: int, chat_id: int, chat_type: str, text: str) -> dict:
     chat: dict[str, object] = {"id": chat_id, "type": chat_type}
     if chat_type != "private":
@@ -135,6 +155,189 @@ def test_enqueue_pulled_updates_keeps_one_batch_for_durable_checkpoint(tmp_path:
     assert update_queue.empty()
 
 
+def test_single_turn_dispatch_keeps_update_lane_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    _conn(tmp_path).close()
+    service = codex_telegram_bot.BotService(cfg)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_run(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(service, "run_single_message", blocking_run)
+    started = time.monotonic()
+    service.dispatch_single_message(
+        codex_telegram_bot.Chat("111", "private", "Owner"),
+        codex_telegram_bot.Sender("111", "Owner", False),
+        42,
+        None,
+        "查一下",
+        "查一下",
+        False,
+        True,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 0.1
+        assert entered.wait(1)
+    finally:
+        release.set()
+
+
+def test_service_db_uses_wal_for_concurrent_readers_and_writers(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        assert codex_telegram_bot.configure_service_db(conn) == "wal"
+    with sqlite3.connect(cfg.db_path) as check:
+        assert check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_fair_scheduler_prefers_direct_human_turn_then_other_chat() -> None:
+    scheduler = codex_telegram_bot.FairTurnScheduler(starvation_seconds=30)
+    scheduler.last_chat_id = "chat-a"
+    scheduler.waiters = [
+        codex_telegram_bot.TurnWaiter(1, "chat-a", False, 100.0),
+        codex_telegram_bot.TurnWaiter(2, "chat-b", False, 101.0),
+        codex_telegram_bot.TurnWaiter(3, "chat-c", True, 102.0),
+    ]
+
+    assert scheduler.selected_waiter(now=105.0).chat_id == "chat-c"
+    scheduler.waiters = scheduler.waiters[:2]
+    assert scheduler.selected_waiter(now=105.0).chat_id == "chat-b"
+
+
+def test_fair_scheduler_ages_ordinary_turn_above_new_direct_traffic() -> None:
+    scheduler = codex_telegram_bot.FairTurnScheduler(starvation_seconds=30)
+    scheduler.waiters = [
+        codex_telegram_bot.TurnWaiter(1, "quiet-room", False, 50.0),
+        codex_telegram_bot.TurnWaiter(2, "busy-room", True, 95.0),
+    ]
+
+    assert scheduler.selected_waiter(now=100.0).chat_id == "quiet-room"
+
+
+def test_successful_update_commits_any_short_unfinished_transaction(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+
+    def fake_handle_update(conn_arg, _update):
+        conn_arg.execute("INSERT INTO meta(key, value) VALUES('short-boundary', 'done')")
+
+    monkeypatch.setattr(service, "handle_update", fake_handle_update)
+
+    assert service.process_update(conn, {"update_id": 7})
+    with sqlite3.connect(cfg.db_path) as check:
+        assert check.execute("SELECT value FROM meta WHERE key = 'short-boundary'").fetchone()[0] == "done"
+
+
+def test_desktop_mirror_refresh_does_not_block_model_start(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, engine="app-server", desktop_sync=True)
+    _conn(tmp_path).close()
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    model_started = threading.Event()
+    release_model = threading.Event()
+    result_holder: list[codex_telegram_bot.RunResult] = []
+
+    def blocking_refresh(*_args, **_kwargs):
+        refresh_started.set()
+        assert release_refresh.wait(2)
+
+    class FakeAppServer:
+        def run_turn(self, *args, **kwargs):
+            model_started.set()
+            assert release_model.wait(2)
+            return "session-after", "", None, [], args[1]
+
+    monkeypatch.setattr(codex_telegram_bot, "refresh_desktop_live_sync", blocking_refresh)
+    monkeypatch.setattr(codex_telegram_bot, "schedule_desktop_run_finalization", lambda *_args: None)
+
+    def run_turn() -> None:
+        with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+            result_holder.append(
+                codex_telegram_bot.run_codex_app_server(
+                    conn,
+                    cfg,
+                    FakeAppServer(),
+                    "111",
+                    "session-before",
+                    "prompt",
+                    9,
+                    run_id="async-desktop-sync",
+                )
+            )
+
+    thread = threading.Thread(target=run_turn)
+    thread.start()
+    try:
+        assert refresh_started.wait(1)
+        assert model_started.wait(0.2)
+    finally:
+        release_refresh.set()
+        release_model.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result_holder[0].status == "ok"
+
+
+def test_stale_desktop_finalizer_does_not_overwrite_newer_run_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path, engine="app-server", desktop_sync=True)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        codex_telegram_bot.create_run(
+            conn,
+            "older-run",
+            "111",
+            session_id,
+            tmp_path / "older.prompt",
+            tmp_path / "older.reply",
+            tmp_path / "older.log",
+        )
+        codex_telegram_bot.finish_run(conn, "older-run", "ok", session_id, None)
+        time.sleep(0.001)
+        codex_telegram_bot.create_run(
+            conn,
+            "newer-run",
+            "222",
+            session_id,
+            tmp_path / "newer.prompt",
+            tmp_path / "newer.reply",
+            tmp_path / "newer.log",
+        )
+
+    metadata_calls: list[str] = []
+    finalized = threading.Event()
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "sync_codex_desktop_metadata",
+        lambda *_args, **_kwargs: metadata_calls.append("called"),
+    )
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "maybe_hide_desktop_prompt_display",
+        lambda *_args, **_kwargs: finalized.set(),
+    )
+
+    codex_telegram_bot.schedule_desktop_run_finalization(
+        cfg,
+        session_id,
+        "older prompt",
+        "older-run",
+        "Older title",
+        "Older preview",
+    )
+
+    assert finalized.wait(1)
+    assert metadata_calls == []
+
+
 def test_poll_once_prioritizes_private_updates_and_advances_offset_after_batch(
     tmp_path: Path,
     monkeypatch,
@@ -169,6 +372,47 @@ def test_poll_once_prioritizes_private_updates_and_advances_offset_after_batch(
     conn = _conn(tmp_path)
     assert seen == [11, 10, 12]
     assert codex_telegram_bot.get_meta(conn, "telegram_offset") == "13"
+
+
+def test_poll_once_runs_single_turn_inline_before_process_exit(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, direct_background=True)
+    conn = _conn(tmp_path)
+    codex_telegram_bot.set_meta(conn, "bot_id", "8600")
+    codex_telegram_bot.set_meta(conn, "bot_username", "codex_test_bot")
+    conn.close()
+    service = codex_telegram_bot.BotService(cfg)
+    calls: list[tuple[str, bool]] = []
+
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "get_updates",
+        lambda _config, _offset: [_telegram_update(20, 111, "private", "foreground check")],
+    )
+
+    def fake_run_single_message(
+        conn_arg,
+        chat,
+        sender,
+        message_id,
+        message_thread_id,
+        prompt_text,
+        trigger_text,
+        allow_silent_reply,
+        explicitly_addressed,
+        **kwargs,
+    ):
+        calls.append((trigger_text, kwargs.get("skip_batch", False)))
+
+    monkeypatch.setattr(service, "run_single_message", fake_run_single_message)
+    monkeypatch.setattr(
+        service,
+        "dispatch_single_message",
+        lambda *_args, **_kwargs: calls.append(("async", False)),
+    )
+
+    assert service.poll_once() == 1
+    assert calls == [("foreground check", True)]
+    assert service._one_shot_poll is False
 
 
 def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
@@ -865,6 +1109,7 @@ def test_short_stale_identity_call_still_reaches_codex(tmp_path: Path, monkeypat
     service._boot_wall_ts = now
     monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
     calls: list[dict] = []
+    dispatched = threading.Event()
 
     def fake_run_single_message(
         self,
@@ -886,6 +1131,7 @@ def test_short_stale_identity_call_still_reaches_codex(tmp_path: Path, monkeypat
                 "explicitly_addressed": explicitly_addressed,
             }
         )
+        dispatched.set()
 
     monkeypatch.setattr(codex_telegram_bot.BotService, "run_single_message", fake_run_single_message)
     direct_update = {
@@ -901,6 +1147,7 @@ def test_short_stale_identity_call_still_reaches_codex(tmp_path: Path, monkeypat
 
     service.handle_update(conn, direct_update)
 
+    assert dispatched.wait(1)
     assert calls == [{"message_id": 101, "trigger_text": "助手～测试一下", "explicitly_addressed": True}]
 
 
@@ -1171,6 +1418,75 @@ def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_p
     assert "codex 当前消息" not in recent_block
 
 
+def test_explicit_human_group_turn_gets_soft_reply_attention(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    sender = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+
+    prompt = codex_telegram_bot.build_prompt(
+        conn,
+        chat,
+        sender,
+        7,
+        "序，你觉得呢？",
+        cfg,
+        allow_silent_reply=True,
+        explicitly_addressed=True,
+    )
+
+    assert "<turn_attention>" in prompt
+    assert "natural default" in prompt
+    assert "merely quoted or mentioned in passing" in prompt
+
+
+def test_non_explicit_or_bot_group_turn_does_not_force_reply_attention(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    human = codex_telegram_bot.Sender("222", "Alice", False)
+    bot = codex_telegram_bot.Sender("333", "Receipt Bot", True)
+    codex_telegram_bot.upsert_chat(conn, chat)
+
+    ordinary = codex_telegram_bot.build_prompt(
+        conn, chat, human, 1, "序刚才说得挺好", cfg, allow_silent_reply=True
+    )
+    bot_ping = codex_telegram_bot.build_prompt(
+        conn,
+        chat,
+        bot,
+        2,
+        "@序 收到",
+        cfg,
+        allow_silent_reply=True,
+        explicitly_addressed=True,
+    )
+
+    assert "<turn_attention>" not in ordinary
+    assert "<turn_attention>" not in bot_ping
+
+
+def test_batch_keeps_open_direct_human_turn_ahead_of_later_bot_receipt(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Tea Room")
+    human = codex_telegram_bot.Sender("111", "Owner", False)
+    bot = codex_telegram_bot.Sender("333", "Receipt Bot", True)
+    prompt = codex_telegram_bot.build_batch_prompt(
+        conn,
+        chat,
+        [
+            codex_telegram_bot.BatchItem(10, None, human, "序你觉得呢？", True, codex_telegram_bot.utc_now()),
+            codex_telegram_bot.BatchItem(11, None, bot, "任务收到", True, codex_telegram_bot.utc_now()),
+        ],
+        cfg,
+    )
+
+    assert "<turn_attention>" in prompt
+    assert "Do not let a later bot receipt" in prompt
+
+
 def test_wake_trigger_names_phrase_when_directly_addressed(tmp_path: Path) -> None:
     cfg = _config(tmp_path, wake_phrases=("codex", "helper"))
     conn = _conn(tmp_path)
@@ -1315,6 +1631,7 @@ def test_private_status_like_chat_enters_codex_instead_of_local_fast_reply(
     service.bot_id = "999"
     service.bot_username = "codex_bot"
     calls: list[dict[str, object]] = []
+    dispatched = threading.Event()
 
     assert codex_telegram_bot.looks_like_channel_status_question(
         "这样叫你你干活会更有劲吗",
@@ -1340,6 +1657,7 @@ def test_private_status_like_chat_enters_codex_instead_of_local_fast_reply(
                 "explicitly_addressed": explicitly_addressed,
             }
         )
+        dispatched.set()
 
     monkeypatch.setattr(service, "run_single_message", fake_run_single_message)
 
@@ -1357,6 +1675,7 @@ def test_private_status_like_chat_enters_codex_instead_of_local_fast_reply(
         },
     )
 
+    assert dispatched.wait(1)
     assert calls == [
         {
             "chat_id": "111",
@@ -1535,6 +1854,133 @@ def test_send_channel_events_skips_already_immediate_reply_but_sends_later_resul
         fallback_message_thread_id=9,
     )
     assert sent == [("111", "查完了，现在是 mention。", 9)]
+
+
+def test_immediate_send_failure_retries_without_spurious_partial_notice(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    chat = codex_telegram_bot.Chat("-1001234567890", "supergroup", "Release Room")
+    event: dict[str, object] = {
+        "type": "reply",
+        "chat_id": "current",
+        "text": "有效回复",
+        "reply_to": "7901",
+    }
+    attempts: list[str] = []
+
+    def flaky_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise codex_telegram_bot.urllib.error.URLError(
+                ConnectionResetError(54, "Connection reset by peer")
+            )
+        return [501]
+
+    monkeypatch.setattr(codex_telegram_bot, "send_message", flaky_send_message)
+    immediate_sender = service.immediate_channel_event_sender_for_turn(chat, 7902, 7901, "retry-run")
+    assert immediate_sender is not None
+    immediate_sender([event])
+    assert "delivered_immediately" not in event
+
+    service.deliver_run_result(
+        chat,
+        7902,
+        7901,
+        codex_telegram_bot.RunResult(
+            run_id="retry-run",
+            status="ok",
+            reply=codex_telegram_bot.NO_REPLY_SENTINEL,
+            session_id_after="thread-1",
+            error=None,
+            channel_events=[event],
+        ),
+        allow_silent_reply=False,
+        explicitly_addressed=True,
+    )
+
+    assert attempts == ["有效回复", "有效回复"]
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        rows = codex_telegram_bot.channel_delivery_rows(conn, "retry-run")
+        assert [
+            (
+                row["delivery_status"],
+                row["telegram_message_id"],
+                row["reply_to_message_id"],
+                row["message_thread_id"],
+            )
+            for row in rows
+        ] == [
+            ("failed", None, 7901, 7901),
+            ("sent", 501, 7901, 7901),
+        ]
+        assert codex_telegram_bot.channel_run_has_partial_delivery(conn, "retry-run") is False
+
+
+def test_partial_delivery_notice_remains_for_unresolved_late_chunk_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        codex_telegram_bot.record_channel_delivery(
+            conn,
+            "partial-run",
+            "111",
+            0,
+            601,
+            None,
+            None,
+            "long reply",
+            event_type="reply",
+        )
+        codex_telegram_bot.record_channel_delivery(
+            conn,
+            "partial-run",
+            "111",
+            0,
+            None,
+            None,
+            None,
+            "long reply",
+            event_type="reply",
+            delivery_status="failed",
+            error="second Telegram chunk failed",
+        )
+
+        assert codex_telegram_bot.channel_run_has_partial_delivery(conn, "partial-run") is True
+
+
+def test_multiple_immediate_failures_are_resolved_by_later_successes(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        for event_index in (0, 0):
+            codex_telegram_bot.record_channel_delivery(
+                conn,
+                "retried-run",
+                "111",
+                event_index,
+                None,
+                77,
+                None,
+                "same short ack",
+                event_type="reply",
+                delivery_status="failed",
+                error="temporary network error",
+            )
+        for event_index, telegram_message_id in ((0, 701), (1, 702)):
+            codex_telegram_bot.record_channel_delivery(
+                conn,
+                "retried-run",
+                "111",
+                event_index,
+                telegram_message_id,
+                77,
+                None,
+                "same short ack",
+                event_type="reply",
+            )
+
+        assert codex_telegram_bot.channel_run_has_partial_delivery(conn, "retried-run") is False
 
 
 def test_app_server_reply_tool_uses_turn_immediate_sender(tmp_path: Path) -> None:
@@ -1946,6 +2392,8 @@ def test_worker_prompt_requires_confirmation_before_start(tmp_path: Path) -> Non
     assert "Do not delegate from keyword matches" in prompt
     assert "Only call codex_worker_start after the owner confirms" in prompt
     assert "a clear owner execution request can be that confirmation" in prompt
+    assert "tool's ack field" in prompt
+    assert "separate worker is preferred" in prompt
 
 
 def test_heavy_single_turn_enters_resident_instead_of_auto_worker(tmp_path: Path, monkeypatch) -> None:
@@ -2410,6 +2858,81 @@ def test_manual_worker_start_tool_schedules_supervisor_alarm(tmp_path: Path, mon
     assert alarms[0]["task_id"] == "manual-task"
     assert alarms[0]["chat_id"] == "111"
     assert alarms[0]["message_thread_id"] == 9
+
+
+def test_worker_start_delivers_model_written_ack_and_records_background_ack(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    client = service.app_server
+    assert client is not None
+    client.current_turn_chat_id = "111"
+    client.current_turn_message_thread_id = 9
+    sent: list[str] = []
+
+    def fake_start_worker(config, *, task, title="", cwd="", task_id=None, session_id=None, turn_count=1):
+        return (
+            {
+                "version": codex_telegram_bot.WORKER_STATE_VERSION,
+                "task_id": "detached-task",
+                "title": title,
+                "status": "running",
+                "pid": 123,
+                "session_id": "",
+                "cwd": str(config.cwd),
+                "model": config.model,
+                "started_at": codex_telegram_bot.utc_now(),
+                "finished_at": "",
+                "turn_count": turn_count,
+                "output_path": str(tmp_path / "workers" / "detached-task.last.txt"),
+                "jsonl_path": str(tmp_path / "workers" / "detached-task.jsonl"),
+                "stderr_path": str(tmp_path / "workers" / "detached-task.stderr.log"),
+            },
+            None,
+        )
+
+    def fake_send_message(config, chat_id, text, *, reply_to_message_id=None, message_thread_id=None):
+        sent.append(text)
+        return [801]
+
+    monkeypatch.setattr(codex_telegram_bot, "start_codex_worker", fake_start_worker)
+    monkeypatch.setattr(codex_telegram_bot, "send_message", fake_send_message)
+    client.current_turn_immediate_channel_event_sender = service.immediate_channel_event_sender_for_turn(
+        codex_telegram_bot.Chat("111", "private", "Owner"),
+        42,
+        9,
+        "resident-run",
+    )
+    events: list[dict[str, object]] = []
+
+    result = client.record_dynamic_tool_call(
+        {
+            "tool": "codex_worker_start",
+            "callId": "worker-call-1",
+            "arguments": {
+                "task": "检查并修好 Telegram 延迟，再跑验证",
+                "title": "Telegram latency",
+                "ack": "我先把延迟链路拆开查，跑完验证回来告诉你。",
+            },
+        },
+        events,
+    )
+
+    assert result["success"] is True
+    assert sent == ["我先把延迟链路拆开查，跑完验证回来告诉你。"]
+    assert events[0]["delivered_immediately"] is True
+    assert events[0]["delivery_event_type"] == "background_ack"
+    with codex_telegram_bot.closing(codex_telegram_bot.connect_db(cfg)) as conn:
+        row = conn.execute(
+            "SELECT event_type, message_thread_id FROM channel_deliveries WHERE run_id = 'resident-run'"
+        ).fetchone()
+    assert tuple(row) == ("background_ack", 9)
+
+
+def test_worker_start_tool_schema_requires_natural_ack() -> None:
+    spec = codex_telegram_bot.app_server_codex_worker_start_tool_spec()
+
+    assert spec["inputSchema"]["required"] == ["task", "ack"]
+    assert "routing mechanics" in spec["description"]
 
 
 def test_leave_chat_tool_requires_owner_private_context(tmp_path: Path, monkeypatch) -> None:
