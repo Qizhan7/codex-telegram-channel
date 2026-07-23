@@ -8882,6 +8882,14 @@ GROUP_PRESENCE_TURN_HINT = (
     "join when you genuinely add warmth."
 )
 
+PRIVATE_BATCH_REPLY_GUIDANCE = (
+    "Private batch reply judgment: Read the whole batch as one conversational turn and use the recent context. "
+    "Reply when it contains a new question, request, decision, substantive update, or unresolved thought that "
+    "naturally benefits from a response. A trailing laugh, emoji, acknowledgement, filler, or tone-only follow-up "
+    "does not need its own reply when the substantive point is already covered. When no visible response adds "
+    "anything, leave Telegram unchanged and finish privately with `(silent)`."
+)
+
 
 def human_direct_turn_hint(chat: Chat, sender: Sender, explicitly_addressed: bool) -> str:
     if chat.chat_type == "private" or not explicitly_addressed or sender.is_bot or sender.is_chat:
@@ -9018,9 +9026,11 @@ def build_batch_prompt(
         ]
         if channel_events:
             parts.append("\n\n".join(channel_events))
-        allow_silent_reply = chat.chat_type != "private"
+        allow_silent_reply = True
         instruction = compact_reply_instruction(chat, latest_id, allow_silent_reply=allow_silent_reply)
-        if allow_silent_reply:
+        if chat.chat_type == "private":
+            instruction += "\n" + PRIVATE_BATCH_REPLY_GUIDANCE
+        else:
             instruction += "\n" + GROUP_PRESENCE_TURN_HINT
         instruction += "\n" + message_shape_instruction(conn, chat)
         if aside_check:
@@ -9077,7 +9087,7 @@ def build_batch_prompt(
         f"{message_shape_instruction(conn, chat)}\n\n"
         "Read the whole batch before responding. "
         + (
-            "Private: call reply(text=...) with a visible current-chat response. "
+            f"{PRIVATE_BATCH_REPLY_GUIDANCE} Use reply(text=...) when a visible current-chat response is useful. "
             if chat.chat_type == "private"
             else "Use reply(text=...) when a visible current-chat response is useful. "
         )
