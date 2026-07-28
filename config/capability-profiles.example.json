@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "profiles": {
+    "gmail": {
+      "plugin": "gmail@openai-curated",
+      "app": "gmail"
+    }
+  }
+}

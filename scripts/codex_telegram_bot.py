@@ -41,7 +41,6 @@ DEFAULT_CONTEXT_MESSAGES = 24
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
-REPLY_CONTEXT_TEXT_CHARS = 180
 DEFAULT_ROLLOVER_INPUT_TOKENS = 200_000
 HANDOFF_MAX_INBOUND_MESSAGES = 6
 HANDOFF_MAX_VISIBLE_REPLIES = 2
@@ -420,7 +419,10 @@ WORKER_DELEGATION_GUIDANCE = (
     "ack for one specific current-chat sentence about what you are starting, without naming the worker or routing. Keep "
     "delegation details private: never surface worker IDs, routing choices, alarms, supervision, or background plumbing "
     "unless the owner is explicitly discussing those mechanics. When a visible reply is useful, say only the natural "
-    "user-facing action/result/caveat. "
+    "user-facing action/result/caveat. Ordinary workers start with apps/plugins disabled. If an owner-private confirmed "
+    "task genuinely needs one external app, pass exactly one locally allowlisted capability_profile to "
+    "codex_worker_start. Capability workers are one-shot and cannot be continued; never request a capability from group "
+    "chat or use a profile merely because it is available. "
     "When there is existing worker context, decide whether the owner is adding to that same task or asking for a "
     "separate task: continue the same task_id/session for confirmed same-task follow-up, or ask before starting a new "
     "worker for separate work. Give workers the concrete goal, cwd, relevant files, success signals, and a concise reporting format. "
@@ -490,6 +492,7 @@ class Config:
     wake_phrases: tuple[str, ...]
     watch_phrases_path: Path
     codex_bin: str
+    memory_dir: Path | None = None
     identity_wake_phrases: tuple[str, ...] = ()
     media_group_delay_seconds: float = DEFAULT_MEDIA_GROUP_DELAY_SECONDS
     group_decision_source: str = "model"
@@ -668,7 +671,7 @@ def parse_float(value: str | None, default: float) -> float:
 
 def normalize_effort(value: str | None) -> str:
     effort = str(value or "").strip().lower()
-    return effort if effort in {"low", "medium", "high", "xhigh"} else "high"
+    return effort if effort in {"low", "medium", "high", "xhigh", "max", "ultra"} else "high"
 
 
 def normalize_engine(value: str | None) -> str:
@@ -711,6 +714,7 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
     token = env("TELEGRAM_BOT_TOKEN")
     owner_ids = parse_csv_set(env("TELEGRAM_OWNER_IDS"))
     reply_timeout_seconds = parse_int(env("CODEX_TELEGRAM_REPLY_TIMEOUT_SECONDS"), 300)
+    memory_dir_value = env("CODEX_TELEGRAM_MEMORY_DIR").strip()
     config = Config(
         state_dir=state_dir,
         env_file=env_file,
@@ -771,6 +775,7 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             env("CODEX_TELEGRAM_WATCH_PHRASES_PATH", str(state_dir / "watch_phrases.txt"))
         ).expanduser(),
         codex_bin=env("CODEX_TELEGRAM_CODEX_BIN", default_codex_bin()),
+        memory_dir=Path(memory_dir_value).expanduser() if memory_dir_value else None,
         identity_wake_phrases=tuple(
             phrase.strip().lower()
             for phrase in env("CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES", "").split(",")
@@ -883,6 +888,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     f"CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS={DEFAULT_MEDIA_GROUP_DELAY_SECONDS:g}",
                     "CODEX_TELEGRAM_DENY_UNKNOWN=0",
                     "CODEX_TELEGRAM_IGNORE_USER_CONFIG=1",
+                    "CODEX_TELEGRAM_MEMORY_DIR=",
                     "CODEX_TELEGRAM_CHANNEL_TOOLS=1",
                     "CODEX_TELEGRAM_DESKTOP_SYNC=1",
                     "CODEX_TELEGRAM_DESKTOP_OUTBOUND=1",
@@ -988,6 +994,19 @@ def connect_db(config: Config, *, timeout_seconds: float = 30.0) -> sqlite3.Conn
     return conn
 
 
+def ensure_db_indexes(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_messages_created_at_message_id
+        ON messages(created_at DESC, telegram_message_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_channel_deliveries_run_id_sent
+        ON channel_deliveries(run_id)
+        WHERE delivery_status = 'sent' AND telegram_message_id IS NOT NULL;
+        """
+    )
+
+
 def configure_service_db(conn: sqlite3.Connection) -> str:
     """Enable the service's concurrent read/write mode once at daemon startup."""
     if conn.in_transaction:
@@ -998,6 +1017,8 @@ def configure_service_db(conn: sqlite3.Connection) -> str:
         raise RuntimeError(f"could not enable SQLite WAL mode (got {mode or 'unknown'})")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    ensure_db_indexes(conn)
+    conn.commit()
     return mode
 
 
@@ -1110,6 +1131,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     ensure_db_column(conn, "channel_deliveries", "delivery_status", "TEXT NOT NULL DEFAULT 'sent'")
     ensure_db_column(conn, "channel_deliveries", "error", "TEXT NOT NULL DEFAULT ''")
     ensure_db_column(conn, "message_attachments", "media_group_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_db_indexes(conn)
     conn.commit()
 
 
@@ -2409,9 +2431,7 @@ def record_channel_delivery(
     delivery_status: str = "sent",
     error: str = "",
 ) -> None:
-    preview = text.replace("\n", " ").strip()
-    if len(preview) > 200:
-        preview = preview[:197].rstrip() + "..."
+    preview = channel_delivery_text_preview(text)
     error_preview = error.replace("\n", " ").strip()
     if len(error_preview) > 500:
         error_preview = error_preview[:497].rstrip() + "..."
@@ -2439,6 +2459,13 @@ def record_channel_delivery(
         ),
     )
     conn.commit()
+
+
+def channel_delivery_text_preview(text: str) -> str:
+    preview = text.replace("\n", " ").strip()
+    if len(preview) > 200:
+        preview = preview[:197].rstrip() + "..."
+    return preview
 
 
 def channel_delivery_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
@@ -4657,20 +4684,160 @@ def stored_message_text(message: dict[str, Any], text: str) -> str:
     return f"{forward_context}\n{text}" if forward_context else text
 
 
-def reply_context_text(message: dict[str, Any]) -> str | None:
+def bot_delivery_text_for_message(
+    conn: sqlite3.Connection,
+    config: Config,
+    chat_id: str,
+    telegram_message_id: int,
+) -> str | None:
+    """Recover the exact bot text bubble that Telegram says was replied to.
+
+    ``channel_deliveries`` is the authoritative message-id mapping, while the
+    channel event file retains the untruncated text. Delivery previews disambiguate
+    immediate/multi-bubble events whose recorded event index can be shared. If the
+    mapping cannot be proven exactly, return None and let the Telegram reply payload
+    remain the source of truth.
+    """
+
+    row = conn.execute(
+        """
+        SELECT id, run_id, event_index, event_type, text_preview
+        FROM channel_deliveries
+        WHERE chat_id = ?
+          AND telegram_message_id = ?
+          AND delivery_status = 'sent'
+          AND event_type != 'react'
+        ORDER BY delivered_at DESC, id DESC
+        LIMIT 1
+        """,
+        (chat_id, telegram_message_id),
+    ).fetchone()
+    if row is None or int(row["event_index"]) < 0:
+        return None
+
+    events = read_channel_events(channel_events_path_for_run(config, str(row["run_id"])))
+    if not events:
+        return None
+    normalized = normalize_channel_event_targets(chat_id, events, config)
+    raw_candidates = [(index, event) for index, event in enumerate(normalized)]
+    shaped_candidates = shaped_reply_events(conn, normalized)
+
+    candidates: list[tuple[int, dict[str, Any], str]] = []
+    seen: set[tuple[int, str, str]] = set()
+    for event_index, event in raw_candidates + shaped_candidates:
+        if str(event.get("chat_id") or "").strip() != str(chat_id):
+            continue
+        event_type = str(event.get("type") or "").strip()
+        effective_type = str(event.get("delivery_event_type") or event_type).strip()
+        if effective_type != str(row["event_type"] or "").strip():
+            continue
+        if event_type == "reply":
+            text = str(event.get("text") or "").strip()
+        elif event_type == "edit_message":
+            text = str(event.get("text") or "").strip()
+        else:
+            # Telegram supplies the replied-to caption/media metadata directly.
+            # Avoid reconstructing an album caption when delivery cardinality is
+            # not provably one-to-one.
+            continue
+        if not text:
+            continue
+        key = (event_index, effective_type, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((event_index, event, text))
+
+    row_preview = str(row["text_preview"] or "")
+    preview_matches = [
+        candidate
+        for candidate in candidates
+        if channel_delivery_text_preview(candidate[2]) == row_preview
+    ]
+    if len(preview_matches) == 1:
+        candidate = preview_matches[0]
+    else:
+        index_matches = [
+            candidate for candidate in candidates if candidate[0] == int(row["event_index"])
+        ]
+        if len(index_matches) != 1:
+            return None
+        candidate = index_matches[0]
+
+    text = candidate[2]
+    chunks = chunk_telegram_text(text)
+    sibling_rows = conn.execute(
+        """
+        SELECT id, telegram_message_id
+        FROM channel_deliveries
+        WHERE run_id = ?
+          AND chat_id = ?
+          AND event_type = ?
+          AND delivery_status = 'sent'
+          AND telegram_message_id IS NOT NULL
+          AND text_preview = ?
+        ORDER BY id ASC
+        """,
+        (row["run_id"], chat_id, row["event_type"], row_preview),
+    ).fetchall()
+    if len(sibling_rows) != len(chunks):
+        return None
+    for index, sibling in enumerate(sibling_rows):
+        if int(sibling["id"]) == int(row["id"]):
+            return chunks[index]
+    return None
+
+
+def reply_context_text(
+    message: dict[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
+    config: Config | None = None,
+    chat_id: str | None = None,
+    bot_id: str | None = None,
+) -> str | None:
     reply = message.get("reply_to_message")
     if not isinstance(reply, dict):
         return None
     sender = parse_sender(reply).name
     body = message_text(reply, enrich_locations=False) or "[非文本消息]"
-    return f"[回复 {sender}: {truncate_context_text(body, REPLY_CONTEXT_TEXT_CHARS)}]"
+    replied_message_id = reply_to_bot_message_id(message, bot_id)
+    if (
+        conn is not None
+        and config is not None
+        and chat_id is not None
+        and replied_message_id is not None
+    ):
+        local_text = bot_delivery_text_for_message(
+            conn,
+            config,
+            chat_id,
+            replied_message_id,
+        )
+        if local_text:
+            body = local_text
+    return f"[回复 {sender}: {body}]"
 
 
-def prompt_message_text(message: dict[str, Any], text: str) -> str:
+def prompt_message_text(
+    message: dict[str, Any],
+    text: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    config: Config | None = None,
+    chat_id: str | None = None,
+    bot_id: str | None = None,
+) -> str:
     forward_context = forward_context_text(message)
     if text.lstrip().startswith("/") and not forward_context:
         return text
-    reply_context = reply_context_text(message)
+    reply_context = reply_context_text(
+        message,
+        conn=conn,
+        config=config,
+        chat_id=chat_id,
+        bot_id=bot_id,
+    )
     contexts = [item for item in (forward_context, reply_context) if item]
     return "\n".join(contexts + [text]) if contexts else text
 
@@ -8869,6 +9036,7 @@ Group rhythm guidance:
 - Treat photos/files as context; inspect them when your reply genuinely needs their contents.
 - If the owner is clearly showing you something to react to, respond naturally instead of demanding formal wording.
 - Let seen-only messages remain quiet context.
+- Use remembered project experience as private background context. In groups, answer the current question without volunteering private-chat content, secrets, sensitive local paths, or personal details that were not already introduced in that room.
 - If someone says "别每条都回", "先别说话", or similar, lower your presence immediately.
 - When the room feels ambiguous, choose quiet presence.
 - A rare short "忍不住" aside fits when it clearly makes the atmosphere better; treat it as one light beat.
@@ -9670,9 +9838,9 @@ def run_codex_app_server(
     reply = ""
     channel_events: list[dict[str, Any]] = []
     actual_prompt = prompt
-    resume_failure_handoff = ""
+    resume_failure_handoff: str | Callable[[], str] = ""
     if session_id_before and config.session_scope == "shared":
-        resume_failure_handoff = build_rollover_handoff(
+        resume_failure_handoff = lambda: build_rollover_handoff(
             conn,
             config,
             session_id_before,
@@ -10323,6 +10491,14 @@ WORKER_ALARM_MIN_SECONDS = 5
 WORKER_ALARM_DEFAULT_SECONDS = 60
 WORKER_RUNNING_RECHECK_SECONDS = 60
 WORKER_MAX_FAILED_ATTEMPTS = 2
+CAPABILITY_PROFILE_VERSION = 1
+CAPABILITY_MARKETPLACE_NAME = "telegram-capabilities"
+CAPABILITY_PROFILE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+CAPABILITY_PLUGIN_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?@[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+)
+CAPABILITY_APP_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+CAPABILITY_CONNECTOR_RE = re.compile(r"^connector_[a-zA-Z0-9]+$")
 WORKER_RETRYABLE_ERROR_MARKERS = (
     "stream disconnected",
     "connection reset",
@@ -10344,6 +10520,253 @@ WORKER_NON_RETRYABLE_ERROR_MARKERS = (
 
 def worker_dir(config: Config) -> Path:
     return config.state_dir / "workers"
+
+
+def capability_profiles_path(config: Config) -> Path:
+    return config.state_dir / "capability-profiles.json"
+
+
+def capability_run_dir(config: Config, task_id: str) -> Path:
+    return config.state_dir / "capability-runs" / safe_path_component(task_id, "task")
+
+
+def load_capability_profiles(config: Config) -> dict[str, dict[str, str]]:
+    path = capability_profiles_path(config)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid capability profile JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict) or set(data) != {"version", "profiles"}:
+        raise RuntimeError("capability profiles must contain only version and profiles")
+    if data.get("version") != CAPABILITY_PROFILE_VERSION:
+        raise RuntimeError(f"unsupported capability profile version: {data.get('version')}")
+    raw_profiles = data.get("profiles")
+    if not isinstance(raw_profiles, dict):
+        raise RuntimeError("capability profiles field must be an object")
+
+    profiles: dict[str, dict[str, str]] = {}
+    for name, raw in raw_profiles.items():
+        if not isinstance(name, str) or not CAPABILITY_PROFILE_RE.fullmatch(name):
+            raise RuntimeError(f"invalid capability profile identifier: {name!r}")
+        if not isinstance(raw, dict) or set(raw) != {"plugin", "app"}:
+            raise RuntimeError(f"capability profile {name!r} must contain only plugin and app")
+        plugin = str(raw.get("plugin") or "")
+        app = str(raw.get("app") or "")
+        if not CAPABILITY_PLUGIN_RE.fullmatch(plugin):
+            raise RuntimeError(f"invalid plugin selector in capability profile {name!r}")
+        if not CAPABILITY_APP_RE.fullmatch(app):
+            raise RuntimeError(f"invalid app identifier in capability profile {name!r}")
+        profiles[name] = {"plugin": plugin, "app": app}
+    return profiles
+
+
+def capability_profile(config: Config, name: str) -> dict[str, str]:
+    if not CAPABILITY_PROFILE_RE.fullmatch(name):
+        raise RuntimeError(f"invalid capability profile identifier: {name!r}")
+    profiles = load_capability_profiles(config)
+    profile = profiles.get(name)
+    if profile is None:
+        available = ", ".join(sorted(profiles)) or "(none)"
+        raise RuntimeError(f"capability profile is not allowlisted: {name}; available: {available}")
+    return {"name": name, **profile}
+
+
+def main_codex_home() -> Path:
+    return Path(os.environ.get("CODEX_SQLITE_HOME") or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+
+
+def installed_plugin_inventory(config: Config) -> dict[str, dict[str, Any]]:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(main_codex_home())
+    proc = subprocess.run(
+        [config.codex_bin, "plugin", "list", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if proc.returncode != 0:
+        detail = truncate_oneline(proc.stderr or proc.stdout or "plugin list failed", 500)
+        raise RuntimeError(f"could not inspect installed plugins: {detail}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Codex plugin list did not return valid JSON") from exc
+    installed = payload.get("installed") if isinstance(payload, dict) else None
+    if not isinstance(installed, list):
+        raise RuntimeError("Codex plugin list JSON is missing installed plugins")
+    return {
+        str(item.get("pluginId")): item
+        for item in installed
+        if isinstance(item, dict) and item.get("installed") is True and item.get("enabled") is True
+    }
+
+
+def resolve_capability_profile(config: Config, name: str) -> dict[str, Any]:
+    profile = capability_profile(config, name)
+    item = installed_plugin_inventory(config).get(profile["plugin"])
+    if item is None:
+        raise RuntimeError(f"allowlisted plugin is not installed and enabled: {profile['plugin']}")
+    source = item.get("source")
+    if not isinstance(source, dict) or source.get("source") != "local":
+        raise RuntimeError(f"allowlisted plugin does not have a local installed source: {profile['plugin']}")
+    source_value = source.get("path")
+    if not isinstance(source_value, str) or not source_value:
+        raise RuntimeError(f"allowlisted plugin source path is missing: {profile['plugin']}")
+    try:
+        source_path = Path(source_value).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"allowlisted plugin source is unavailable: {profile['plugin']}") from exc
+    plugin_name = profile["plugin"].split("@", 1)[0]
+    try:
+        manifest = json.loads((source_path / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        app_manifest = json.loads((source_path / ".app.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"allowlisted plugin manifests are unavailable: {profile['plugin']}") from exc
+    if not isinstance(manifest, dict) or manifest.get("name") != plugin_name:
+        raise RuntimeError(f"allowlisted plugin manifest name mismatch: {profile['plugin']}")
+    apps = app_manifest.get("apps") if isinstance(app_manifest, dict) else None
+    app_entry = apps.get(profile["app"]) if isinstance(apps, dict) else None
+    connector_id = app_entry.get("id") if isinstance(app_entry, dict) else None
+    if not isinstance(connector_id, str) or not CAPABILITY_CONNECTOR_RE.fullmatch(connector_id):
+        raise RuntimeError(f"allowlisted app connector is missing or invalid: {profile['app']}")
+    return {
+        **profile,
+        "plugin_name": plugin_name,
+        "source_path": source_path,
+        "connector_id": connector_id,
+    }
+
+
+def ensure_exact_symlink(target: Path, source: Path, label: str) -> None:
+    if target.is_symlink():
+        try:
+            if target.resolve(strict=True) == source.resolve(strict=True):
+                return
+        except OSError:
+            pass
+        raise RuntimeError(f"{label} link points somewhere else: {target}")
+    if target.exists():
+        raise RuntimeError(f"refusing to replace existing {label} path: {target}")
+    target.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def run_capability_setup_command(command: list[str], home: Path) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home)
+    env["CODEX_SQLITE_HOME"] = str(home)
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=60, env=env)
+    if proc.returncode != 0:
+        detail = truncate_oneline(proc.stderr or proc.stdout or "setup failed", 600)
+        raise RuntimeError(f"capability lane setup failed: {detail}")
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("capability lane setup did not return valid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("capability lane setup returned an unexpected result")
+    return result
+
+
+def prepare_capability_run_home(config: Config, profile_name: str, task_id: str) -> tuple[Path, dict[str, Any]]:
+    profile = resolve_capability_profile(config, profile_name)
+    run_root = capability_run_dir(config, task_id)
+    marketplace = run_root / "marketplace"
+    plugin_links = marketplace / "plugins"
+    home = run_root / "codex-home"
+    ensure_private_dir(plugin_links)
+    ensure_private_dir(home)
+    plugin_link = plugin_links / profile["plugin_name"]
+    ensure_exact_symlink(plugin_link, profile["source_path"], "capability plugin")
+
+    marketplace_payload = {
+        "name": CAPABILITY_MARKETPLACE_NAME,
+        "owner": {"name": "Codex Telegram local capability lane"},
+        "plugins": [
+            {
+                "name": profile["plugin_name"],
+                "source": {"source": "local", "path": f"./plugins/{profile['plugin_name']}"},
+                "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"},
+            }
+        ],
+    }
+    write_private_text(
+        marketplace / ".agents" / "plugins" / "marketplace.json",
+        json.dumps(marketplace_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    source_auth = main_codex_home() / "auth.json"
+    if not source_auth.exists():
+        raise RuntimeError(f"main Codex auth file is unavailable: {source_auth}")
+    ensure_exact_symlink(home / "auth.json", source_auth, "capability auth")
+
+    run_capability_setup_command(
+        [config.codex_bin, "plugin", "marketplace", "add", str(marketplace), "--json"],
+        home,
+    )
+    lane_plugin_id = f"{profile['plugin_name']}@{CAPABILITY_MARKETPLACE_NAME}"
+    run_capability_setup_command(
+        [config.codex_bin, "plugin", "add", lane_plugin_id, "--json"],
+        home,
+    )
+    config_path = home / "config.toml"
+    try:
+        base_config = config_path.read_text(encoding="utf-8").rstrip()
+    except OSError as exc:
+        raise RuntimeError("capability lane config was not created") from exc
+    marker = "# Codex Telegram one-shot capability policy."
+    if marker in base_config:
+        base_config = base_config.split(marker, 1)[0].rstrip()
+    connector_key = json.dumps(profile["connector_id"])
+    policy = (
+        f"\n\n{marker}\n"
+        "[features]\n"
+        "apps = true\n"
+        "plugins = true\n"
+        "remote_plugin = true\n"
+        "hooks = false\n"
+        "memories = false\n"
+        "multi_agent = false\n\n"
+        "[apps._default]\n"
+        "enabled = false\n"
+        "destructive_enabled = false\n"
+        "open_world_enabled = false\n"
+        'default_tools_approval_mode = "writes"\n\n'
+        f"[apps.{connector_key}]\n"
+        "enabled = true\n"
+        "destructive_enabled = false\n"
+        "open_world_enabled = false\n"
+        'approvals_reviewer = "user"\n'
+        'default_tools_approval_mode = "writes"\n'
+    )
+    write_private_text(config_path, base_config + policy)
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home)
+    env["CODEX_SQLITE_HOME"] = str(home)
+    proc = subprocess.run(
+        [config.codex_bin, "plugin", "list", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("could not verify the capability lane plugin")
+    try:
+        lane_payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("capability lane verification did not return valid JSON") from exc
+    lane_installed = lane_payload.get("installed") if isinstance(lane_payload, dict) else None
+    lane_ids = {
+        str(item.get("pluginId"))
+        for item in lane_installed or []
+        if isinstance(item, dict) and item.get("installed") is True and item.get("enabled") is True
+    }
+    if lane_ids != {lane_plugin_id}:
+        raise RuntimeError(f"capability lane plugin set is not exact: {sorted(lane_ids)}")
+    return home, profile
 
 
 def worker_alarm_dir(config: Config) -> Path:
@@ -10808,6 +11231,22 @@ def build_worker_continue_prompt(task: str) -> str:
     )
 
 
+def build_capability_worker_prompt(task: str, profile_name: str) -> str:
+    return (
+        "Worker role: You are a one-shot Codex capability worker opened by the Telegram bridge supervisor.\n"
+        f"Only the locally allowlisted `{profile_name}` app/plugin profile is available for this task. "
+        "Use it only as required by the concrete task; do not install, enable, suggest, or search for another app/plugin.\n"
+        "Carry the confirmed task to the next useful terminal result. External writes remain subject to the app's "
+        "configured approval policy; if an approval cannot be completed in this lane, report the exact blocked action "
+        "without attempting a broader route.\n"
+        "Do not send Telegram messages, use Telegram channel tools, or speak to the Telegram chat directly. "
+        "Return only the result the Telegram resident supervisor needs, including any external action that actually "
+        "occurred and any action that did not occur.\n"
+        "End with a status line: `status: complete` or `status: needs_input`.\n\n"
+        f"Task:\n{task.strip()}\n"
+    )
+
+
 def build_worker_alarm_prompt(alarm: dict[str, Any]) -> str:
     task_id = str(alarm.get("task_id") or "").strip()
     note = str(alarm.get("note") or "").strip()
@@ -10842,12 +11281,27 @@ def codex_worker_command(
 ) -> list[str]:
     approval_arg = f'approval_policy="{config.approval}"'
     effort_arg = f'model_reasoning_effort="{normalize_effort(config.effort)}"'
+    isolation_args = [
+        "--ignore-user-config",
+        "--strict-config",
+        "--enable",
+        "memories",
+        "--disable",
+        "apps",
+        "--disable",
+        "plugins",
+        "--disable",
+        "remote_plugin",
+        "--disable",
+        "hooks",
+    ]
     if session_id:
         command = [
             config.codex_bin,
             "exec",
             "resume",
             "--json",
+            *isolation_args,
             "-c",
             approval_arg,
             "-c",
@@ -10863,6 +11317,7 @@ def codex_worker_command(
         return command
     command = [
             "--json",
+            *isolation_args,
             "-m",
             config.model,
             "-C",
@@ -10880,6 +11335,31 @@ def codex_worker_command(
         command.append("--dangerously-bypass-approvals-and-sandbox")
     command.append("-")
     return [config.codex_bin, "exec", *command]
+
+
+def capability_worker_command(
+    config: Config,
+    cwd: Path,
+    output_path: Path,
+    *,
+    profile_name: str,
+    task_id: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--state-dir",
+        str(config.state_dir),
+        "capability-worker",
+        "--profile",
+        profile_name,
+        "--task-id",
+        task_id,
+        "--cwd",
+        str(cwd),
+        "--output",
+        str(output_path),
+    ]
 
 
 def monitor_codex_worker(config: Config, task_id: str, proc: subprocess.Popen[str]) -> None:
@@ -10905,6 +11385,7 @@ def start_codex_worker(
     session_id: str | None = None,
     turn_count: int = 1,
     failure_count: int = 0,
+    capability_profile_name: str = "",
 ) -> tuple[dict[str, Any] | None, str | None]:
     task = task.strip()
     if not task:
@@ -10914,19 +11395,48 @@ def start_codex_worker(
         return None, f"cwd is not available: {workdir}"
     ensure_private_dir(worker_dir(config))
     real_task_id = task_id or worker_task_id(title or task[:40])
+    capability_profile_name = capability_profile_name.strip()
+    if capability_profile_name:
+        try:
+            capability_profile(config, capability_profile_name)
+        except RuntimeError as exc:
+            return None, str(exc)
+        try:
+            configured_root = config.cwd.expanduser().resolve(strict=True)
+            resolved_workdir = workdir.resolve(strict=True)
+        except OSError as exc:
+            return None, f"could not resolve capability worker cwd: {exc}"
+        if resolved_workdir != configured_root and not resolved_workdir.is_relative_to(configured_root):
+            return None, "capability worker cwd must stay inside the bridge's configured workspace"
+        workdir = resolved_workdir
+        if session_id:
+            return None, "capability workers are one-shot and cannot resume a prior session"
     output_path = worker_output_path(config, real_task_id)
     jsonl_path = worker_jsonl_path(config, real_task_id)
     stderr_path = worker_stderr_path(config, real_task_id)
     write_private_text(output_path, "")
     write_private_text(jsonl_path, "")
     write_private_text(stderr_path, "")
-    prompt = build_worker_continue_prompt(task) if session_id else build_worker_prompt(task)
-    command = codex_worker_command(config, workdir, output_path, session_id=session_id)
+    if capability_profile_name:
+        prompt = build_capability_worker_prompt(task, capability_profile_name)
+        command = capability_worker_command(
+            config,
+            workdir,
+            output_path,
+            profile_name=capability_profile_name,
+            task_id=real_task_id,
+        )
+    else:
+        prompt = build_worker_continue_prompt(task) if session_id else build_worker_prompt(task)
+        command = codex_worker_command(config, workdir, output_path, session_id=session_id)
     stdout_handle = jsonl_path.open("a", encoding="utf-8")
     stderr_handle = stderr_path.open("a", encoding="utf-8")
     try:
         worker_env = os.environ.copy()
         worker_env["CODEX_TELEGRAM_WORKER"] = "1"
+        if capability_profile_name:
+            worker_env["CODEX_TELEGRAM_CAPABILITY_WORKER"] = "1"
+            worker_env["CODEX_TELEGRAM_CAPABILITY_PROFILE"] = capability_profile_name
         proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -10958,6 +11468,8 @@ def start_codex_worker(
         "status": "running",
         "pid": proc.pid,
         "session_id": session_id or "",
+        "capability_profile": capability_profile_name,
+        "one_shot": bool(capability_profile_name),
         "cwd": str(workdir),
         "model": config.model,
         "started_at": utc_now(),
@@ -10988,6 +11500,9 @@ def format_worker_state(state: dict[str, Any], *, include_result: bool = True) -
         f"started_at: {state.get('started_at')}",
         f"updated_at: {state.get('updated_at')}",
     ]
+    if state.get("capability_profile"):
+        lines.append(f"capability_profile: {state.get('capability_profile')}")
+        lines.append("one_shot: true")
     if state.get("finished_at"):
         lines.append(f"finished_at: {state.get('finished_at')}")
     if state.get("returncode") is not None:
@@ -11014,8 +11529,14 @@ def format_worker_list(config: Config) -> str:
         return "No Codex workers recorded yet."
     lines = ["Codex workers:"]
     for state in states:
+        capability = (
+            f" capability={state.get('capability_profile')}"
+            if state.get("capability_profile")
+            else ""
+        )
         lines.append(
-            f"- {state.get('task_id')} status={state.get('status')} title={truncate_oneline(str(state.get('title') or ''), 80)}"
+            f"- {state.get('task_id')} status={state.get('status')}{capability} "
+            f"title={truncate_oneline(str(state.get('title') or ''), 80)}"
         )
     return "\n".join(lines)
 
@@ -11495,7 +12016,9 @@ def app_server_codex_worker_start_tool_spec() -> dict[str, Any]:
             "Start a separate Codex worker for larger coding tasks, multi-step debugging, or longer verification. "
             "Provide the concrete task, useful cwd, relevant files, result shape, and a short natural Telegram ack. "
             "The ack is delivered immediately while the separate worker starts; do not mention worker/routing mechanics. "
-            "The tool returns a task_id for later codex_worker_status and codex_worker_continue calls."
+            "Ordinary workers have apps/plugins disabled. For an owner-private confirmed task that needs one external "
+            "app, capability_profile may name one exact local allowlisted profile; that creates an isolated one-shot "
+            "worker which can be inspected but not continued. The tool returns a task_id for later status calls."
         ),
         "inputSchema": {
             "type": "object",
@@ -11504,6 +12027,14 @@ def app_server_codex_worker_start_tool_spec() -> dict[str, Any]:
                 "title": {"type": "string"},
                 "cwd": {"type": "string"},
                 "ack": {"type": "string"},
+                "capability_profile": {
+                    "type": "string",
+                    "pattern": CAPABILITY_PROFILE_RE.pattern,
+                    "description": (
+                        "Optional exact identifier from the bridge's local capability allowlist. "
+                        "Owner-private confirmed tasks only; one-shot worker scope."
+                    ),
+                },
             },
             "required": ["task", "ack"],
             "additionalProperties": False,
@@ -11574,6 +12105,8 @@ def app_server_codex_worker_alarm_tool_spec() -> dict[str, Any]:
 
 
 def app_server_dynamic_tools() -> list[dict[str, Any]]:
+    if parse_bool(os.environ.get("CODEX_TELEGRAM_CAPABILITY_WORKER")):
+        return []
     return [
         app_server_reply_tool_spec(),
         app_server_send_photos_tool_spec(),
@@ -11589,6 +12122,15 @@ def app_server_dynamic_tools() -> list[dict[str, Any]]:
 
 
 def app_server_base_instructions(config: Config) -> str:
+    if parse_bool(os.environ.get("CODEX_TELEGRAM_CAPABILITY_WORKER")):
+        profile_name = os.environ.get("CODEX_TELEGRAM_CAPABILITY_PROFILE", "").strip()
+        return (
+            "You are a one-shot isolated Codex worker. "
+            f"Only the locally prepared `{profile_name}` capability profile is in scope. "
+            "Use that app only when the task requires it. Do not install, enable, suggest, or seek another app/plugin. "
+            "There are no Telegram channel tools in this process; return a concise private result to the supervisor. "
+            "State which external actions actually happened and which requested actions remain blocked."
+        )
     shared = shared_context_guidance(config, Chat(chat_id="", chat_type="", title=""))
     aside_check = private_aside_turn_check(config)
     return (
@@ -11633,6 +12175,10 @@ def app_server_base_instructions(config: Config) -> str:
     )
 
 
+def app_server_thread_ephemeral() -> bool:
+    return parse_bool(os.environ.get("CODEX_TELEGRAM_CAPABILITY_WORKER"))
+
+
 def app_server_sandbox_policy(config: Config) -> dict[str, Any]:
     if config.sandbox == "danger-full-access":
         return {"type": "dangerFullAccess"}
@@ -11656,21 +12202,62 @@ plugins = false
 memories = false
 """
 
+APP_SERVER_ISOLATED_MEMORY_CONFIG = """# Managed by codex-telegram.
+# The bridge supplies its own dynamic tools and must not load user MCP/plugin processes.
+# Memories use the explicitly configured shared local store.
+
+[features]
+apps = false
+plugins = false
+memories = true
+
+[memories]
+generate_memories = true
+use_memories = true
+disable_on_external_context = false
+"""
+
 
 def app_server_isolated_home(config: Config) -> Path:
     return config.state_dir / "codex-home"
+
+
+def link_app_server_memory_store(home: Path, memory_dir: Path) -> None:
+    try:
+        source = memory_dir.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Telegram memory directory does not exist: {memory_dir}") from exc
+    if not source.is_dir():
+        raise RuntimeError(f"Telegram memory path is not a directory: {source}")
+
+    target = home / "memories"
+    if target.is_symlink():
+        try:
+            if target.resolve(strict=True) == source:
+                return
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(f"Telegram memory link points somewhere else: {target}")
+    if target.exists():
+        raise RuntimeError(f"Refusing to replace existing Telegram memory path: {target}")
+    target.symlink_to(source, target_is_directory=True)
 
 
 def prepare_app_server_isolated_home(config: Config) -> Path:
     home = app_server_isolated_home(config)
     ensure_private_dir(home)
     config_path = home / "config.toml"
+    isolated_config = (
+        APP_SERVER_ISOLATED_MEMORY_CONFIG if config.memory_dir is not None else APP_SERVER_ISOLATED_CONFIG
+    )
     try:
         existing = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         existing = ""
-    if existing != APP_SERVER_ISOLATED_CONFIG:
-        write_private_text(config_path, APP_SERVER_ISOLATED_CONFIG)
+    if existing != isolated_config:
+        write_private_text(config_path, isolated_config)
+    if config.memory_dir is not None:
+        link_app_server_memory_store(home, config.memory_dir)
 
     main_home = Path(os.environ.get("CODEX_SQLITE_HOME") or codex_home()).expanduser()
     source_auth = main_home / "auth.json"
@@ -12066,9 +12653,24 @@ class CodexAppServerClient:
             title = str(arguments.get("title") or "").strip()
             cwd = str(arguments.get("cwd") or "").strip()
             ack = str(arguments.get("ack") or "").strip()
+            capability_profile_name = str(arguments.get("capability_profile") or "").strip()
             if ack and _looks_like_system_prompt_echo(ack):
                 return self._dynamic_tool_result("Blocked worker ack: looks like system prompt echo", success=False)
-            state, error = start_codex_worker(self.config, task=task, title=title, cwd=cwd)
+            if capability_profile_name and not self.current_turn_owner_private:
+                return self._dynamic_tool_result(
+                    "capability_profile is only available for an explicit owner-private confirmed task",
+                    success=False,
+                )
+            if capability_profile_name:
+                state, error = start_codex_worker(
+                    self.config,
+                    task=task,
+                    title=title,
+                    cwd=cwd,
+                    capability_profile_name=capability_profile_name,
+                )
+            else:
+                state, error = start_codex_worker(self.config, task=task, title=title, cwd=cwd)
             if error or state is None:
                 return self._dynamic_tool_result(error or "worker start failed", success=False)
             alarm_text = ""
@@ -12131,6 +12733,12 @@ class CodexAppServerClient:
             if state is None:
                 return self._dynamic_tool_result(f"Codex worker not found: {task_id}", success=False)
             state = refresh_worker_state(self.config, state)
+            if state.get("capability_profile"):
+                return self._dynamic_tool_result(
+                    "Capability workers are one-shot and cannot be continued. "
+                    "Start a new owner-private confirmed capability worker if another external-app action is needed.",
+                    success=False,
+                )
             if state.get("status") == "running":
                 return self._dynamic_tool_result(
                     "Codex worker is currently running:\n" + format_worker_state(state, include_result=False),
@@ -12250,7 +12858,7 @@ class CodexAppServerClient:
         effort: str,
         log_path: Path,
         *,
-        resume_failure_handoff: str = "",
+        resume_failure_handoff: str | Callable[[], str] = "",
         timeout_seconds: int | None = None,
         immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> tuple[str | None, str, str | None, list[dict[str, Any]], str]:
@@ -12273,7 +12881,12 @@ class CodexAppServerClient:
                     channel_events,
                 )
                 if resume_error:
-                    actual_prompt = inject_resume_failure_handoff(prompt, resume_failure_handoff, resume_error)
+                    handoff = (
+                        resume_failure_handoff()
+                        if callable(resume_failure_handoff)
+                        else resume_failure_handoff
+                    )
+                    actual_prompt = inject_resume_failure_handoff(prompt, handoff, resume_error)
                 turn_id = self._start_turn_locked(
                     thread_id,
                     actual_prompt,
@@ -12352,7 +12965,7 @@ class CodexAppServerClient:
                 "cwd": str(self.config.cwd),
                 "approvalPolicy": self.config.approval,
                 "sandbox": self.config.sandbox,
-                "ephemeral": False,
+                "ephemeral": app_server_thread_ephemeral(),
                 "serviceName": SERVICE_NAME,
                 "baseInstructions": app_server_base_instructions(self.config),
                 "dynamicTools": app_server_dynamic_tools(),
@@ -13373,7 +13986,14 @@ class BotService:
         if media_group_id and should_store:
             if enriched_text is None:
                 enriched_text = message_text(message, enrich_locations=True) or text
-            current_prompt_text = prompt_message_text(message, enriched_text)
+            current_prompt_text = prompt_message_text(
+                message,
+                enriched_text,
+                conn=conn,
+                config=self.config,
+                chat_id=chat.chat_id,
+                bot_id=self.bot_id,
+            )
             current_media_action = looks_like_current_media_action_request(text, message)
             explicitly_addressed = (
                 chat.chat_type == "private"
@@ -13431,7 +14051,14 @@ class BotService:
             if should_store:
                 text_for_storage = stored_message_text(message, enriched_text)
                 store_message(conn, message_id, chat.chat_id, sender, text_for_storage)
-        current_prompt_text = prompt_message_text(message, enriched_text)
+        current_prompt_text = prompt_message_text(
+            message,
+            enriched_text,
+            conn=conn,
+            config=self.config,
+            chat_id=chat.chat_id,
+            bot_id=self.bot_id,
+        )
         current_prompt_text = self.enrich_media_followup_prompt(
             conn,
             chat,
@@ -14102,7 +14729,14 @@ class BotService:
                 enriched_items.append(
                     replace(
                         item,
-                        prompt_text=prompt_message_text(item.message, enriched_text),
+                        prompt_text=prompt_message_text(
+                            item.message,
+                            enriched_text,
+                            conn=conn,
+                            config=self.config,
+                            chat_id=chat.chat_id,
+                            bot_id=self.bot_id,
+                        ),
                     )
                 )
             prompt_text = build_media_group_text(latest.media_group_id, enriched_items)
@@ -15266,6 +15900,95 @@ def print_doctor(config: Config, chat_id: str | None = None) -> None:
         print(optimization_report(conn, config, policy, chat_id))
 
 
+def run_capability_worker_cli(
+    config: Config,
+    *,
+    profile_name: str,
+    task_id: str,
+    cwd: Path,
+    output_path: Path,
+) -> int:
+    prompt = sys.stdin.read().strip()
+    expected_output = worker_output_path(config, task_id)
+    if output_path.expanduser().resolve() != expected_output.resolve():
+        raise SystemExit("capability worker output path does not match its task id")
+    if not cwd.exists() or not cwd.is_dir():
+        write_private_text(output_path, f"Capability worker cwd is unavailable: {cwd}\n\nstatus: needs_input\n")
+        return 1
+    if not prompt:
+        write_private_text(output_path, "Capability worker received no task.\n\nstatus: needs_input\n")
+        return 1
+
+    client: CodexAppServerClient | None = None
+    try:
+        home, resolved_profile = prepare_capability_run_home(config, profile_name, task_id)
+        os.environ["CODEX_HOME"] = str(home)
+        os.environ["CODEX_SQLITE_HOME"] = str(home)
+        os.environ["CODEX_TELEGRAM_CAPABILITY_WORKER"] = "1"
+        os.environ["CODEX_TELEGRAM_CAPABILITY_PROFILE"] = profile_name
+        os.environ.pop("CODEX_ROLLOUT_TRACE_ROOT", None)
+        lane_config = replace(
+            config,
+            cwd=cwd,
+            engine="app-server",
+            sandbox="workspace-write",
+            approval="never",
+            ignore_user_config=False,
+            bypass_permissions=False,
+            memory_dir=None,
+        )
+        client = CodexAppServerClient(lane_config)
+        _, reply, error, channel_events, _ = client.run_turn(
+            None,
+            prompt,
+            lane_config.task_effort,
+            capability_run_dir(config, task_id) / "app-server.jsonl",
+            timeout_seconds=lane_config.direct_background_timeout_seconds,
+        )
+        if channel_events:
+            raise RuntimeError("capability worker unexpectedly produced Telegram channel events")
+        if error:
+            detail = truncate_oneline(error, 1200)
+            body = reply.strip()
+            if body:
+                body += "\n\n"
+            body += (
+                f"Capability `{resolved_profile['name']}` did not complete: {detail}\n\n"
+                "status: needs_input"
+            )
+            write_private_text(output_path, body + "\n")
+            return 1
+        body = reply.strip()
+        if not body:
+            write_private_text(
+                output_path,
+                f"Capability `{resolved_profile['name']}` returned no result.\n\nstatus: needs_input\n",
+            )
+            return 1
+        if not re.search(r"(?im)^\s*status\s*:", body):
+            body += "\n\nstatus: complete"
+        write_private_text(output_path, body + "\n")
+        print(json.dumps({"status": "complete", "capability_profile": profile_name}), flush=True)
+        return 0
+    except Exception as exc:
+        detail = truncate_oneline(str(exc), 1600)
+        write_private_text(
+            output_path,
+            f"Capability worker setup or execution failed: {detail}\n\nstatus: needs_input\n",
+        )
+        print(
+            json.dumps(
+                {"status": "failed", "capability_profile": profile_name, "error": detail},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 1
+    finally:
+        if client is not None:
+            client.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
@@ -15282,6 +16005,11 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser.add_argument("--chat-id")
     sub.add_parser("get-me")
     sub.add_parser("mcp-channel")
+    capability_parser = sub.add_parser("capability-worker")
+    capability_parser.add_argument("--profile", required=True)
+    capability_parser.add_argument("--task-id", required=True)
+    capability_parser.add_argument("--cwd", required=True, type=Path)
+    capability_parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     command = args.command or "serve"
 
@@ -15291,6 +16019,15 @@ def main(argv: list[str] | None = None) -> int:
     if command == "mcp-channel":
         run_channel_mcp_server()
         return 0
+    if command == "capability-worker":
+        config = load_config(args.state_dir, require_ready=False)
+        return run_capability_worker_cli(
+            config,
+            profile_name=args.profile,
+            task_id=args.task_id,
+            cwd=args.cwd.expanduser(),
+            output_path=args.output.expanduser(),
+        )
 
     config = load_config(args.state_dir, require_ready=True)
     if command == "status":

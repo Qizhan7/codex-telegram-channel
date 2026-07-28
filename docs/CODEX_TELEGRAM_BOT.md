@@ -110,6 +110,7 @@ CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS=2
 CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS=1.5
 CODEX_TELEGRAM_DENY_UNKNOWN=0
 CODEX_TELEGRAM_IGNORE_USER_CONFIG=1
+CODEX_TELEGRAM_MEMORY_DIR=
 CODEX_TELEGRAM_CHANNEL_TOOLS=1
 CODEX_TELEGRAM_DESKTOP_SYNC=1
 CODEX_TELEGRAM_DESKTOP_OUTBOUND=1
@@ -247,15 +248,75 @@ but it is not a text-triggered dispatch path. `CODEX_TELEGRAM_AUTO_WORKER_CHECK_
 sets the first supervisor check delay for workers started from Telegram and for
 legacy pending auto-delivery records.
 
+### On-demand app/plugin workers
+
+The resident and ordinary workers do not inherit the Desktop app/plugin set.
+Ordinary `codex exec` workers use `--ignore-user-config`, enable the shared
+Codex memory feature, and explicitly disable `apps`, `plugins`,
+`remote_plugin`, and `hooks`.
+
+An external app is available only through an optional, exact
+`capability_profile` on `codex_worker_start`. The bridge accepts it only during
+an owner-private turn. The profile name is validated against
+`<state-dir>/capability-profiles.json`.
+
+The file has a closed schema. Only a profile id, one already-installed plugin
+id, and one app slug are accepted; paths and extra config keys are rejected.
+Capability worker `cwd` is also confined to the bridge's configured workspace.
+Start from [the example](../config/capability-profiles.example.json):
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "gmail": {
+      "plugin": "gmail@openai-curated",
+      "app": "gmail"
+    }
+  }
+}
+```
+
+For each accepted task, the bridge creates
+`<state-dir>/capability-runs/<task-id>/` with a private Codex home and a local
+marketplace containing exactly that one plugin. It derives the connector id
+from the installed plugin manifest, disables all other apps by default, starts
+a separate app-server with an ephemeral thread and no Telegram dynamic tools,
+then terminates that app-server when the worker exits. The capability worker
+cannot be resumed. Its private result is reviewed by the resident through the
+normal worker status path.
+
+This is a process and context boundary, not a dynamic edit of the resident's
+global config. The Desktop plugin registry is read only to resolve an
+allowlisted, installed, enabled local plugin. The bridge does not enable,
+disable, or install anything in the Desktop Codex home. A task fails closed if
+the plugin is absent, disabled, its manifest changes, the requested app is not
+present, or an external write requires an approval the one-shot worker cannot
+complete.
+
+Codex's current app/plugin semantics are session-oriented: installed plugins
+contribute skills/connectors to new chats, skill metadata can occupy some model
+context before a skill is opened, and fuller skill instructions are loaded on
+demand. Connector data is sent to the external service when its tool is
+actually used. The current CLI exposes plugin install/list/remove, profiles,
+feature flags, `--ignore-user-config`, and ephemeral execution, but no reliable
+public per-turn `--plugin <id>` mount. This bridge therefore uses a separate
+single-plugin Codex home and process instead of loading Desktop's full set into
+the shared resident.
+
 ## Shared Desktop Thread
 
 `CODEX_TELEGRAM_ENGINE=app-server` uses Codex's local app-server protocol.
 
 With `CODEX_TELEGRAM_IGNORE_USER_CONFIG=1`, the app-server child uses a minimal
 Codex home under `<state-dir>/codex-home`. Authentication and SQLite state remain
-connected to the main Codex home, while user MCP servers, plugins, apps, and
-memories stay out of Telegram turns. This prevents each supervisor/thread start
-from accumulating unrelated MCP child processes and file descriptors.
+connected to the main Codex home, while user MCP servers, plugins, and apps stay
+out of Telegram turns. Memories also stay out by default. Set
+`CODEX_TELEGRAM_MEMORY_DIR` to one explicit local Codex `memories` directory to
+enable memory use and generation through that shared store without loading the
+rest of the user config. The bridge refuses to replace an existing non-link
+`<state-dir>/codex-home/memories` path. This prevents each supervisor/thread
+start from accumulating unrelated MCP child processes and file descriptors.
 
 With `CODEX_TELEGRAM_SESSION_SCOPE=shared`, private chats and group chats use
 one shared Codex session. Recent context remains source-labeled by chat id, chat
@@ -363,6 +424,20 @@ launchctl bootstrap gui/$(id -u) /path/to/codex-telegram-channel/launchd/com.cod
 launchctl enable gui/$(id -u)/com.codex.telegram
 launchctl kickstart -k gui/$(id -u)/com.codex.telegram
 ```
+
+After changing bridge code or capability profiles, restart the intended
+instance from a Desktop/local terminal, not from a Telegram worker:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/<launchd-label>
+```
+
+Then confirm a new PID, inspect the service error log for startup errors, and
+from the owner private chat request a read-only task that genuinely needs the
+single allowlisted profile. Verify the resulting worker state names that
+profile, has `one_shot: true`, and completes without any other plugin in its
+lane. A group attempt with `capability_profile` must be rejected before a child
+process starts.
 
 Logs:
 

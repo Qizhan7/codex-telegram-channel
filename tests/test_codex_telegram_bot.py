@@ -63,6 +63,15 @@ def _config(tmp_path: Path, **overrides):
     return codex_telegram_bot.Config(**values)
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", "ultra"])
+def test_normalize_effort_accepts_supported_levels(effort: str) -> None:
+    assert codex_telegram_bot.normalize_effort(effort) == effort
+
+
+def test_normalize_effort_falls_back_to_high() -> None:
+    assert codex_telegram_bot.normalize_effort("unsupported") == "high"
+
+
 def _conn(tmp_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(tmp_path / "chats.sqlite")
     conn.row_factory = sqlite3.Row
@@ -125,6 +134,120 @@ def _telegram_update(update_id: int, chat_id: int, chat_type: str, text: str) ->
             "text": text,
         },
     }
+
+
+def test_private_reply_to_bot_uses_full_authoritative_delivery_text(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    original = "完整的私聊原文：" + ("这一段不能被截断。" * 30)
+    run_id = "run-private-quote"
+    codex_telegram_bot.write_channel_events(
+        codex_telegram_bot.channel_events_path_for_run(cfg, run_id),
+        [{"type": "reply", "chat_id": "current", "text": original}],
+    )
+    codex_telegram_bot.record_channel_delivery(
+        conn,
+        run_id,
+        "111",
+        0,
+        900,
+        None,
+        None,
+        original,
+        event_type="reply",
+    )
+    message = {
+        "text": "我在回复这条",
+        "reply_to_message": {
+            "message_id": 900,
+            "from": {"id": 999, "username": "example_reply_bot", "is_bot": True},
+            "text": "Telegram payload preview only",
+        },
+    }
+
+    prompt = codex_telegram_bot.prompt_message_text(
+        message,
+        "我在回复这条",
+        conn=conn,
+        config=cfg,
+        chat_id="111",
+        bot_id="999",
+    )
+
+    assert prompt == f"[回复 @example_reply_bot: {original}]\n我在回复这条"
+    assert "[truncated" not in prompt
+    assert "Telegram payload preview only" not in prompt
+
+
+def test_group_reply_to_second_bot_bubble_keeps_that_full_bubble(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    first = "第一泡"
+    second = "第二泡完整群聊原文：" + ("群聊引用也不能被截断。" * 24)
+    run_id = "run-group-multi-quote"
+    codex_telegram_bot.write_channel_events(
+        codex_telegram_bot.channel_events_path_for_run(cfg, run_id),
+        [
+            {"type": "reply", "chat_id": "current", "text": first},
+            {"type": "reply", "chat_id": "current", "text": second},
+        ],
+    )
+    # Immediate multi-bubble delivery can share event_index=0. The durable
+    # delivery preview still identifies the exact Telegram bubble.
+    codex_telegram_bot.record_channel_delivery(
+        conn, run_id, "-100", 0, 501, None, None, first, event_type="reply"
+    )
+    codex_telegram_bot.record_channel_delivery(
+        conn, run_id, "-100", 0, 502, None, None, second, event_type="reply"
+    )
+    message = {
+        "text": "说的是这泡",
+        "reply_to_message": {
+            "message_id": 502,
+            "from": {"id": 999, "username": "example_reply_bot", "is_bot": True},
+            "text": "Telegram stale text",
+        },
+    }
+
+    prompt = codex_telegram_bot.prompt_message_text(
+        message,
+        "说的是这泡",
+        conn=conn,
+        config=cfg,
+        chat_id="-100",
+        bot_id="999",
+    )
+
+    assert prompt == f"[回复 @example_reply_bot: {second}]\n说的是这泡"
+    assert first not in prompt
+    assert "[truncated" not in prompt
+
+
+def test_reply_quote_falls_back_to_full_telegram_caption(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    conn = _conn(tmp_path)
+    caption = ("完整图片说明：" + ("caption fallback stays complete. " * 12)).rstrip()
+    message = {
+        "text": "这张",
+        "reply_to_message": {
+            "message_id": 777,
+            "from": {"id": 999, "username": "example_reply_bot", "is_bot": True},
+            "photo": [{"file_id": "photo-1"}],
+            "caption": caption,
+        },
+    }
+
+    prompt = codex_telegram_bot.prompt_message_text(
+        message,
+        "这张",
+        conn=conn,
+        config=cfg,
+        chat_id="111",
+        bot_id="999",
+    )
+
+    assert prompt == f"[回复 @example_reply_bot: [照片]\n{caption}]\n这张"
+    assert "[truncated" not in prompt
 
 
 def test_updates_private_first_preserves_relative_order() -> None:
@@ -192,6 +315,14 @@ def test_service_db_uses_wal_for_concurrent_readers_and_writers(tmp_path: Path) 
         assert codex_telegram_bot.configure_service_db(conn) == "wal"
     with sqlite3.connect(cfg.db_path) as check:
         assert check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        indexes = {
+            row[0]
+            for row in check.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+    assert "idx_messages_created_at_message_id" in indexes
+    assert "idx_channel_deliveries_run_id_sent" in indexes
 
 
 def test_fair_scheduler_prefers_direct_human_turn_then_other_chat() -> None:
@@ -282,6 +413,57 @@ def test_desktop_mirror_refresh_does_not_block_model_start(tmp_path: Path, monke
 
     assert not thread.is_alive()
     assert result_holder[0].status == "ok"
+
+
+def test_app_server_builds_resume_handoff_only_after_resume_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path, engine="app-server", desktop_sync=False)
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+    resume_error: list[str | None] = [None]
+    handoff_calls: list[str] = []
+
+    monkeypatch.setattr(client, "_ensure_started_locked", lambda _log_handle=None: None)
+    monkeypatch.setattr(
+        client,
+        "_ensure_thread_locked",
+        lambda *_args: ("session-after", resume_error[0]),
+    )
+    monkeypatch.setattr(client, "_start_turn_locked", lambda *_args: "turn-1")
+    monkeypatch.setattr(
+        client,
+        "_wait_for_turn_completed_locked",
+        lambda *_args: {"params": {"turn": {"status": "completed"}}},
+    )
+
+    def build_handoff() -> str:
+        handoff_calls.append("called")
+        return "recent Telegram continuity"
+
+    result = client.run_turn(
+        "session-before",
+        "prompt",
+        "high",
+        tmp_path / "normal.jsonl",
+        resume_failure_handoff=build_handoff,
+    )
+
+    assert handoff_calls == []
+    assert result[4] == "prompt"
+
+    resume_error[0] = "resume broke"
+    result = client.run_turn(
+        "session-before",
+        "prompt",
+        "high",
+        tmp_path / "resume-failed.jsonl",
+        resume_failure_handoff=build_handoff,
+    )
+
+    assert handoff_calls == ["called"]
+    assert "Resume fallback continuity handoff:" in result[4]
+    assert "recent Telegram continuity" in result[4]
 
 
 def test_stale_desktop_finalizer_does_not_overwrite_newer_run_metadata(
@@ -423,6 +605,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
         "CODEX_TELEGRAM_DESKTOP_OUTBOUND",
         "CODEX_TELEGRAM_WAKE_PHRASES",
         "CODEX_TELEGRAM_GROUP_DECISION_SOURCE",
+        "CODEX_TELEGRAM_MEMORY_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
     cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
@@ -440,6 +623,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
     assert cfg.auto_worker_result_chars == codex_telegram_bot.DEFAULT_AUTO_WORKER_RESULT_CHARS
     assert cfg.wake_phrases == ("codex", "assistant", "bot")
     assert cfg.group_decision_source == "model"
+    assert cfg.memory_dir is None
 
 
 def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
@@ -451,6 +635,7 @@ def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
     assert "CODEX_TELEGRAM_DESKTOP_OUTBOUND=1" in env_text
     assert "CODEX_TELEGRAM_DIRECT_BACKGROUND=1" in env_text
     assert "CODEX_TELEGRAM_AUTO_WORKER=0" in env_text
+    assert "CODEX_TELEGRAM_MEMORY_DIR=" in env_text
     assert "CODEX_TELEGRAM_GROUP_DECISION_SOURCE" not in env_text
     access = json.loads((tmp_path / "access.json").read_text(encoding="utf-8"))
     assert access == {
@@ -593,6 +778,48 @@ def test_app_server_uses_isolated_home_when_ignoring_user_config(tmp_path: Path,
     assert "apps = false" in config_text
     assert "plugins = false" in config_text
     assert "memories = false" in config_text
+    assert not (isolated / "memories").exists()
+
+
+def test_app_server_can_share_explicit_memory_store(tmp_path: Path, monkeypatch) -> None:
+    state_dir = tmp_path / "state"
+    main_home = tmp_path / "main-codex"
+    memory_dir = main_home / "memories"
+    memory_dir.mkdir(parents=True)
+    (main_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(main_home))
+    monkeypatch.delenv("CODEX_SQLITE_HOME", raising=False)
+    cfg = _config(
+        state_dir,
+        codex_bin="/opt/codex",
+        ignore_user_config=True,
+        memory_dir=memory_dir,
+    )
+
+    env = codex_telegram_bot.app_server_environment(cfg)
+    isolated = state_dir / "codex-home"
+    config_text = (isolated / "config.toml").read_text(encoding="utf-8")
+
+    assert env["CODEX_HOME"] == str(isolated)
+    assert "apps = false" in config_text
+    assert "plugins = false" in config_text
+    assert "memories = true" in config_text
+    assert "generate_memories = true" in config_text
+    assert "use_memories = true" in config_text
+    assert (isolated / "memories").is_symlink()
+    assert (isolated / "memories").resolve() == memory_dir.resolve()
+
+
+def test_app_server_shared_memory_refuses_to_replace_existing_path(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    memory_dir = tmp_path / "desktop-memories"
+    memory_dir.mkdir()
+    existing = state_dir / "codex-home" / "memories"
+    existing.mkdir(parents=True)
+    cfg = _config(state_dir, memory_dir=memory_dir)
+
+    with pytest.raises(RuntimeError, match="Refusing to replace existing Telegram memory path"):
+        codex_telegram_bot.prepare_app_server_isolated_home(cfg)
 
 
 def test_app_server_command_allows_user_config_when_requested(tmp_path: Path, monkeypatch) -> None:
@@ -2390,10 +2617,12 @@ def test_worker_prompt_requires_confirmation_before_start(tmp_path: Path) -> Non
     prompt = codex_telegram_bot.app_server_base_instructions(cfg)
 
     assert "Do not delegate from keyword matches" in prompt
-    assert "Only call codex_worker_start after the owner confirms" in prompt
-    assert "a clear owner execution request can be that confirmation" in prompt
+    assert "Only call codex_worker_start after the owner confirms the work" in prompt
+    assert "The execution request itself can confirm the work" in prompt
     assert "tool's ack field" in prompt
     assert "separate worker is preferred" in prompt
+    assert "Ordinary workers start with apps/plugins disabled" in prompt
+    assert "owner-private confirmed task" in prompt
 
 
 def test_heavy_single_turn_enters_resident_instead_of_auto_worker(tmp_path: Path, monkeypatch) -> None:
@@ -2933,6 +3162,9 @@ def test_worker_start_tool_schema_requires_natural_ack() -> None:
 
     assert spec["inputSchema"]["required"] == ["task", "ack"]
     assert "routing mechanics" in spec["description"]
+    assert spec["inputSchema"]["properties"]["capability_profile"]["pattern"] == (
+        codex_telegram_bot.CAPABILITY_PROFILE_RE.pattern
+    )
 
 
 def test_leave_chat_tool_requires_owner_private_context(tmp_path: Path, monkeypatch) -> None:
@@ -3035,15 +3267,334 @@ def test_refresh_worker_state_marks_missing_process_without_output_failed(tmp_pa
     assert "worker process ended" in codex_telegram_bot.format_worker_state(refreshed)
 
 
-def test_worker_command_does_not_use_removed_ignore_user_config_flag(tmp_path: Path) -> None:
+def test_worker_command_isolates_apps_plugins_but_keeps_memory_enabled(tmp_path: Path) -> None:
     cfg = _config(tmp_path, codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex")
     output = tmp_path / "worker.txt"
 
     initial = codex_telegram_bot.codex_worker_command(cfg, ROOT, output)
     resumed = codex_telegram_bot.codex_worker_command(cfg, ROOT, output, session_id="session-1")
 
-    assert "--ignore-user-config" not in initial
-    assert "--ignore-user-config" not in resumed
+    for command in (initial, resumed):
+        assert "--ignore-user-config" in command
+        assert "--strict-config" in command
+        enabled = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--enable"]
+        disabled = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--disable"]
+        assert enabled == ["memories"]
+        assert disabled == ["apps", "plugins", "remote_plugin", "hooks"]
+
+
+def test_capability_profiles_use_closed_allowlist_schema(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    path = codex_telegram_bot.capability_profiles_path(cfg)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "gmail": {
+                        "plugin": "gmail@openai-curated",
+                        "app": "gmail",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert codex_telegram_bot.capability_profile(cfg, "gmail") == {
+        "name": "gmail",
+        "plugin": "gmail@openai-curated",
+        "app": "gmail",
+    }
+    with pytest.raises(RuntimeError, match="invalid capability profile identifier"):
+        codex_telegram_bot.capability_profile(cfg, "../gmail")
+
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "gmail": {
+                        "plugin": "gmail@openai-curated",
+                        "app": "gmail",
+                        "config_path": "/tmp/injected.toml",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="must contain only plugin and app"):
+        codex_telegram_bot.load_capability_profiles(cfg)
+
+
+def test_resolve_capability_profile_derives_connector_from_installed_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(tmp_path)
+    codex_telegram_bot.capability_profiles_path(cfg).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "gmail": {
+                        "plugin": "gmail@openai-curated",
+                        "app": "gmail",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = tmp_path / "gmail-plugin"
+    (source / ".codex-plugin").mkdir(parents=True)
+    (source / ".codex-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "gmail"}),
+        encoding="utf-8",
+    )
+    (source / ".app.json").write_text(
+        json.dumps({"apps": {"gmail": {"id": "connector_abc123"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "installed_plugin_inventory",
+        lambda config: {
+            "gmail@openai-curated": {
+                "installed": True,
+                "enabled": True,
+                "source": {"source": "local", "path": str(source)},
+            }
+        },
+    )
+
+    resolved = codex_telegram_bot.resolve_capability_profile(cfg, "gmail")
+
+    assert resolved["source_path"] == source.resolve()
+    assert resolved["plugin_name"] == "gmail"
+    assert resolved["connector_id"] == "connector_abc123"
+
+
+def test_prepare_capability_home_contains_exactly_one_plugin_and_app(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    cfg = _config(state_dir, codex_bin="/opt/codex")
+    source = tmp_path / "gmail-plugin"
+    source.mkdir()
+    main_home = tmp_path / "main-home"
+    main_home.mkdir()
+    (main_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(main_home))
+    monkeypatch.delenv("CODEX_SQLITE_HOME", raising=False)
+    monkeypatch.setattr(
+        codex_telegram_bot,
+        "resolve_capability_profile",
+        lambda config, name: {
+            "name": "gmail",
+            "plugin": "gmail@openai-curated",
+            "app": "gmail",
+            "plugin_name": "gmail",
+            "source_path": source.resolve(),
+            "connector_id": "connector_abc123",
+        },
+    )
+    setup_commands: list[list[str]] = []
+
+    def fake_setup(command, home):
+        setup_commands.append(command)
+        config_path = home / "config.toml"
+        if not config_path.exists():
+            codex_telegram_bot.write_private_text(config_path, "# generated by Codex\n")
+        return {}
+
+    monkeypatch.setattr(codex_telegram_bot, "run_capability_setup_command", fake_setup)
+
+    def fake_run(command, **kwargs):
+        assert command == ["/opt/codex", "plugin", "list", "--json"]
+        return codex_telegram_bot.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "installed": [
+                        {
+                            "pluginId": "gmail@telegram-capabilities",
+                            "installed": True,
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(codex_telegram_bot.subprocess, "run", fake_run)
+
+    home, profile = codex_telegram_bot.prepare_capability_run_home(cfg, "gmail", "task-1")
+
+    assert profile["connector_id"] == "connector_abc123"
+    assert (home / "auth.json").resolve() == (main_home / "auth.json").resolve()
+    assert (
+        state_dir / "capability-runs" / "task-1" / "marketplace" / "plugins" / "gmail"
+    ).resolve() == source.resolve()
+    config_text = (home / "config.toml").read_text(encoding="utf-8")
+    assert "[apps._default]" in config_text
+    assert 'enabled = false' in config_text
+    assert '[apps."connector_abc123"]' in config_text
+    assert "remote_plugin = true" in config_text
+    assert "memories = false" in config_text
+    assert len(setup_commands) == 2
+    assert setup_commands[0][1:5] == ["plugin", "marketplace", "add", str(home.parent / "marketplace")]
+    assert setup_commands[1][-2:] == ["gmail@telegram-capabilities", "--json"]
+
+
+def test_capability_worker_start_requires_owner_private_turn(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+    client.current_turn_chat_id = "-100"
+    client.current_turn_owner_private = False
+
+    def unexpected_start(*args, **kwargs):
+        raise AssertionError("group capability request must not start a child process")
+
+    monkeypatch.setattr(codex_telegram_bot, "start_codex_worker", unexpected_start)
+    result = client.record_worker_tool_call(
+        "codex_worker_start",
+        {
+            "task": "Read my inbox",
+            "ack": "我查一下。",
+            "capability_profile": "gmail",
+        },
+    )
+
+    assert result["success"] is False
+    assert "owner-private" in result["contentItems"][0]["text"]
+
+
+def test_capability_worker_cwd_cannot_escape_configured_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cfg = _config(tmp_path / "state", cwd=workspace)
+    codex_telegram_bot.write_private_text(
+        codex_telegram_bot.capability_profiles_path(cfg),
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "gmail": {
+                        "plugin": "gmail@openai-curated",
+                        "app": "gmail",
+                    }
+                },
+            }
+        ),
+    )
+
+    state, error = codex_telegram_bot.start_codex_worker(
+        cfg,
+        task="read inbox",
+        cwd=str(outside),
+        capability_profile_name="gmail",
+    )
+
+    assert state is None
+    assert error == "capability worker cwd must stay inside the bridge's configured workspace"
+
+
+def test_owner_private_capability_worker_passes_exact_profile(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+    client.current_turn_chat_id = "111"
+    client.current_turn_owner_private = True
+    received: list[str] = []
+
+    def fake_start_worker(config, *, task, title="", cwd="", capability_profile_name=""):
+        received.append(capability_profile_name)
+        return (
+            {
+                "version": codex_telegram_bot.WORKER_STATE_VERSION,
+                "task_id": "cap-task",
+                "title": title or task,
+                "status": "running",
+                "pid": 123,
+                "session_id": "",
+                "capability_profile": capability_profile_name,
+                "one_shot": True,
+                "cwd": str(config.cwd),
+                "model": config.model,
+                "started_at": codex_telegram_bot.utc_now(),
+                "finished_at": "",
+                "turn_count": 1,
+                "output_path": str(tmp_path / "workers" / "cap-task.last.txt"),
+                "jsonl_path": str(tmp_path / "workers" / "cap-task.jsonl"),
+                "stderr_path": str(tmp_path / "workers" / "cap-task.stderr.log"),
+            },
+            None,
+        )
+
+    monkeypatch.setattr(codex_telegram_bot, "start_codex_worker", fake_start_worker)
+    result = client.record_worker_tool_call(
+        "codex_worker_start",
+        {
+            "task": "Read my inbox",
+            "ack": "我查一下。",
+            "capability_profile": "gmail",
+        },
+    )
+
+    assert result["success"] is True
+    assert received == ["gmail"]
+    assert "capability_profile: gmail" in result["contentItems"][0]["text"]
+    assert "one_shot: true" in result["contentItems"][0]["text"]
+
+
+def test_capability_worker_cannot_be_continued(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = {
+        "version": codex_telegram_bot.WORKER_STATE_VERSION,
+        "task_id": "cap-task",
+        "title": "mail task",
+        "status": "complete",
+        "pid": 0,
+        "session_id": "session-1",
+        "capability_profile": "gmail",
+        "one_shot": True,
+        "cwd": str(ROOT),
+        "model": cfg.model,
+        "started_at": codex_telegram_bot.utc_now(),
+        "finished_at": codex_telegram_bot.utc_now(),
+        "turn_count": 1,
+        "output_path": str(tmp_path / "workers" / "cap-task.last.txt"),
+        "jsonl_path": str(tmp_path / "workers" / "cap-task.jsonl"),
+        "stderr_path": str(tmp_path / "workers" / "cap-task.stderr.log"),
+    }
+    codex_telegram_bot.write_worker_state(cfg, state)
+    client = codex_telegram_bot.CodexAppServerClient(cfg)
+
+    result = client.record_worker_tool_call(
+        "codex_worker_continue",
+        {"task_id": "cap-task", "prompt": "one more action"},
+    )
+
+    assert result["success"] is False
+    assert "one-shot" in result["contentItems"][0]["text"]
+
+
+def test_capability_app_server_is_ephemeral_without_telegram_tools(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_TELEGRAM_CAPABILITY_WORKER", "1")
+    monkeypatch.setenv("CODEX_TELEGRAM_CAPABILITY_PROFILE", "gmail")
+
+    assert codex_telegram_bot.app_server_thread_ephemeral() is True
+    assert codex_telegram_bot.app_server_dynamic_tools() == []
+    instructions = codex_telegram_bot.app_server_base_instructions(_config(tmp_path))
+    assert "one-shot isolated Codex worker" in instructions
+    assert "`gmail` capability profile" in instructions
+    assert "There are no Telegram channel tools" in instructions
 
 
 def test_schedule_worker_alarm_deduplicates_pending_task_alarm(tmp_path: Path) -> None:
