@@ -8,6 +8,7 @@ label under a private runtime state directory.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import html
 import json
@@ -347,6 +348,18 @@ GROUP_RESPONSE_MODE_KEY_PREFIX = "group_response_mode:"
 GROUP_RESPONSE_MODES = {"batch", "single"}
 MESSAGE_SHAPE_KEY_PREFIX = "message_shape:"
 MESSAGE_SHAPES = {"auto", "single", "multi"}
+RUNTIME_MODEL_KEY = "runtime_model"
+RUNTIME_EFFORT_KEYS = {
+    "default": "runtime_effort",
+    "private": "runtime_private_effort",
+    "task": "runtime_task_effort",
+}
+RUNTIME_EFFORT_FIELDS = {
+    "default": "effort",
+    "private": "private_effort",
+    "task": "task_effort",
+}
+EFFORT_CHOICES = ("low", "medium", "high", "xhigh")
 RECENT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CHAT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CONTINUATION_OUTPUT_SECONDS = 20 * 60
@@ -484,6 +497,7 @@ class Config:
     auto_worker_result_chars: int = DEFAULT_AUTO_WORKER_RESULT_CHARS
     wake_window_seconds: float = DEFAULT_WAKE_WINDOW_SECONDS
     owner_presence_minutes: float = DEFAULT_OWNER_PRESENCE_MINUTES
+    allowed_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -626,6 +640,12 @@ def parse_csv_set(value: str | None) -> set[str]:
     return {item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()}
 
 
+def parse_csv_tuple(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(item.strip() for item in re.split(r"[,;\s]+", value) if item.strip())
+
+
 def parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None or value == "":
         return default
@@ -708,6 +728,7 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
         token=token,
         owner_ids=owner_ids,
         model=env("CODEX_TELEGRAM_MODEL", "gpt-5.5"),
+        allowed_models=parse_csv_tuple(env("CODEX_TELEGRAM_ALLOWED_MODELS")),
         engine=normalize_engine(env("CODEX_TELEGRAM_ENGINE", "app-server")),
         effort=normalize_effort(env("CODEX_TELEGRAM_EFFORT", "high")),
         private_effort=normalize_effort(env("CODEX_TELEGRAM_PRIVATE_EFFORT", env("CODEX_TELEGRAM_EFFORT", "high"))),
@@ -1174,6 +1195,42 @@ def desktop_prompt_debug_enabled(conn: sqlite3.Connection) -> bool:
 
 def set_desktop_prompt_debug(conn: sqlite3.Connection, enabled: bool) -> None:
     set_meta(conn, DESKTOP_PROMPT_DEBUG_KEY, "1" if enabled else "0")
+
+
+def set_runtime_model(conn: sqlite3.Connection, model: str) -> None:
+    set_meta(conn, RUNTIME_MODEL_KEY, model)
+
+
+def set_runtime_effort(conn: sqlite3.Connection, scope: str, effort: str) -> None:
+    set_meta(conn, RUNTIME_EFFORT_KEYS[scope], effort)
+
+
+def apply_runtime_overrides(conn: sqlite3.Connection, config: Config) -> Config:
+    model = get_meta(conn, RUNTIME_MODEL_KEY)
+    if not model:
+        model = config.model
+    updates: dict[str, object] = {"model": model}
+    for scope, key in RUNTIME_EFFORT_KEYS.items():
+        effort = get_meta(conn, key)
+        if not effort or effort not in EFFORT_CHOICES:
+            continue
+        updates[RUNTIME_EFFORT_FIELDS[scope]] = effort
+    changed = any(getattr(config, name) != value for name, value in updates.items())
+    if not changed:
+        return config
+    return dataclasses.replace(config, **updates)
+
+
+def load_config_with_runtime_overrides(config: Config) -> Config:
+    """Fold persisted /codex_model and /codex_effort choices into a fresh config."""
+    try:
+        conn = connect_db(config)
+    except sqlite3.Error:
+        return config
+    try:
+        return apply_runtime_overrides(conn, config)
+    finally:
+        conn.close()
 
 
 def group_response_mode_key(chat_id: str) -> str:
@@ -8117,6 +8174,8 @@ def handle_command(
             "/codex_new - start a fresh Codex session on the next message\n"
             "/codex_resume <session_id> - bind this chat to a Codex session (owner)\n"
             "/codex_rollover - start a clean shared session with a short handoff (owner)\n"
+            "/codex_model [model] - show or switch the Codex model (owner)\n"
+            "/codex_effort [private|task] low|medium|high|xhigh - show or switch reasoning effort (owner)\n"
             "/codex_mode decide|smart|mention - set group trigger mode (owner)\n"
             "/codex_here [minutes] - keep owner-present normal wake active (owner)\n"
             "/codex_away - switch this group to weak wake now (owner)\n"
@@ -8161,6 +8220,52 @@ def handle_command(
         mark_shared_session_rollover(conn, config, session_id, "owner requested /codex_rollover")
         set_chat_enabled(conn, chat.chat_id, True)
         return "好，已准备换到新的共享 Codex session；下一条消息会带短 handoff 接上。"
+
+    if command.name == "codex_model":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        requested = " ".join(command.args).strip()
+        if not requested:
+            lines = [f"当前模型：{config.model}"]
+            if config.allowed_models:
+                lines.append(f"可选模型：{'、'.join(config.allowed_models)}")
+            else:
+                lines.append("未配置白名单（.env 的 CODEX_TELEGRAM_ALLOWED_MODELS），可任意切换。")
+            lines.append("用法：/codex_model <model>")
+            return "\n".join(lines)
+        if requested.lower() == "default":
+            set_meta(conn, RUNTIME_MODEL_KEY, "")
+            return f"已清除运行时模型覆盖，回到 .env 配置的 {config.model}，下一条消息生效。"
+        if config.allowed_models and requested not in config.allowed_models:
+            return (
+                f"{requested} 不在可选列表里。可选模型：{'、'.join(config.allowed_models)}"
+                "（编辑 .env 的 CODEX_TELEGRAM_ALLOWED_MODELS 可增删）"
+            )
+        set_runtime_model(conn, requested)
+        return f"模型已切到 {requested}，下一条消息生效。用 /codex_status 可复核。"
+
+    if command.name == "codex_effort":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        args = [arg.lower() for arg in command.args]
+        if not args:
+            return (
+                f"当前 effort：普通 {config.effort} / 私聊 {config.private_effort} / 任务 {config.task_effort}\n"
+                "用法：/codex_effort low|medium|high|xhigh\n"
+                "或 /codex_effort private|task <effort> 单独调私聊或长任务。"
+            )
+        scope = "default"
+        if args[0] in RUNTIME_EFFORT_KEYS and len(args) >= 2:
+            scope = args.pop(0)
+        value = args[0]
+        if value not in EFFORT_CHOICES:
+            return "effort 只能是 low、medium、high 或 xhigh。"
+        set_runtime_effort(conn, scope, value)
+        if scope == "private":
+            return f"私聊 effort 已切到 {value}，下一条消息生效。"
+        if scope == "task":
+            return f"任务 effort 已切到 {value}，下一条消息生效。"
+        return f"effort 已切到 {value}，下一条消息生效。"
 
     if command.name == "codex_mode":
         if not owner:
@@ -8287,6 +8392,7 @@ def status_for_chat(
         f"allowedChats: {len(policy.allowed_chats)}",
         f"legacyAllowedBotsIgnoredInGroups: {len(policy.allowed_bots)}",
         f"model: {config.model}",
+        f"allowedModels: {', '.join(config.allowed_models) if config.allowed_models else 'any'}",
         f"engine: {config.engine}",
         f"sessionScope: {config.session_scope}",
         f"effort: {config.effort}",
@@ -12483,13 +12589,13 @@ class CodexAppServerClient:
 
 class BotService:
     def __init__(self, config: Config) -> None:
-        self.config = config
+        self.config = load_config_with_runtime_overrides(config)
         self.chat_locks: dict[str, threading.Lock] = {}
         self.batch_lock = threading.Lock()
         self.batches: dict[str, BatchState] = {}
         self.media_group_lock = threading.Lock()
         self.media_groups: dict[str, MediaGroupState] = {}
-        self.app_server = CodexAppServerClient(config) if config.engine == "app-server" else None
+        self.app_server = CodexAppServerClient(self.config) if self.config.engine == "app-server" else None
         self.bot_id: str | None = None
         self.bot_username: str | None = None
         self.desktop_outbound_current_turn_id: str | None = None
@@ -12503,6 +12609,13 @@ class BotService:
         if key not in self.chat_locks:
             self.chat_locks[key] = threading.Lock()
         return self.chat_locks[key]
+
+    def refresh_runtime_config(self, conn: sqlite3.Connection) -> None:
+        latest = apply_runtime_overrides(conn, self.config)
+        if latest is not self.config:
+            self.config = latest
+            if self.app_server is not None:
+                self.app_server.config = latest
 
     def refresh_bot_info(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -13344,6 +13457,7 @@ class BotService:
                 self.handle_probe_channel(conn, chat, chat_row, sender, message_id, thread_id, policy)
                 return
             reply = handle_command(conn, self.config, policy, chat, sender, command)
+            self.refresh_runtime_config(conn)
             if reply:
                 send_message(
                     self.config,
@@ -15177,6 +15291,7 @@ def get_me(config: Config) -> dict[str, Any]:
 
 
 def print_status(config: Config, chat_id: str | None = None) -> None:
+    config = load_config_with_runtime_overrides(config)
     policy = load_access_policy(config.access_file, config.owner_ids)
     with closing(connect_db(config)) as conn:
         print(status_for_chat(conn, config, policy, chat_id))

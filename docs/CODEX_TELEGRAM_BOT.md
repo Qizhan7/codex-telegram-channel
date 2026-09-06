@@ -84,6 +84,7 @@ The generated `.env` includes the following reference configuration:
 TELEGRAM_BOT_TOKEN=<telegram-bot-token>
 TELEGRAM_OWNER_IDS=<telegram-user-id>
 CODEX_TELEGRAM_MODEL=gpt-5.5
+CODEX_TELEGRAM_ALLOWED_MODELS=gpt-5.5,gpt-6-astra
 CODEX_TELEGRAM_ENGINE=app-server
 CODEX_TELEGRAM_EFFORT=high
 CODEX_TELEGRAM_PRIVATE_EFFORT=high
@@ -135,6 +136,23 @@ Owner ids from `.env` are automatically allowed. Add group chat ids to
 bots, and anonymous group senders follow the same per-chat strategy.
 Older access files may contain `botPolicy` or `allowedBots`; those fields are
 read for compatibility but do not give bots a separate group-mode strategy.
+
+## Runtime Model And Effort Switching
+
+`CODEX_TELEGRAM_MODEL`, `CODEX_TELEGRAM_EFFORT`, `CODEX_TELEGRAM_PRIVATE_EFFORT`,
+and `CODEX_TELEGRAM_TASK_EFFORT` are the startup defaults. The owner can switch
+the model and effort at runtime from Telegram:
+
+- `/codex_model` shows the current model and the `CODEX_TELEGRAM_ALLOWED_MODELS`
+  allowlist (when set); `/codex_model <model>` switches to that model. With no
+  allowlist configured, any model id is accepted.
+- `/codex_effort` shows the three effort scopes; `/codex_effort high` switches
+  normal turns, and `/codex_effort private xhigh` or `/codex_effort task medium`
+  adjust owner private chats or long tasks separately.
+
+Both choices are stored in the bridge's sqlite `meta` table, take effect on the
+next message without a restart, and survive bridge restarts. In-flight turns
+keep the effort they started with.
 
 ## Group Chat Modes
 
@@ -331,6 +349,11 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind the chat or shared context to a session.
 - `/codex_rollover`: start a clean shared session with a bounded handoff.
+- `/codex_model [model]`: show the current model and optional allowlist, or
+  switch the model. The choice is owner-only, applies from the next message,
+  and survives bridge restarts.
+- `/codex_effort [private|task] low|medium|high|xhigh`: show or switch the
+  reasoning effort for normal turns, owner private chats, or long tasks.
 - `/codex_mode decide|smart|mention`: set group trigger behavior.
 - `/codex_batch single|batch|status`: switch group batching behavior.
 - `/codex auto|single|multi|status`: switch visible reply bubble shape.

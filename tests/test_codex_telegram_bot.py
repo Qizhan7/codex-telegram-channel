@@ -3707,3 +3707,143 @@ def test_public_sources_do_not_expose_private_prompt_names() -> None:
         lowered = text.lower()
         for needle in forbidden:
             assert needle.lower() not in lowered, f"{needle!r} leaked in {path}"
+
+
+def test_codex_model_command_switches_model_and_persists(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, model="gpt-5.5", allowed_models=("gpt-5.5", "gpt-6-astra"))
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_model", [])
+    )
+    assert "gpt-5.5" in reply
+    assert "gpt-6-astra" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        _policy(),
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-9-nope"]),
+    )
+    assert "不在可选列表" in reply
+    assert service.config.model == "gpt-5.5"
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        _policy(),
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-6-astra"]),
+    )
+    assert "gpt-6-astra" in reply
+    service.refresh_runtime_config(conn)
+    assert service.config.model == "gpt-6-astra"
+    assert service.app_server is not None
+    assert service.app_server.config is service.config
+
+    restarted = codex_telegram_bot.BotService(cfg)
+    assert restarted.config.model == "gpt-6-astra"
+
+
+def test_codex_model_command_requires_owner_and_supports_reset(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, model="gpt-5.5", allowed_models=("gpt-5.5",))
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    allowed_non_owner = codex_telegram_bot.Sender("222", "Friend", False)
+    policy = codex_telegram_bot.AccessPolicy(
+        dm_policy="allowlist",
+        group_policy="decide",
+        allowed_users={"111", "222"},
+        allowed_chats={"-100"},
+        allowed_bots=set(),
+        bot_policy="ai-decide",
+    )
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        allowed_non_owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-5.5"]),
+    )
+    assert "owner" in reply
+
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, policy, chat, owner, codex_telegram_bot.Command("codex_model", ["gpt-5.5"])
+    )
+    assert "gpt-5.5" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, policy, chat, owner, codex_telegram_bot.Command("codex_model", ["default"])
+    )
+    assert "gpt-5.5" in reply
+    service = codex_telegram_bot.BotService(cfg)
+    assert service.config.model == "gpt-5.5"
+
+
+def test_codex_effort_command_switches_scopes_and_persists(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, effort="high", private_effort="high", task_effort="xhigh")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", [])
+    )
+    assert "high" in reply
+    assert "xhigh" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["turbo"])
+    )
+    assert "只能是" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["low"])
+    )
+    assert "low" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["private", "medium"])
+    )
+    assert "私聊" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["task", "high"])
+    )
+    assert "任务" in reply
+
+    service.refresh_runtime_config(conn)
+    assert service.config.effort == "low"
+    assert service.config.private_effort == "medium"
+    assert service.config.task_effort == "high"
+
+    restarted = codex_telegram_bot.BotService(cfg)
+    assert restarted.config.effort == "low"
+    assert restarted.config.private_effort == "medium"
+    assert restarted.config.task_effort == "high"
+
+
+def test_load_config_parses_allowed_models(tmp_path: Path, monkeypatch) -> None:
+    for name in (
+        "CODEX_TELEGRAM_ENGINE",
+        "CODEX_TELEGRAM_SESSION_SCOPE",
+        "CODEX_TELEGRAM_ALLOWED_MODELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
+    assert cfg.allowed_models == ()
+
+    monkeypatch.setenv("CODEX_TELEGRAM_ALLOWED_MODELS", "gpt-5.5, gpt-6-astra")
+    cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
+    assert cfg.allowed_models == ("gpt-5.5", "gpt-6-astra")
+
