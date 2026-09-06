@@ -58,6 +58,7 @@ def _config(tmp_path: Path, **overrides):
         "wake_phrases": ("codex", "assistant", "bot"),
         "watch_phrases_path": tmp_path / "watch_phrases.txt",
         "codex_bin": "codex",
+        "owner_presence_minutes": 0.0,
     }
     values.update(overrides)
     return codex_telegram_bot.Config(**values)
@@ -606,6 +607,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
         "CODEX_TELEGRAM_WAKE_PHRASES",
         "CODEX_TELEGRAM_GROUP_DECISION_SOURCE",
         "CODEX_TELEGRAM_MEMORY_DIR",
+        "CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES",
     ):
         monkeypatch.delenv(name, raising=False)
     cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
@@ -624,6 +626,7 @@ def test_load_config_uses_public_defaults(tmp_path: Path, monkeypatch) -> None:
     assert cfg.wake_phrases == ("codex", "assistant", "bot")
     assert cfg.group_decision_source == "model"
     assert cfg.memory_dir is None
+    assert cfg.owner_presence_minutes == codex_telegram_bot.DEFAULT_OWNER_PRESENCE_MINUTES
 
 
 def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
@@ -636,6 +639,7 @@ def test_init_config_writes_public_wake_phrases(tmp_path: Path) -> None:
     assert "CODEX_TELEGRAM_DIRECT_BACKGROUND=1" in env_text
     assert "CODEX_TELEGRAM_AUTO_WORKER=0" in env_text
     assert "CODEX_TELEGRAM_MEMORY_DIR=" in env_text
+    assert "CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES=0" in env_text
     assert "CODEX_TELEGRAM_GROUP_DECISION_SOURCE" not in env_text
     access = json.loads((tmp_path / "access.json").read_text(encoding="utf-8"))
     assert access == {
@@ -854,6 +858,108 @@ def test_sender_alias_uses_numeric_user_id_and_preserves_telegram_name(tmp_path:
 
     assert mapped.user_id == "7541487750"
     assert mapped.name == "云 / 兮兮 [Telegram: @current_username]"
+
+
+def test_persona_is_loaded_into_app_server_base_instructions(tmp_path: Path) -> None:
+    persona_path = tmp_path / "CODEX_PERSONA.md"
+    persona_path.write_text("# 人格\n你是阿祈。", encoding="utf-8")
+    cfg = _config(tmp_path, persona_path=persona_path)
+
+    instructions = codex_telegram_bot.app_server_base_instructions(cfg)
+
+    assert "<codex_persona sha256=" in instructions
+    assert "你是阿祈。" in instructions
+
+
+def test_memory_scope_is_bound_to_chat_type_and_owner_user_id(tmp_path: Path) -> None:
+    shared_path = tmp_path / "MEMORY_SHARED.md"
+    private_path = tmp_path / "MEMORY_PRIVATE.md"
+    shared_path.write_text("# 群聊记忆\n木栖也叫小鸟。", encoding="utf-8")
+    private_path.write_text("# 私人记忆\n只有兮兮私聊可见。", encoding="utf-8")
+    cfg = _config(
+        tmp_path,
+        shared_memory_path=shared_path,
+        private_memory_path=private_path,
+        memory_recall_max_chars=6000,
+    )
+    owner = codex_telegram_bot.Sender("111", "兮兮", False)
+    outsider = codex_telegram_bot.Sender("222", "其他人", False)
+
+    group_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("-100", "supergroup", "群"),
+        owner,
+        "木栖是谁",
+    )
+    owner_private_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("111", "private", "兮兮"),
+        owner,
+        "你记得我吗",
+    )
+    outsider_private_block = codex_telegram_bot.memory_context_block(
+        cfg,
+        codex_telegram_bot.Chat("222", "private", "其他人"),
+        outsider,
+        "你记得我吗",
+    )
+
+    assert 'scope="shared-only"' in group_block
+    assert "木栖也叫小鸟" in group_block
+    assert "只有兮兮私聊可见" not in group_block
+    assert 'scope="owner-private"' in owner_private_block
+    assert "木栖也叫小鸟" in owner_private_block
+    assert "只有兮兮私聊可见" in owner_private_block
+    assert "只有兮兮私聊可见" not in outsider_private_block
+
+
+def test_memory_file_changes_are_visible_on_the_next_recall(tmp_path: Path) -> None:
+    shared_path = tmp_path / "MEMORY_SHARED.md"
+    shared_path.write_text("# 共享\n第一版", encoding="utf-8")
+    cfg = _config(tmp_path, shared_memory_path=shared_path, memory_recall_max_chars=6000)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "群")
+    sender = codex_telegram_bot.Sender("111", "兮兮", False)
+
+    first = codex_telegram_bot.memory_context_block(cfg, chat, sender, "测试")
+    shared_path.write_text("# 共享\n第二版", encoding="utf-8")
+    second = codex_telegram_bot.memory_context_block(cfg, chat, sender, "测试")
+
+    assert "第一版" in first
+    assert "第二版" in second
+    assert first != second
+
+
+def test_persona_revision_starts_a_fresh_per_chat_session(tmp_path: Path) -> None:
+    persona_path = tmp_path / "CODEX_PERSONA.md"
+    persona_path.write_text("# 人格\n第一版", encoding="utf-8")
+    cfg = _config(tmp_path, session_scope="per-chat", persona_path=persona_path)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("111", "private", "Owner")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "session-old", "app-server")
+
+    first = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert first is None
+
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "session-current", "app-server")
+    unchanged = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert unchanged == "session-current"
+
+    persona_path.write_text("# 人格\n第二版", encoding="utf-8")
+    changed = codex_telegram_bot.prepare_session_for_turn(
+        conn,
+        cfg,
+        codex_telegram_bot.get_chat(conn, chat.chat_id),
+    )
+    assert changed is None
 
 
 def test_desktop_titles_include_merged_shared_thread(tmp_path: Path) -> None:
@@ -1300,6 +1406,160 @@ def test_unlisted_group_humans_follow_chat_modes(tmp_path: Path) -> None:
     assert service.should_call_codex(conn, chat, row, sender, "codex 在吗", {"message_id": 5, "text": "codex 在吗"}, policy)
 
 
+def test_adaptive_decide_uses_owner_presence_window_for_normal_or_weak_wake(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        wake_phrases=("codex",),
+        group_decision_source="model",
+        owner_presence_minutes=15.0,
+    )
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    friend = codex_telegram_bot.Sender("222", "Friend", False)
+    other_bot = codex_telegram_bot.Sender("333", "Other Bot", True)
+    policy = _policy()
+    service = codex_telegram_bot.BotService(cfg)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_mode(conn, chat.chat_id, "decide")
+    row = codex_telegram_bot.get_chat(conn, chat.chat_id)
+    now = 10_000.0
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "smart"
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "普通闲聊一句",
+        {"message_id": 1, "text": "普通闲聊一句"},
+        policy,
+    )
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        other_bot,
+        "机器人背景闲聊",
+        {"message_id": 2, "text": "机器人背景闲聊"},
+        policy,
+    )
+    assert service.should_call_codex(
+        conn,
+        chat,
+        row,
+        other_bot,
+        "codex 在吗",
+        {"message_id": 3, "text": "codex 在吗"},
+        policy,
+    )
+
+    codex_telegram_bot.mark_owner_present(conn, chat.chat_id, 15, now=now)
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "decide"
+    assert service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "普通闲聊一句",
+        {"message_id": 4, "text": "普通闲聊一句"},
+        policy,
+    )
+
+    now += 901
+    assert codex_telegram_bot.effective_group_trigger_mode(conn, chat.chat_id, "decide", cfg) == "smart"
+    assert not service.should_call_codex(
+        conn,
+        chat,
+        row,
+        friend,
+        "窗口过期后的闲聊",
+        {"message_id": 5, "text": "窗口过期后的闲聊"},
+        policy,
+    )
+
+
+def test_owner_message_automatically_opens_presence_window(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(
+        tmp_path,
+        owner_presence_minutes=15.0,
+        group_decision_source="model",
+    )
+    (tmp_path / "access.json").write_text(
+        json.dumps(
+            {
+                "dmPolicy": "allowlist",
+                "groupPolicy": "decide",
+                "allowedUsers": ["111"],
+                "allowedChats": ["-100"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = _conn(tmp_path)
+    service = codex_telegram_bot.BotService(cfg)
+    captured: list[str] = []
+    monkeypatch.setattr(service, "run_single_message", lambda *_args, **_kwargs: captured.append("run"))
+
+    background = _telegram_update(99, -100, "supergroup", "你们先聊")
+    background["message"]["from"] = {
+        "id": 222,
+        "is_bot": False,
+        "first_name": "Friend",
+    }
+    service.handle_update(conn, background)
+
+    assert captured == []
+    assert codex_telegram_bot.message_exists(conn, 199, "-100")
+
+    service.handle_update(conn, _telegram_update(100, -100, "supergroup", "我回来啦"))
+
+    assert codex_telegram_bot.owner_presence_active(conn, "-100")
+    deadline = time.monotonic() + 1
+    while captured != ["run"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert captured == ["run"]
+
+
+def test_owner_here_and_away_commands_control_presence(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path, owner_presence_minutes=15.0)
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    policy = _policy()
+    codex_telegram_bot.upsert_chat(conn, chat)
+    now = 20_000.0
+    monkeypatch.setattr(codex_telegram_bot.time, "time", lambda: now)
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_here", ["30"]),
+    )
+    assert "30" in reply
+    assert 1799 <= codex_telegram_bot.owner_presence_remaining_seconds(conn, chat.chat_id) <= 1800
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_away", []),
+    )
+    assert "弱唤醒" in reply
+    assert not codex_telegram_bot.owner_presence_active(conn, chat.chat_id)
+    status = codex_telegram_bot.status_for_chat(conn, cfg, policy, chat.chat_id)
+    assert "effectiveMode: smart" in status
+    assert "ownerPresence: away (weak wake)" in status
+
+
 def test_group_modes_route_as_decide_smart_or_mention(tmp_path: Path) -> None:
     cfg = _config(tmp_path, wake_phrases=("codex", "project alpha"), group_decision_source="model")
     conn = _conn(tmp_path)
@@ -1643,13 +1903,18 @@ def test_wake_window_extends_when_bot_sends_message(tmp_path: Path, monkeypatch)
     assert not codex_telegram_bot.wake_window_active(chat_id)
 
 
-def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, wake_phrases=("codex",), group_decision_source="model")
+def test_new_per_chat_thread_bootstraps_only_a_bounded_context_tail(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        wake_phrases=("codex",),
+        group_decision_source="model",
+        session_scope="per-chat",
+    )
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
     sender = codex_telegram_bot.Sender("111", "Owner", False)
     codex_telegram_bot.upsert_chat(conn, chat)
-    for message_id in range(1, 7):
+    for message_id in range(1, 11):
         codex_telegram_bot.store_new_message(
             conn,
             message_id,
@@ -1657,17 +1922,68 @@ def test_group_prompt_includes_last_five_same_chat_messages_before_trigger(tmp_p
             sender,
             f"history message {message_id}",
         )
-    codex_telegram_bot.store_new_message(conn, 7, chat.chat_id, sender, "codex 当前消息")
+    codex_telegram_bot.store_new_message(conn, 11, chat.chat_id, sender, "codex 当前消息")
 
-    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 7, "codex 当前消息", cfg, allow_silent_reply=True)
-    start = prompt.index("<recent_chat_window")
-    end = prompt.index("</recent_chat_window>")
-    recent_block = prompt[start:end]
+    prompt = codex_telegram_bot.build_prompt(
+        conn,
+        chat,
+        sender,
+        11,
+        "codex 当前消息",
+        cfg,
+        allow_silent_reply=True,
+    )
+    start = prompt.index("<context>")
+    end = prompt.index("</context>")
+    context_block = prompt[start:end]
 
-    assert "history message 1" not in recent_block
-    for message_id in range(2, 7):
-        assert f"history message {message_id}" in recent_block
-    assert "codex 当前消息" not in recent_block
+    assert ": history message 1\n" not in context_block
+    assert ": history message 2\n" not in context_block
+    for message_id in range(3, 11):
+        assert f"history message {message_id}" in context_block
+    assert "codex 当前消息" not in context_block
+    assert "<recent_chat_window" not in prompt
+
+
+def test_existing_per_chat_thread_injects_only_messages_after_last_successful_turn(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, session_scope="per-chat")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    sender = codex_telegram_bot.Sender("222", "Alice", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    codex_telegram_bot.set_chat_session(conn, chat.chat_id, "thread-current", "app-server")
+    codex_telegram_bot.store_new_message(conn, 1, chat.chat_id, sender, "already seen")
+    codex_telegram_bot.store_new_message(conn, 2, chat.chat_id, sender, "silent unseen message")
+    conn.execute(
+        "UPDATE messages SET created_at = ? WHERE chat_id = ? AND telegram_message_id = ?",
+        ("2026-01-01T00:00:01+00:00", chat.chat_id, 1),
+    )
+    conn.execute(
+        "UPDATE messages SET created_at = ? WHERE chat_id = ? AND telegram_message_id = ?",
+        ("2026-01-01T00:00:03+00:00", chat.chat_id, 2),
+    )
+    codex_telegram_bot.create_run(
+        conn,
+        "run-ok",
+        chat.chat_id,
+        "thread-current",
+        tmp_path / "prompt.txt",
+        tmp_path / "reply.txt",
+        tmp_path / "run.jsonl",
+    )
+    codex_telegram_bot.finish_run(conn, "run-ok", "ok", "thread-current", None)
+    conn.execute(
+        "UPDATE runs SET started_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:02+00:00", "run-ok"),
+    )
+    conn.commit()
+
+    prompt = codex_telegram_bot.build_prompt(conn, chat, sender, 3, "current trigger", cfg)
+
+    assert "already seen" not in prompt
+    assert "silent unseen message" in prompt
+    assert "Alice [user_id=222]" in prompt
+    assert "<recent_chat_window" not in prompt
 
 
 def test_explicit_human_group_turn_gets_soft_reply_attention(tmp_path: Path) -> None:
@@ -1809,7 +2125,7 @@ def test_chat_sender_relationships_track_first_seen_senders(tmp_path: Path) -> N
     assert row["message_count"] == 2
 
 
-def test_prompt_includes_known_chat_sender_relationships(tmp_path: Path) -> None:
+def test_prompt_uses_unseen_rows_instead_of_relationship_dump(tmp_path: Path) -> None:
     cfg = _config(tmp_path, session_scope="per-chat")
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
@@ -1820,8 +2136,8 @@ def test_prompt_includes_known_chat_sender_relationships(tmp_path: Path) -> None
 
     prompt = codex_telegram_bot.build_prompt(conn, chat, current_sender, 2, "codex 当前消息", cfg)
 
-    assert "<telegram_relationships>" in prompt
-    assert "[supergroup -100 Release Room] Alice (user, id=222); messages=1;" in prompt
+    assert "<telegram_relationships>" not in prompt
+    assert "Alice [user_id=222]: previous context" in prompt
 
 
 def test_app_server_prompt_omits_telegram_outputs_for_ordinary_chat(tmp_path: Path) -> None:
@@ -2568,6 +2884,9 @@ def test_direct_background_keeps_typing_until_background_delivery(tmp_path: Path
         time.sleep(0.01)
 
     assert sent == ["回来了。"]
+    deadline = time.monotonic() + 1
+    while not stop_events[0].is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert stop_events[0].is_set()
 
 
@@ -4354,7 +4673,13 @@ def test_private_messages_use_two_second_batch_window(tmp_path: Path, monkeypatc
 
 
 def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, private_batch_delay_seconds=2.0)
+    shared_memory_path = tmp_path / "MEMORY_SHARED.md"
+    shared_memory_path.write_text("# Shared identity\n111 = Owner\n", encoding="utf-8")
+    cfg = _config(
+        tmp_path,
+        private_batch_delay_seconds=2.0,
+        shared_memory_path=shared_memory_path,
+    )
     conn = _conn(tmp_path)
     chat = codex_telegram_bot.Chat("111", "private", "Owner")
     sender = codex_telegram_bot.Sender("111", "Owner", False)
@@ -4370,6 +4695,9 @@ def test_private_batch_prompt_contains_all_messages_and_requires_reply(tmp_path:
 
     assert 'message_id="10"' in prompt
     assert 'message_id="11"' in prompt
+    assert 'user_id="111"' in prompt
+    assert "<memory_context" in prompt
+    assert "111 = Owner" in prompt
     assert "第一条" in prompt and "第二条" in prompt
     assert "Private: normally call reply(text)" in prompt
 

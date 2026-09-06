@@ -8,6 +8,7 @@ label under a private runtime state directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import mimetypes
@@ -51,9 +52,12 @@ BOT_COMMAND_MENU: tuple[dict[str, str], ...] = (
     {"command": "codex_help", "description": "List all bridge commands"},
 )
 DEFAULT_CONTEXT_MESSAGES = 24
+PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES = 8
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
+DEFAULT_OWNER_PRESENCE_MINUTES = 0.0
+REPLY_CONTEXT_TEXT_CHARS = 180
 DEFAULT_ROLLOVER_INPUT_TOKENS = 200_000
 HANDOFF_MAX_INBOUND_MESSAGES = 6
 HANDOFF_MAX_VISIBLE_REPLIES = 2
@@ -520,6 +524,11 @@ class Config:
     memory_dir: Path | None = None
     identity_wake_phrases: tuple[str, ...] = ()
     identity_aliases_path: Path | None = None
+    persona_path: Path | None = None
+    shared_memory_path: Path | None = None
+    private_memory_path: Path | None = None
+    memory_recall_max_chars: int = 6000
+    knowledge_enabled: bool = False
     media_group_delay_seconds: float = DEFAULT_MEDIA_GROUP_DELAY_SECONDS
     group_decision_source: str = "model"
     direct_background: bool = True
@@ -529,6 +538,7 @@ class Config:
     auto_worker_check_seconds: int = DEFAULT_AUTO_WORKER_CHECK_SECONDS
     auto_worker_result_chars: int = DEFAULT_AUTO_WORKER_RESULT_CHARS
     wake_window_seconds: float = DEFAULT_WAKE_WINDOW_SECONDS
+    owner_presence_minutes: float = DEFAULT_OWNER_PRESENCE_MINUTES
     allowed_models: tuple[str, ...] = ()
 
 
@@ -826,11 +836,32 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
         identity_aliases_path=Path(
             env("CODEX_TELEGRAM_IDENTITY_ALIASES_PATH", str(state_dir / "identity_aliases.json"))
         ).expanduser(),
+        persona_path=Path(
+            env("CODEX_TELEGRAM_PERSONA_PATH", str(state_dir / "knowledge" / "CODEX_PERSONA.md"))
+        ).expanduser(),
+        shared_memory_path=Path(
+            env("CODEX_TELEGRAM_SHARED_MEMORY_PATH", str(state_dir / "knowledge" / "MEMORY_SHARED.md"))
+        ).expanduser(),
+        private_memory_path=Path(
+            env("CODEX_TELEGRAM_PRIVATE_MEMORY_PATH", str(state_dir / "knowledge" / "MEMORY_PRIVATE.md"))
+        ).expanduser(),
+        memory_recall_max_chars=max(
+            1000,
+            parse_int(env("CODEX_TELEGRAM_MEMORY_RECALL_MAX_CHARS"), 6000),
+        ),
+        knowledge_enabled=parse_bool(env("CODEX_TELEGRAM_KNOWLEDGE"), default=False),
         media_group_delay_seconds=max(
             MIN_MEDIA_GROUP_DELAY_SECONDS,
             parse_float(env("CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS"), DEFAULT_MEDIA_GROUP_DELAY_SECONDS),
         ),
         group_decision_source=normalize_group_decision_source(env("CODEX_TELEGRAM_GROUP_DECISION_SOURCE", "model")),
+        owner_presence_minutes=max(
+            0.0,
+            parse_float(
+                env("CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES"),
+                DEFAULT_OWNER_PRESENCE_MINUTES,
+            ),
+        ),
         direct_background=parse_bool(env("CODEX_TELEGRAM_DIRECT_BACKGROUND"), default=True),
         direct_background_after_seconds=max(
             0.0,
@@ -867,6 +898,8 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
                 f"Missing {', '.join(missing)} in {config.env_file}. "
                 "Run init-config, then add the BotFather token and your numeric Telegram user id."
             )
+    if not config.knowledge_enabled:
+        config = replace(config, persona_path=None, shared_memory_path=None, private_memory_path=None)
     return config
 
 
@@ -899,6 +932,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
     ensure_private_dir(config.logs_dir)
     ensure_private_dir(config.out_dir)
     ensure_private_dir(config.state_dir / "incoming")
+    ensure_private_dir(config.state_dir / "knowledge")
     if not config.env_file.exists():
         write_private_text(
             config.env_file,
@@ -931,6 +965,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     "CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000",
                     "CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5",
                     f"CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS={DEFAULT_MEDIA_GROUP_DELAY_SECONDS:g}",
+                    f"CODEX_TELEGRAM_OWNER_PRESENCE_MINUTES={DEFAULT_OWNER_PRESENCE_MINUTES:g}",
                     "CODEX_TELEGRAM_DENY_UNKNOWN=0",
                     "CODEX_TELEGRAM_IGNORE_USER_CONFIG=1",
                     "CODEX_TELEGRAM_MEMORY_DIR=",
@@ -941,6 +976,10 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     f"CODEX_TELEGRAM_WAKE_PHRASES={DEFAULT_WAKE_PHRASES}",
                     "CODEX_TELEGRAM_IDENTITY_WAKE_PHRASES=codex,assistant,bot",
                     f"CODEX_TELEGRAM_WATCH_PHRASES_PATH={config.state_dir / 'watch_phrases.txt'}",
+                    f"CODEX_TELEGRAM_PERSONA_PATH={config.state_dir / 'knowledge' / 'CODEX_PERSONA.md'}",
+                    f"CODEX_TELEGRAM_SHARED_MEMORY_PATH={config.state_dir / 'knowledge' / 'MEMORY_SHARED.md'}",
+                    f"CODEX_TELEGRAM_PRIVATE_MEMORY_PATH={config.state_dir / 'knowledge' / 'MEMORY_PRIVATE.md'}",
+                    "CODEX_TELEGRAM_MEMORY_RECALL_MAX_CHARS=6000",
                     "",
                 ]
             ),
@@ -1201,6 +1240,60 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+def owner_presence_until_key(chat_id: str) -> str:
+    return f"owner_presence_until:{chat_id}"
+
+
+def owner_presence_remaining_seconds(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    *,
+    now: float | None = None,
+) -> int:
+    raw = get_meta(conn, owner_presence_until_key(chat_id))
+    try:
+        until = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    remaining = until - (time.time() if now is None else now)
+    return max(0, int(remaining))
+
+
+def owner_presence_active(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    return owner_presence_remaining_seconds(conn, chat_id, now=now) > 0
+
+
+def mark_owner_present(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    minutes: float,
+    *,
+    now: float | None = None,
+) -> None:
+    current = time.time() if now is None else now
+    duration = max(0.0, minutes) * 60.0
+    set_meta(conn, owner_presence_until_key(chat_id), f"{current + duration:.3f}")
+
+
+def mark_owner_away(conn: sqlite3.Connection, chat_id: str) -> None:
+    set_meta(conn, owner_presence_until_key(chat_id), "0")
+
+
+def owner_presence_summary(conn: sqlite3.Connection, chat_id: str, config: Config) -> str:
+    if config.owner_presence_minutes <= 0:
+        return "disabled"
+    remaining = owner_presence_remaining_seconds(conn, chat_id)
+    if remaining <= 0:
+        return "away (weak wake)"
+    minutes = max(1, (remaining + 59) // 60)
+    return f"active ({minutes}m remaining)"
 
 
 def desktop_prompt_debug_enabled(conn: sqlite3.Connection) -> bool:
@@ -1978,6 +2071,7 @@ def recent_context_messages(
               m.chat_id,
               COALESCE(c.chat_type, 'unknown') AS chat_type,
               COALESCE(c.title, '') AS chat_title,
+              m.sender_id,
               m.sender_name,
               m.text,
               m.created_at
@@ -2006,6 +2100,7 @@ def recent_context_messages(
               m.chat_id,
               COALESCE(c.chat_type, 'unknown') AS chat_type,
               COALESCE(c.title, '') AS chat_title,
+              m.sender_id,
               m.sender_name,
               m.text,
               m.created_at
@@ -2093,6 +2188,30 @@ def prompt_context_rows(
     *,
     exclude: set[tuple[str, int]] | None = None,
 ) -> list[sqlite3.Row]:
+    if config.session_scope != "shared":
+        chat_row = conn.execute(
+            "SELECT * FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        session_id = session_for_engine(conn, chat_row, config) if chat_row else None
+        last_run_started_at = latest_successful_run_started_at(conn, chat_id, config)
+        if not session_id or last_run_started_at is None:
+            return recent_context_messages(
+                conn,
+                chat_id,
+                min(config.context_messages, PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES),
+                config,
+                exclude=exclude,
+            )
+        return recent_context_messages(
+            conn,
+            chat_id,
+            config.context_messages,
+            config,
+            exclude=exclude,
+            after=last_run_started_at,
+        )
+
     mode = prompt_context_mode(conn, config)
     if mode != "steady":
         return recent_context_messages(
@@ -2136,7 +2255,6 @@ def prompt_context_rows(
         merged[row_identity(row)] = row
     max_rows = max(config.steady_context_messages, len(unseen))
     return sort_context_rows(list(merged.values()))[-max_rows:]
-
 
 def recent_relationship_rows(
     conn: sqlite3.Connection,
@@ -2267,27 +2385,11 @@ def format_context_row(row: sqlite3.Row, text_limit: int = DEFAULT_CONTEXT_TEXT_
     title = str(row["chat_title"] or "").replace("\n", " ").strip()
     title_part = f" {title}" if title else ""
     source = f"{row['chat_type']} {row['chat_id']}{title_part}"
-    return f"- {row['created_at']} [{source}] {row['sender_name']}: {clean_text}"
-
-
-def recent_group_trigger_context_lines(
-    conn: sqlite3.Connection,
-    chat: Chat,
-    config: Config,
-    *,
-    exclude: set[tuple[str, int]] | None = None,
-) -> list[str]:
-    if chat.chat_type == "private":
-        return []
-    return [
-        format_context_row(row, config.context_text_chars)
-        for row in recent_same_chat_context_rows(
-            conn,
-            chat.chat_id,
-            RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES,
-            exclude=exclude,
-        )
-    ]
+    sender_id = str(row["sender_id"] or "").strip()
+    sender = str(row["sender_name"])
+    if sender_id:
+        sender += f" [user_id={sender_id}]"
+    return f"- {row['created_at']} [{source}] {sender}: {clean_text}"
 
 
 def owner_private_destinations(config: Config) -> str:
@@ -3090,6 +3192,19 @@ def prepare_session_for_turn(
     config: Config,
     chat_row: sqlite3.Row,
 ) -> str | None:
+    persona = load_knowledge_document(config.persona_path)
+    revision_key = (
+        f"persona_revision:shared:{normalize_engine(config.engine)}"
+        if config.session_scope == "shared"
+        else f"persona_revision:chat:{chat_row['chat_id']}:{normalize_engine(config.engine)}"
+    )
+    stored_revision = get_meta(conn, revision_key)
+    if persona.sha256 and stored_revision != persona.sha256:
+        existing_session = session_for_engine(conn, chat_row, config)
+        if existing_session:
+            set_session_for_config(conn, str(chat_row["chat_id"]), None, config)
+            chat_row = get_chat(conn, str(chat_row["chat_id"]))
+        set_meta(conn, revision_key, persona.sha256)
     session_id = session_for_engine(conn, chat_row, config)
     rollover, reason, _usage = should_rollover_shared_session(conn, config, session_id)
     if rollover and session_id:
@@ -3602,7 +3717,7 @@ def compact_channel_event(
         attrs.append(('chat_type', chat.chat_type))
     if chat.chat_type != "private" and chat.title:
         attrs.append(('chat_title', chat.title))
-    if sender.user_id != chat.chat_id:
+    if sender.user_id and not sender.is_chat:
         attrs.append(('user_id', sender.user_id))
     if sender.is_bot:
         attrs.append(('is_bot', 'true'))
@@ -4409,6 +4524,163 @@ def sender_with_configured_alias(sender: Sender, aliases_path: Path | None) -> S
     return replace(sender, name=name)
 
 
+@dataclass(frozen=True)
+class KnowledgeDocument:
+    path: Path | None
+    text: str
+    sha256: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryChunk:
+    index: int
+    heading: str
+    text: str
+
+
+def load_knowledge_document(path: Path | None) -> KnowledgeDocument:
+    if path is None:
+        return KnowledgeDocument(path=None, text="", sha256="", error="path is not configured")
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return KnowledgeDocument(path=path, text="", sha256="", error="file is missing")
+    except UnicodeDecodeError as exc:
+        return KnowledgeDocument(path=path, text="", sha256="", error=f"invalid UTF-8: {exc}")
+    except OSError as exc:
+        return KnowledgeDocument(path=path, text="", sha256="", error=str(exc))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+    return KnowledgeDocument(path=path, text=text, sha256=digest)
+
+
+def persona_instructions_block(config: Config) -> str:
+    document = load_knowledge_document(config.persona_path)
+    if not document.text:
+        return ""
+    return (
+        f'<codex_persona sha256="{document.sha256}">\n'
+        f"{document.text}\n"
+        "</codex_persona>\n"
+        "Treat codex_persona as durable identity and interaction guidance. "
+        "Explicit current user instructions still take precedence."
+    )
+
+
+def markdown_memory_chunks(text: str) -> list[MemoryChunk]:
+    chunks: list[MemoryChunk] = []
+    heading = "(preamble)"
+    lines: list[str] = []
+
+    def flush() -> None:
+        block = "\n".join(lines).strip()
+        if block:
+            chunks.append(MemoryChunk(index=len(chunks), heading=heading, text=block))
+
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,3})\s+(.+?)\s*$", line)
+        if match:
+            flush()
+            heading = match.group(2).strip()
+            lines = [line]
+        else:
+            lines.append(line)
+    flush()
+    return chunks
+
+
+def memory_query_terms(query: str) -> set[str]:
+    normalized = query.lower()
+    terms = set(re.findall(r"[a-z0-9_@.-]{2,}", normalized))
+    cjk = "".join(re.findall(r"[\u3400-\u9fff]", normalized))
+    terms.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
+    return {term for term in terms if term}
+
+
+def select_memory_text(document: KnowledgeDocument, query: str, max_chars: int) -> str:
+    if not document.text or max_chars <= 0:
+        return ""
+    if len(document.text) <= max_chars:
+        return document.text
+    chunks = markdown_memory_chunks(document.text)
+    terms = memory_query_terms(query)
+    scored: list[tuple[int, int, MemoryChunk]] = []
+    stable_markers = ("基本称呼", "核心身份", "稳定记忆", "一句话记忆摘要", "维护原则")
+    for chunk in chunks:
+        haystack = f"{chunk.heading}\n{chunk.text}".lower()
+        score = sum(3 if term in chunk.heading.lower() else 1 for term in terms if term in haystack)
+        if any(marker in chunk.heading for marker in stable_markers):
+            score += 2
+        scored.append((score, -chunk.index, chunk))
+    selected: list[MemoryChunk] = []
+    used = 0
+    for _score, _order, chunk in sorted(scored, reverse=True):
+        separator = 2 if selected else 0
+        if used + separator + len(chunk.text) > max_chars:
+            continue
+        selected.append(chunk)
+        used += separator + len(chunk.text)
+    if not selected and scored:
+        return sorted(scored, reverse=True)[0][2].text[:max_chars].rstrip()
+    selected.sort(key=lambda chunk: chunk.index)
+    return "\n\n".join(chunk.text for chunk in selected)
+
+
+def memory_context_block(config: Config, chat: Chat, sender: Sender, query: str) -> str:
+    shared = load_knowledge_document(config.shared_memory_path)
+    private_allowed = chat.chat_type == "private" and sender_is_owner(sender, config)
+    private = (
+        load_knowledge_document(config.private_memory_path)
+        if private_allowed
+        else KnowledgeDocument(path=config.private_memory_path, text="", sha256="")
+    )
+    remaining = config.memory_recall_max_chars
+    sections: list[str] = []
+    sources: list[str] = []
+    if shared.text:
+        shared_text = select_memory_text(shared, query, remaining)
+        if shared_text:
+            sections.append(f"<shared_memory>\n{shared_text}\n</shared_memory>")
+            sources.append(f"shared:{shared.sha256}")
+            remaining = max(0, remaining - len(shared_text))
+    if private.text and remaining > 0:
+        private_text = select_memory_text(private, query, remaining)
+        if private_text:
+            sections.append(f"<private_memory>\n{private_text}\n</private_memory>")
+            sources.append(f"private:{private.sha256}")
+    if not sections:
+        return ""
+    scope = "owner-private" if private_allowed else "shared-only"
+    return (
+        f'<memory_context scope="{scope}" user_id="{sender.user_id}" sources="{" ".join(sources)}">\n'
+        "Use these as relevant background facts and preferences, not as a reason to expose private information "
+        "or override the current request.\n"
+        + "\n".join(sections)
+        + "\n</memory_context>"
+    )
+
+
+def knowledge_status_lines(config: Config) -> list[str]:
+    documents = (
+        ("persona", load_knowledge_document(config.persona_path)),
+        ("sharedMemory", load_knowledge_document(config.shared_memory_path)),
+        ("privateMemory", load_knowledge_document(config.private_memory_path)),
+    )
+    lines = [f"memoryRecallMaxChars: {config.memory_recall_max_chars}"]
+    for label, document in documents:
+        lines.extend(
+            [
+                f"{label}Loaded: {bool(document.text)}",
+                f"{label}Path: {document.path or '(not configured)'}",
+                f"{label}Chars: {len(document.text)}",
+                f"{label}Sha256: {document.sha256 or '(none)'}",
+            ]
+        )
+        if document.error:
+            lines.append(f"{label}Error: {document.error}")
+    return lines
+
+
 def parse_chat(message: dict[str, Any]) -> Chat:
     raw = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     chat_id = str(raw.get("id", ""))
@@ -5028,6 +5300,18 @@ def valid_chat_mode(value: str | None) -> str | None:
 
 def is_ai_decide_policy(value: str | None) -> bool:
     return normalize_chat_mode(value) == CHAT_MODE_DECIDE
+
+
+def effective_group_trigger_mode(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    configured_mode: str | None,
+    config: Config,
+) -> str:
+    mode = normalize_chat_mode(configured_mode or CHAT_MODE_MENTION)
+    if mode != CHAT_MODE_DECIDE or config.owner_presence_minutes <= 0:
+        return mode
+    return CHAT_MODE_DECIDE if owner_presence_active(conn, chat_id) else CHAT_MODE_SMART
 
 
 def is_silent_reply(reply: str) -> bool:
@@ -8199,8 +8483,12 @@ def should_trigger_group_reply(
     bot_id: str | None,
     bot_username: str | None,
     sender: Sender | None = None,
+    *,
+    mode_override: str | None = None,
 ) -> bool:
-    mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
+    mode = normalize_chat_mode(
+        mode_override or chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION
+    )
     if mode == CHAT_MODE_DECIDE:
         return True
     if mode == CHAT_MODE_SMART:
@@ -8211,6 +8499,7 @@ def should_trigger_group_reply(
 
 
 def group_model_decide_for_sender(
+    conn: sqlite3.Connection,
     chat: Chat,
     chat_row: sqlite3.Row,
     sender: Sender,
@@ -8226,7 +8515,12 @@ def group_model_decide_for_sender(
         return False
     if config.group_decision_source != "model":
         return False
-    mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
+    mode = effective_group_trigger_mode(
+        conn,
+        chat.chat_id,
+        chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION,
+        config,
+    )
     return mode == CHAT_MODE_DECIDE
 
 
@@ -8258,6 +8552,8 @@ def handle_command(
             "/codex_model [model] - show or switch the Codex model (owner)\n"
             "/codex_effort [private|task] low|medium|high|xhigh - show or switch reasoning effort (owner)\n"
             "/codex_mode decide|smart|mention - set group trigger mode (owner)\n"
+            "/codex_here [minutes] - keep owner-present normal wake active (owner)\n"
+            "/codex_away - switch this group to weak wake now (owner)\n"
             "/codex_batch single|batch|status - set group single-message or batched response mode (owner)\n"
             "/codex auto|single|multi|status - set/show reply bubble shape for this chat (owner)\n"
             "/codex_debug on|off|status - show or hide raw Desktop prompts (owner)\n"
@@ -8355,7 +8651,38 @@ def handle_command(
         if normalized == CHAT_MODE_DECIDE and chat.chat_type == "private":
             return "私聊不需要 decide 模式，每条消息都会触发。"
         set_chat_mode(conn, chat.chat_id, normalized)
+        if normalized == CHAT_MODE_DECIDE and config.owner_presence_minutes > 0:
+            return (
+                f"已切到自适应 decide：owner 活跃时正常唤醒，离开 "
+                f"{config.owner_presence_minutes:g} 分钟后自动弱唤醒。"
+            )
         return f"已切到 {normalized} 模式。"
+
+    if command.name == "codex_here":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        if chat.chat_type == "private":
+            return "这个命令用于群聊；私聊每条消息都会触发。"
+        if config.owner_presence_minutes <= 0:
+            return "Owner 活跃窗口当前被配置为关闭。"
+        minutes = config.owner_presence_minutes
+        if command.args:
+            try:
+                minutes = float(command.args[0])
+            except ValueError:
+                return "用法：/codex_here 或 /codex_here <分钟数>"
+            if minutes < 1 or minutes > 1440:
+                return "分钟数需要在 1 到 1440 之间。"
+        mark_owner_present(conn, chat.chat_id, minutes)
+        return f"好，未来 {minutes:g} 分钟按 owner 在场处理；你再次发言会自动续期。"
+
+    if command.name == "codex_away":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        if chat.chat_type == "private":
+            return "这个命令用于群聊；私聊不需要弱唤醒。"
+        mark_owner_away(conn, chat.chat_id)
+        return "已进入弱唤醒：普通消息只记录，不启动 Codex；点名、回复、唤醒词和必要跟进仍会启动。"
 
     if command.name == "codex_batch":
         if not owner:
@@ -8446,7 +8773,9 @@ def status_for_chat(
         f"effort: {config.effort}",
         f"privateEffort: {config.private_effort}",
         f"taskEffort: {config.task_effort}",
-        f"contextMessages: {config.context_messages}",
+        f"ownerPresenceMinutes: {config.owner_presence_minutes:g}",
+        f"unseenContextMessagesCap: {config.context_messages}",
+        f"perChatBootstrapContextMessages: {PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES}",
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
@@ -8469,6 +8798,7 @@ def status_for_chat(
         f"desktopPromptDebug: {desktop_prompt_debug_enabled(conn)}",
         f"cwd: {config.cwd}",
     ]
+    lines.extend(knowledge_status_lines(config))
     lines.extend(update_failure_summary_lines(conn))
     if chat_id:
         row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -8476,12 +8806,27 @@ def status_for_chat(
             shared_session = shared_session_for_engine(conn, config.engine)
             handoff = shared_handoff_for_engine(conn, config.engine)
             usage = latest_session_token_usage(conn, shared_session) if shared_session else None
+            configured_mode = normalize_chat_mode(row["mode"] or policy.group_policy)
+            is_group = str(row["chat_type"] or "") != "private"
+            effective_mode = (
+                effective_group_trigger_mode(
+                    conn,
+                    chat_id,
+                    configured_mode,
+                    config,
+                )
+                if is_group
+                else "private"
+            )
+            presence = owner_presence_summary(conn, chat_id, config) if is_group else "n/a"
             lines.extend(
                 [
                     f"chat: {chat_id}",
                     f"enabled: {bool(row['enabled'])}",
                     f"botActive: {bool(row['bot_active'])}",
-                    f"mode: {normalize_chat_mode(row['mode'] or policy.group_policy)}",
+                    f"mode: {configured_mode}",
+                    f"effectiveMode: {effective_mode}",
+                    f"ownerPresence: {presence}",
                     f"groupBatchMode: {group_response_mode(conn, chat_id)}",
                     f"messageShape: {message_shape(conn, chat_id)}",
                     f"lastMessageReaction: {get_meta(conn, last_message_reaction_key(chat_id)) or '(none)'}",
@@ -8833,6 +9178,9 @@ def prompt_metrics(prompt: str) -> dict[str, int]:
         "sharedBehaviorCount": prompt.count("Shared-context behavior"),
         "replyRhythmCount": prompt.count("Telegram reply rhythm"),
         "handoffCount": prompt.count("Pending continuity handoff"),
+        "memoryContextCount": prompt.count("<memory_context"),
+        "sharedMemoryCount": prompt.count("<shared_memory>"),
+        "privateMemoryCount": prompt.count("<private_memory>"),
         "recentContextHeaders": sum(
             1 for line in lines if line.startswith("Recent Telegram context") or line == "<context>"
         ),
@@ -8921,6 +9269,13 @@ def optimization_report(
     post_success_metrics = prompt_metrics(post_success_prompt)
     previous_metrics = last_prompt_metrics(conn, chat.chat_id)
     media_tool_lines, media_tool_failures = app_server_media_tool_health_lines()
+    persona_document = load_knowledge_document(config.persona_path)
+    shared_memory_document = load_knowledge_document(config.shared_memory_path)
+    private_memory_document = load_knowledge_document(config.private_memory_path)
+    knowledge_enabled = any(
+        path is not None
+        for path in (config.persona_path, config.shared_memory_path, config.private_memory_path)
+    )
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -8938,6 +9293,23 @@ def optimization_report(
         failures.append("stable channel instructions are still present in post-success steady sample")
     if sample_metrics["recentContextRows"] > max(config.shared_context_messages, config.context_messages):
         failures.append("sample prompt includes more recent context rows than configured")
+    if knowledge_enabled and not persona_document.text:
+        failures.append(f"persona is unavailable: {persona_document.error or 'empty file'}")
+    if knowledge_enabled and not shared_memory_document.text:
+        failures.append(f"shared memory is unavailable: {shared_memory_document.error or 'empty file'}")
+    if knowledge_enabled and not private_memory_document.text:
+        failures.append(f"private memory is unavailable: {private_memory_document.error or 'empty file'}")
+    if knowledge_enabled and sample_metrics["memoryContextCount"] != 1:
+        failures.append("sample prompt does not contain exactly one memory context")
+    if knowledge_enabled and chat.chat_type != "private" and sample_metrics["privateMemoryCount"]:
+        failures.append("group sample prompt contains private memory")
+    if (
+        knowledge_enabled
+        and chat.chat_type == "private"
+        and sender_is_owner(sender, config)
+        and not sample_metrics["privateMemoryCount"]
+    ):
+        failures.append("owner-private sample prompt does not contain private memory")
     failures.extend(media_tool_failures)
     if shared_session and rollover:
         warnings.append(reason)
@@ -8948,7 +9320,8 @@ def optimization_report(
         f"chatType: {chat.chat_type}",
         f"engine: {config.engine}",
         f"sessionScope: {config.session_scope}",
-        f"contextMessages: {config.context_messages}",
+        f"unseenContextMessagesCap: {config.context_messages}",
+        f"perChatBootstrapContextMessages: {PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES}",
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
@@ -8971,6 +9344,8 @@ def optimization_report(
             ]
         )
     lines.extend(media_tool_lines)
+    if knowledge_enabled:
+        lines.extend(knowledge_status_lines(config))
     lines.extend(prompt_metric_lines(sample_metrics, "sample"))
     lines.extend(prompt_metric_lines(post_success_metrics, "postSuccessSample"))
     if previous_metrics:
@@ -9030,17 +9405,12 @@ def build_prompt(
             exclude={(chat.chat_id, message_id)},
         )
     )
-    recent_group_lines = recent_group_trigger_context_lines(
-        conn,
-        chat,
-        config,
-        exclude={(chat.chat_id, message_id)},
-    )
     for row in rows:
         context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
     relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
+    recalled_memory = memory_context_block(config, chat, sender, text)
     output_lines = (
         [
             format_editable_output_row(row)
@@ -9064,17 +9434,11 @@ def build_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
-        if relationship_lines:
-            parts.append("<telegram_relationships>\n" + "\n".join(relationship_lines) + "\n</telegram_relationships>")
+        if recalled_memory:
+            parts.append(recalled_memory)
         worker_context = active_worker_context_block(config, chat.chat_id)
         if worker_context:
             parts.append(worker_context)
-        if recent_group_lines:
-            parts.append(
-                '<recent_chat_window last="5" purpose="immediate group context before the current trigger">\n'
-                + "\n".join(recent_group_lines)
-                + "\n</recent_chat_window>"
-            )
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -9167,8 +9531,7 @@ def build_prompt(
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
         f"{relationship_context}\n\n"
-        "Immediate same-chat context (last five messages before the current trigger):\n"
-        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
+        f"{recalled_memory + chr(10) + chr(10) if recalled_memory else ''}"
         f"{worker_context_block}"
         f"{reaction_feedback_block}"
         f"{turn_attention_block}"
@@ -9254,12 +9617,6 @@ def build_batch_prompt(
 ) -> str:
     context_lines: list[str] = []
     exclude_keys = {(chat.chat_id, item.message_id) for item in items}
-    recent_group_lines = recent_group_trigger_context_lines(
-        conn,
-        chat,
-        config,
-        exclude=exclude_keys,
-    )
     for row in prompt_context_rows(
         conn,
         chat.chat_id,
@@ -9270,6 +9627,9 @@ def build_batch_prompt(
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
     relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
+    latest_sender = items[-1].sender if items else diagnostic_sender_for_chat(config, chat)
+    memory_query = "\n".join(item.text for item in items)
+    recalled_memory = memory_context_block(config, chat, latest_sender, memory_query)
     output_lines = (
         [
             format_editable_output_row(row)
@@ -9315,14 +9675,8 @@ def build_batch_prompt(
             parts.append(handoff_block.strip())
         if context_lines:
             parts.append("<context>\n" + "\n".join(context_lines) + "\n</context>")
-        if relationship_lines:
-            parts.append("<telegram_relationships>\n" + "\n".join(relationship_lines) + "\n</telegram_relationships>")
-        if recent_group_lines:
-            parts.append(
-                '<recent_chat_window last="5" purpose="immediate group context before this batch">\n'
-                + "\n".join(recent_group_lines)
-                + "\n</recent_chat_window>"
-            )
+        if recalled_memory:
+            parts.append(recalled_memory)
         if output_lines:
             parts.append("<telegram_outputs>\n" + "\n".join(output_lines) + "\n</telegram_outputs>")
         if reaction_feedback:
@@ -9395,8 +9749,7 @@ def build_batch_prompt(
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
         f"{relationship_context}\n\n"
-        "Immediate same-chat context (last five messages before this batch):\n"
-        f"{chr(10).join(recent_group_lines) if recent_group_lines else '(none)'}\n\n"
+        f"{recalled_memory + chr(10) + chr(10) if recalled_memory else ''}"
         f"{reaction_feedback_block}"
         f"{turn_attention_block}"
         "Latest short batch:\n"
@@ -12293,6 +12646,7 @@ def app_server_base_instructions(config: Config) -> str:
         )
     shared = shared_context_guidance(config, Chat(chat_id="", chat_type="", title=""))
     aside_check = private_aside_turn_check(config)
+    persona = persona_instructions_block(config)
     return (
         "You are a Codex collaborator reached through Telegram.\n\n"
         "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
@@ -12332,6 +12686,7 @@ def app_server_base_instructions(config: Config) -> str:
         f"{CHANNEL_ADMIN_GUIDANCE}\n\n"
         f"{GROUP_SOCIAL_MANUAL}"
         f"{shared}"
+        + (f"\n\n{persona}" if persona else "")
     )
 
 
@@ -14144,6 +14499,17 @@ class BotService:
             return
         if should_store and not is_new_message:
             return
+        if (
+            chat.chat_type != "private"
+            and self.config.owner_presence_minutes > 0
+            and sender_is_owner(sender, self.config)
+            and chat_is_allowed(chat, policy)
+        ):
+            mark_owner_present(
+                conn,
+                chat.chat_id,
+                self.config.owner_presence_minutes,
+            )
         if is_context_only_message(message):
             return
 
@@ -14163,7 +14529,14 @@ class BotService:
             )
             return
 
-        defer_group_decision_to_model = group_model_decide_for_sender(chat, chat_row, sender, policy, self.config)
+        defer_group_decision_to_model = group_model_decide_for_sender(
+            conn,
+            chat,
+            chat_row,
+            sender,
+            policy,
+            self.config,
+        )
         explicitly_addressed_by_identity = is_explicitly_addressed_group_message(
             text,
             message,
@@ -14343,6 +14716,16 @@ class BotService:
         else:
             allowed = chat_is_allowed(chat, policy)
         if allowed:
+            if (
+                chat.chat_type != "private"
+                and self.config.owner_presence_minutes > 0
+                and sender_is_owner(sender, self.config)
+            ):
+                mark_owner_present(
+                    conn,
+                    chat.chat_id,
+                    self.config.owner_presence_minutes,
+                )
             message_id = event.get("message_id") if isinstance(event.get("message_id"), int) else None
             base_summary = message_reaction_summary(event)
             summary = reaction_summary_with_target_preview(
@@ -15855,7 +16238,13 @@ class BotService:
             return False
         if not chat_is_allowed(chat, policy):
             return False
-        if group_model_decide_for_sender(chat, chat_row, sender, policy, self.config):
+        effective_mode = effective_group_trigger_mode(
+            conn,
+            chat.chat_id,
+            chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION,
+            self.config,
+        )
+        if group_model_decide_for_sender(conn, chat, chat_row, sender, policy, self.config):
             return True
         if should_trigger_group_reply(
             text,
@@ -15866,8 +16255,11 @@ class BotService:
             self.bot_id,
             self.bot_username,
             sender,
+            mode_override=effective_mode,
         ):
             return True
+        if effective_mode == CHAT_MODE_SMART and sender.is_bot:
+            return False
         group_mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
         if is_ai_decide_policy(group_mode) and should_wake_recent_bot_continuation(
             conn,

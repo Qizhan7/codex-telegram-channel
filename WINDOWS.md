@@ -35,6 +35,26 @@ The Windows adapter refreshes a private copy of `auth.json` when an isolated
 app-server starts because ordinary Windows processes cannot create symbolic
 links unless Developer Mode or elevation is enabled.
 
+## Persona and memory
+
+Private runtime knowledge lives outside Git and is **opt-in**: set
+`CODEX_TELEGRAM_KNOWLEDGE=1` in `.env` or the files below stay unloaded.
+
+```text
+%USERPROFILE%\.codex\channels\codex-telegram\knowledge\
+├── CODEX_PERSONA.md
+├── MEMORY_SHARED.md
+└── MEMORY_PRIVATE.md
+```
+
+The full persona is attached to app-server base instructions. A persona hash
+change starts a fresh thread for each chat the next time that chat is active.
+Memory is re-read on every turn: groups receive only `MEMORY_SHARED.md`; the
+configured owner's private chat receives shared plus private memory.
+
+Use `status` or `doctor` to verify loaded paths, character counts, SHA-256
+digests, and whether a diagnostic prompt contains private memory.
+
 ## Rollback
 
 Only one process may long-poll a Telegram Bot token. Stop this bridge before
