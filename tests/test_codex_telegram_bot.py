@@ -4599,3 +4599,16 @@ def test_load_config_parses_allowed_models(tmp_path: Path, monkeypatch) -> None:
     cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
     assert cfg.allowed_models == ("gpt-5.5", "gpt-6-astra")
 
+
+def test_default_codex_bin_prefers_windows_npm_wrapper(tmp_path: Path, monkeypatch) -> None:
+    fake_npm_bin = tmp_path / "npm" / "codex.cmd"
+    fake_npm_bin.parent.mkdir()
+    fake_npm_bin.write_text("rem npm shim", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(codex_telegram_bot, "CHATGPT_APP_BIN", tmp_path / "missing-chatgpt")
+    monkeypatch.setattr(codex_telegram_bot, "CODEX_APP_BIN", tmp_path / "missing-codex")
+
+    assert codex_telegram_bot.default_codex_bin() == str(fake_npm_bin)
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "empty-appdata"))
+    assert codex_telegram_bot.default_codex_bin() == "codex"

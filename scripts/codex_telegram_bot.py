@@ -721,6 +721,11 @@ def default_codex_bin() -> str:
         return str(CHATGPT_APP_BIN)
     if CODEX_APP_BIN.exists():
         return str(CODEX_APP_BIN)
+    npm_codex = Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd"
+    if npm_codex.exists():
+        # The WindowsApps "codex.exe" alias cannot be launched from scripts;
+        # the npm shim is the working entry point on Windows.
+        return str(npm_codex)
     return "codex"
 
 
@@ -9632,7 +9637,7 @@ def build_codex_command(
     channel_mcp_args: list[str] = []
     if channel_events_path is not None:
         script_path = Path(__file__).resolve()
-        python_bin = sys.executable or "/opt/homebrew/bin/python3.12"
+        python_bin = sys.executable
         channel_mcp_args = [
             "-c",
             f'mcp_servers.telegram_channel.command="{python_bin}"',
