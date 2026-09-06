@@ -76,6 +76,12 @@ python3.12 -m venv .venv
 The app-server path has no third-party runtime dependency; `pytest` is only for
 the included verification suite.
 
+On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python` and
+see [WINDOWS.md](WINDOWS.md) for background service scripts (`start_windows.ps1`,
+`stop_windows.ps1`, and the logon task installer). `init-config` detects the
+npm-installed Codex wrapper (`%APPDATA%\npm\codex.cmd`) automatically; the bare
+`codex` alias under WindowsApps cannot be launched from scripts.
+
 ### 2. Create the private runtime config
 
 ```bash
