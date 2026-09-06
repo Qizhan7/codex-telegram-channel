@@ -856,6 +856,8 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
                 f"Missing {', '.join(missing)} in {config.env_file}. "
                 "Run init-config, then add the BotFather token and your numeric Telegram user id."
             )
+    if not config.knowledge_enabled:
+        config = replace(config, persona_path=None, shared_memory_path=None, private_memory_path=None)
     return config
 
 

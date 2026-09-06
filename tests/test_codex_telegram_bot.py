@@ -1515,6 +1515,9 @@ def test_owner_message_automatically_opens_presence_window(tmp_path: Path, monke
     service.handle_update(conn, _telegram_update(100, -100, "supergroup", "我回来啦"))
 
     assert codex_telegram_bot.owner_presence_active(conn, "-100")
+    deadline = time.monotonic() + 1
+    while captured != ["run"] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert captured == ["run"]
 
 
@@ -2875,6 +2878,9 @@ def test_direct_background_keeps_typing_until_background_delivery(tmp_path: Path
         time.sleep(0.01)
 
     assert sent == ["回来了。"]
+    deadline = time.monotonic() + 1
+    while not stop_events[0].is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert stop_events[0].is_set()
 
 

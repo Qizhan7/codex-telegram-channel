@@ -350,6 +350,15 @@ preferences, and interpretation rules are recalled from the shared/private
 Markdown memory files. Current sender ids and access control still come from
 the Telegram event and bridge policy rather than from memory.
 
+## Persona And Memory Files
+
+Persona and Markdown memory files are **opt-in**: set
+`CODEX_TELEGRAM_KNOWLEDGE=1` to load them. Without the switch, configured
+`CODEX_TELEGRAM_PERSONA_PATH`, `CODEX_TELEGRAM_SHARED_MEMORY_PATH`, and
+`CODEX_TELEGRAM_PRIVATE_MEMORY_PATH` values are ignored and no knowledge
+content reaches Codex. Sender recognition and group wake behavior keep using
+the sqlite relationship rows and recent context regardless of this switch.
+
 ## Desktop Sync
 
 `CODEX_TELEGRAM_DESKTOP_SYNC=1` updates Codex Desktop metadata for
