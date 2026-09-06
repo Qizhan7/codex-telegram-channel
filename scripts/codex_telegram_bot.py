@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +39,18 @@ SERVICE_TITLE = "Codex Telegram"
 DEFAULT_STATE_DIR = Path.home() / ".codex" / "channels" / SERVICE_NAME
 DEFAULT_WAKE_PHRASES = "codex,assistant,bot"
 PUBLIC_COMMAND_PREFIX = "codex"
+BOT_COMMAND_MENU: tuple[dict[str, str], ...] = (
+    {"command": "start", "description": "Introduce the bridge and commands"},
+    {"command": "codex_status", "description": "Show bot state, session, and last run"},
+    {"command": "codex_new", "description": "Start a fresh Codex session next message"},
+    {"command": "codex_model", "description": "Show or switch the Codex model (owner)"},
+    {"command": "codex_effort", "description": "Show or switch reasoning effort (owner)"},
+    {"command": "codex_mode", "description": "Set group trigger: decide|smart|mention (owner)"},
+    {"command": "codex_batch", "description": "Set group batching: single|batch (owner)"},
+    {"command": "codex", "description": "Set reply bubble shape: auto|single|multi (owner)"},
+    {"command": "codex_debug", "description": "Show or hide raw Desktop prompts (owner)"},
+    {"command": "codex_help", "description": "List all bridge commands"},
+)
 DEFAULT_CONTEXT_MESSAGES = 24
 PER_CHAT_BOOTSTRAP_CONTEXT_MESSAGES = 8
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
@@ -368,6 +381,19 @@ GROUP_RESPONSE_MODE_KEY_PREFIX = "group_response_mode:"
 GROUP_RESPONSE_MODES = {"batch", "single"}
 MESSAGE_SHAPE_KEY_PREFIX = "message_shape:"
 MESSAGE_SHAPES = {"auto", "single", "multi"}
+RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES = 5
+RUNTIME_MODEL_KEY = "runtime_model"
+RUNTIME_EFFORT_KEYS = {
+    "default": "runtime_effort",
+    "private": "runtime_private_effort",
+    "task": "runtime_task_effort",
+}
+RUNTIME_EFFORT_FIELDS = {
+    "default": "effort",
+    "private": "private_effort",
+    "task": "task_effort",
+}
+EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max", "ultra")
 RECENT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CHAT_MEDIA_FOLLOWUP_LOOKBACK = 3
 RECENT_CONTINUATION_OUTPUT_SECONDS = 20 * 60
@@ -513,6 +539,7 @@ class Config:
     auto_worker_result_chars: int = DEFAULT_AUTO_WORKER_RESULT_CHARS
     wake_window_seconds: float = DEFAULT_WAKE_WINDOW_SECONDS
     owner_presence_minutes: float = DEFAULT_OWNER_PRESENCE_MINUTES
+    allowed_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -655,6 +682,12 @@ def parse_csv_set(value: str | None) -> set[str]:
     return {item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()}
 
 
+def parse_csv_tuple(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(item.strip() for item in re.split(r"[,;\s]+", value) if item.strip())
+
+
 def parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None or value == "":
         return default
@@ -710,6 +743,11 @@ def default_codex_bin() -> str:
         return str(CHATGPT_APP_BIN)
     if CODEX_APP_BIN.exists():
         return str(CODEX_APP_BIN)
+    npm_codex = Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd"
+    if npm_codex.exists():
+        # The WindowsApps "codex.exe" alias cannot be launched from scripts;
+        # the npm shim is the working entry point on Windows.
+        return str(npm_codex)
     return "codex"
 
 
@@ -721,7 +759,10 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
     def env(name: str, default: str = "") -> str:
         return os.environ.get(name, env_values.get(name, default))
 
-    token = env("TELEGRAM_BOT_TOKEN")
+    # Accept the previous Node bridge's token name so an existing private
+    # runtime configuration can be migrated without printing or re-entering
+    # the BotFather secret.
+    token = env("TELEGRAM_BOT_TOKEN", env("CODEX_TELEGRAM_BOT_TOKEN"))
     owner_ids = parse_csv_set(env("TELEGRAM_OWNER_IDS"))
     reply_timeout_seconds = parse_int(env("CODEX_TELEGRAM_REPLY_TIMEOUT_SECONDS"), 300)
     memory_dir_value = env("CODEX_TELEGRAM_MEMORY_DIR").strip()
@@ -735,6 +776,7 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
         token=token,
         owner_ids=owner_ids,
         model=env("CODEX_TELEGRAM_MODEL", "gpt-5.5"),
+        allowed_models=parse_csv_tuple(env("CODEX_TELEGRAM_ALLOWED_MODELS")),
         engine=normalize_engine(env("CODEX_TELEGRAM_ENGINE", "app-server")),
         effort=normalize_effort(env("CODEX_TELEGRAM_EFFORT", "high")),
         private_effort=normalize_effort(env("CODEX_TELEGRAM_PRIVATE_EFFORT", env("CODEX_TELEGRAM_EFFORT", "high"))),
@@ -1260,6 +1302,42 @@ def desktop_prompt_debug_enabled(conn: sqlite3.Connection) -> bool:
 
 def set_desktop_prompt_debug(conn: sqlite3.Connection, enabled: bool) -> None:
     set_meta(conn, DESKTOP_PROMPT_DEBUG_KEY, "1" if enabled else "0")
+
+
+def set_runtime_model(conn: sqlite3.Connection, model: str) -> None:
+    set_meta(conn, RUNTIME_MODEL_KEY, model)
+
+
+def set_runtime_effort(conn: sqlite3.Connection, scope: str, effort: str) -> None:
+    set_meta(conn, RUNTIME_EFFORT_KEYS[scope], effort)
+
+
+def apply_runtime_overrides(conn: sqlite3.Connection, config: Config) -> Config:
+    model = get_meta(conn, RUNTIME_MODEL_KEY)
+    if not model:
+        model = config.model
+    updates: dict[str, object] = {"model": model}
+    for scope, key in RUNTIME_EFFORT_KEYS.items():
+        effort = get_meta(conn, key)
+        if not effort or effort not in EFFORT_CHOICES:
+            continue
+        updates[RUNTIME_EFFORT_FIELDS[scope]] = effort
+    changed = any(getattr(config, name) != value for name, value in updates.items())
+    if not changed:
+        return config
+    return replace(config, **updates)
+
+
+def load_config_with_runtime_overrides(config: Config) -> Config:
+    """Fold persisted /codex_model and /codex_effort choices into a fresh config."""
+    try:
+        conn = connect_db(config)
+    except sqlite3.Error:
+        return config
+    try:
+        return apply_runtime_overrides(conn, config)
+    finally:
+        conn.close()
 
 
 def group_response_mode_key(chat_id: str) -> str:
@@ -8471,6 +8549,8 @@ def handle_command(
             "/codex_new - start a fresh Codex session on the next message\n"
             "/codex_resume <session_id> - bind this chat to a Codex session (owner)\n"
             "/codex_rollover - start a clean shared session with a short handoff (owner)\n"
+            "/codex_model [model] - show or switch the Codex model (owner)\n"
+            "/codex_effort [private|task] low|medium|high|xhigh - show or switch reasoning effort (owner)\n"
             "/codex_mode decide|smart|mention - set group trigger mode (owner)\n"
             "/codex_here [minutes] - keep owner-present normal wake active (owner)\n"
             "/codex_away - switch this group to weak wake now (owner)\n"
@@ -8515,6 +8595,52 @@ def handle_command(
         mark_shared_session_rollover(conn, config, session_id, "owner requested /codex_rollover")
         set_chat_enabled(conn, chat.chat_id, True)
         return "好，已准备换到新的共享 Codex session；下一条消息会带短 handoff 接上。"
+
+    if command.name == "codex_model":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        requested = " ".join(command.args).strip()
+        if not requested:
+            lines = [f"当前模型：{config.model}"]
+            if config.allowed_models:
+                lines.append(f"可选模型：{'、'.join(config.allowed_models)}")
+            else:
+                lines.append("未配置白名单（.env 的 CODEX_TELEGRAM_ALLOWED_MODELS），可任意切换。")
+            lines.append("用法：/codex_model <model>")
+            return "\n".join(lines)
+        if requested.lower() == "default":
+            set_meta(conn, RUNTIME_MODEL_KEY, "")
+            return f"已清除运行时模型覆盖，回到 .env 配置的 {config.model}，下一条消息生效。"
+        if config.allowed_models and requested not in config.allowed_models:
+            return (
+                f"{requested} 不在可选列表里。可选模型：{'、'.join(config.allowed_models)}"
+                "（编辑 .env 的 CODEX_TELEGRAM_ALLOWED_MODELS 可增删）"
+            )
+        set_runtime_model(conn, requested)
+        return f"模型已切到 {requested}，下一条消息生效。用 /codex_status 可复核。"
+
+    if command.name == "codex_effort":
+        if not owner:
+            return "这个命令只给 owner 用。"
+        args = [arg.lower() for arg in command.args]
+        if not args:
+            return (
+                f"当前 effort：普通 {config.effort} / 私聊 {config.private_effort} / 任务 {config.task_effort}\n"
+                "用法：/codex_effort low|medium|high|xhigh\n"
+                "或 /codex_effort private|task <effort> 单独调私聊或长任务。"
+            )
+        scope = "default"
+        if args[0] in RUNTIME_EFFORT_KEYS and len(args) >= 2:
+            scope = args.pop(0)
+        value = args[0]
+        if value not in EFFORT_CHOICES:
+            return "effort 只能是 low、medium、high 或 xhigh。"
+        set_runtime_effort(conn, scope, value)
+        if scope == "private":
+            return f"私聊 effort 已切到 {value}，下一条消息生效。"
+        if scope == "task":
+            return f"任务 effort 已切到 {value}，下一条消息生效。"
+        return f"effort 已切到 {value}，下一条消息生效。"
 
     if command.name == "codex_mode":
         if not owner:
@@ -8641,6 +8767,7 @@ def status_for_chat(
         f"allowedChats: {len(policy.allowed_chats)}",
         f"legacyAllowedBotsIgnoredInGroups: {len(policy.allowed_bots)}",
         f"model: {config.model}",
+        f"allowedModels: {', '.join(config.allowed_models) if config.allowed_models else 'any'}",
         f"engine: {config.engine}",
         f"sessionScope: {config.session_scope}",
         f"effort: {config.effort}",
@@ -9875,7 +10002,7 @@ def build_codex_command(
     channel_mcp_args: list[str] = []
     if channel_events_path is not None:
         script_path = Path(__file__).resolve()
-        python_bin = sys.executable or "/opt/homebrew/bin/python3.12"
+        python_bin = sys.executable
         channel_mcp_args = [
             "-c",
             f'mcp_servers.telegram_channel.command="{python_bin}"',
@@ -11828,6 +11955,7 @@ def start_codex_worker(
             stdout=stdout_handle,
             stderr=stderr_handle,
             text=True,
+            encoding="utf-8",
             cwd=str(workdir),
             env=worker_env,
         )
@@ -12650,6 +12778,14 @@ def prepare_app_server_isolated_home(config: Config) -> Path:
     source_auth = main_home / "auth.json"
     target_auth = home / "auth.json"
     if source_auth.exists():
+        if os.name == "nt":
+            # Creating symlinks on Windows normally requires Developer Mode or
+            # elevation. Refreshing a private copy on app-server startup keeps
+            # the isolated home usable for ordinary desktop users.
+            if target_auth.is_symlink():
+                target_auth.unlink()
+            shutil.copy2(source_auth, target_auth)
+            return home
         already_linked = False
         if target_auth.is_symlink():
             try:
@@ -12720,6 +12856,7 @@ class CodexAppServerClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 bufsize=1,
                 cwd=str(self.config.cwd),
                 env=app_server_environment(self.config),
@@ -13476,14 +13613,14 @@ class FairTurnScheduler:
 
 class BotService:
     def __init__(self, config: Config) -> None:
-        self.config = config
+        self.config = load_config_with_runtime_overrides(config)
         self.chat_locks: dict[str, threading.Lock] = {}
         self.turn_scheduler = FairTurnScheduler()
         self.batch_lock = threading.Lock()
         self.batches: dict[str, BatchState] = {}
         self.media_group_lock = threading.Lock()
         self.media_groups: dict[str, MediaGroupState] = {}
-        self.app_server = CodexAppServerClient(config) if config.engine == "app-server" else None
+        self.app_server = CodexAppServerClient(self.config) if self.config.engine == "app-server" else None
         self.bot_id: str | None = None
         self.bot_username: str | None = None
         self.desktop_outbound_current_turn_id: str | None = None
@@ -13498,6 +13635,25 @@ class BotService:
         if key not in self.chat_locks:
             self.chat_locks[key] = threading.Lock()
         return self.chat_locks[key]
+
+    def refresh_runtime_config(self, conn: sqlite3.Connection) -> None:
+        latest = apply_runtime_overrides(conn, self.config)
+        if latest is not self.config:
+            self.config = latest
+            if self.app_server is not None:
+                self.app_server.config = latest
+
+    def sync_bot_command_menu(self) -> None:
+        params = {
+            # telegram_api posts form-encoded params, so nested values must be
+            # pre-serialized, matching how react and the media tools send JSON.
+            "commands": json.dumps(list(BOT_COMMAND_MENU), ensure_ascii=False)
+        }
+        try:
+            telegram_api(self.config.token, "setMyCommands", params)
+            print(f"{utc_now()} synced {len(BOT_COMMAND_MENU)} bot commands to Telegram menu", flush=True)
+        except Exception as exc:
+            print(f"{utc_now()} bot command menu sync error: {exc}", file=sys.stderr, flush=True)
 
     def refresh_bot_info(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -13598,6 +13754,7 @@ class BotService:
                 f"({self.bot_id or 'unknown'})",
                 flush=True,
             )
+            self.sync_bot_command_menu()
             if self.config.desktop_outbound:
                 threading.Thread(target=self.desktop_outbound_loop, daemon=True).start()
             if self.config.auto_worker:
@@ -14289,7 +14446,7 @@ class BotService:
             return
         message_id = int(message.get("message_id", 0) or 0)
         thread_id = message_thread_id(message)
-        sender = parse_sender(message)
+        sender = sender_with_configured_alias(parse_sender(message), self.config.identity_aliases_path)
         chat = parse_chat(message)
         if not chat.chat_id:
             return
@@ -14361,6 +14518,7 @@ class BotService:
                 self.handle_probe_channel(conn, chat, chat_row, sender, message_id, thread_id, policy)
                 return
             reply = handle_command(conn, self.config, policy, chat, sender, command)
+            self.refresh_runtime_config(conn)
             if reply:
                 send_message(
                     self.config,
@@ -14898,6 +15056,8 @@ class BotService:
             if not deliver_in_background:
                 return
             try:
+                if stop_typing is not None:
+                    stop_typing.set()
                 if error is not None:
                     self.deliver_bridge_error(chat, message_id, message_thread_id, error)
                 elif result is not None:
@@ -16307,6 +16467,7 @@ def get_me(config: Config) -> dict[str, Any]:
 
 
 def print_status(config: Config, chat_id: str | None = None) -> None:
+    config = load_config_with_runtime_overrides(config)
     policy = load_access_policy(config.access_file, config.owner_ids)
     with closing(connect_db(config)) as conn:
         print(status_for_chat(conn, config, policy, chat_id))

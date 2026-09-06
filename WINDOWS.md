@@ -37,7 +37,8 @@ links unless Developer Mode or elevation is enabled.
 
 ## Persona and memory
 
-Private runtime knowledge lives outside Git:
+Private runtime knowledge lives outside Git and is **opt-in**: set
+`CODEX_TELEGRAM_KNOWLEDGE=1` in `.env` or the files below stay unloaded.
 
 ```text
 %USERPROFILE%\.codex\channels\codex-telegram\knowledge\
