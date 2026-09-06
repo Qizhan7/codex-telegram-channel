@@ -773,7 +773,10 @@ def test_app_server_uses_isolated_home_when_ignoring_user_config(tmp_path: Path,
     isolated = state_dir / "codex-home"
     assert env["CODEX_HOME"] == str(isolated)
     assert env["CODEX_SQLITE_HOME"] == str(main_home)
-    assert (isolated / "auth.json").resolve() == (main_home / "auth.json").resolve()
+    if sys.platform == "win32":
+        assert (isolated / "auth.json").read_bytes() == (main_home / "auth.json").read_bytes()
+    else:
+        assert (isolated / "auth.json").resolve() == (main_home / "auth.json").resolve()
     config_text = (isolated / "config.toml").read_text(encoding="utf-8")
     assert "apps = false" in config_text
     assert "plugins = false" in config_text
@@ -829,6 +832,28 @@ def test_app_server_command_allows_user_config_when_requested(tmp_path: Path, mo
     assert codex_telegram_bot.app_server_command(cfg) == ["/opt/codex", "app-server", "--stdio"]
     assert codex_telegram_bot.app_server_environment(cfg)["CODEX_HOME"] == "/custom/codex-home"
     assert not (tmp_path / "codex-home").exists()
+
+
+def test_sender_alias_uses_numeric_user_id_and_preserves_telegram_name(tmp_path: Path) -> None:
+    aliases_path = tmp_path / "identity_aliases.json"
+    aliases_path.write_text(
+        json.dumps(
+            {
+                "7541487750": {
+                    "name": "云 / 兮兮",
+                    "aliases": ["云", "兮兮"],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    sender = codex_telegram_bot.Sender("7541487750", "@current_username", False)
+
+    mapped = codex_telegram_bot.sender_with_configured_alias(sender, aliases_path)
+
+    assert mapped.user_id == "7541487750"
+    assert mapped.name == "云 / 兮兮 [Telegram: @current_username]"
 
 
 def test_desktop_titles_include_merged_shared_thread(tmp_path: Path) -> None:
@@ -2398,6 +2423,9 @@ def test_direct_background_continues_silently_and_delivers_later(tmp_path: Path,
 
     assert elapsed < 0.08
     assert sent == []
+    deadline = time.monotonic() + 1
+    while timeouts != [60] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert timeouts == [60]
 
     deadline = time.monotonic() + 1
@@ -4431,3 +4459,197 @@ def test_public_sources_do_not_expose_private_prompt_names() -> None:
         lowered = text.lower()
         for needle in forbidden:
             assert needle.lower() not in lowered, f"{needle!r} leaked in {path}"
+
+
+def test_codex_model_command_switches_model_and_persists(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, model="gpt-5.5", allowed_models=("gpt-5.5", "gpt-6-astra"))
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_model", [])
+    )
+    assert "gpt-5.5" in reply
+    assert "gpt-6-astra" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        _policy(),
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-9-nope"]),
+    )
+    assert "不在可选列表" in reply
+    assert service.config.model == "gpt-5.5"
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        _policy(),
+        chat,
+        owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-6-astra"]),
+    )
+    assert "gpt-6-astra" in reply
+    service.refresh_runtime_config(conn)
+    assert service.config.model == "gpt-6-astra"
+    assert service.app_server is not None
+    assert service.app_server.config is service.config
+
+    restarted = codex_telegram_bot.BotService(cfg)
+    assert restarted.config.model == "gpt-6-astra"
+
+
+def test_codex_model_command_requires_owner_and_supports_reset(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, model="gpt-5.5", allowed_models=("gpt-5.5",))
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    codex_telegram_bot.upsert_chat(conn, chat)
+    allowed_non_owner = codex_telegram_bot.Sender("222", "Friend", False)
+    policy = codex_telegram_bot.AccessPolicy(
+        dm_policy="allowlist",
+        group_policy="decide",
+        allowed_users={"111", "222"},
+        allowed_chats={"-100"},
+        allowed_bots=set(),
+        bot_policy="ai-decide",
+    )
+
+    reply = codex_telegram_bot.handle_command(
+        conn,
+        cfg,
+        policy,
+        chat,
+        allowed_non_owner,
+        codex_telegram_bot.Command("codex_model", ["gpt-5.5"]),
+    )
+    assert "owner" in reply
+
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, policy, chat, owner, codex_telegram_bot.Command("codex_model", ["gpt-5.5"])
+    )
+    assert "gpt-5.5" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, policy, chat, owner, codex_telegram_bot.Command("codex_model", ["default"])
+    )
+    assert "gpt-5.5" in reply
+    service = codex_telegram_bot.BotService(cfg)
+    assert service.config.model == "gpt-5.5"
+
+
+def test_codex_effort_command_switches_scopes_and_persists(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, effort="high", private_effort="high", task_effort="xhigh")
+    conn = _conn(tmp_path)
+    chat = codex_telegram_bot.Chat("-100", "supergroup", "Release Room")
+    owner = codex_telegram_bot.Sender("111", "Owner", False)
+    codex_telegram_bot.upsert_chat(conn, chat)
+    service = codex_telegram_bot.BotService(cfg)
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", [])
+    )
+    assert "high" in reply
+    assert "xhigh" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["turbo"])
+    )
+    assert "只能是" in reply
+
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["low"])
+    )
+    assert "low" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["private", "medium"])
+    )
+    assert "私聊" in reply
+    reply = codex_telegram_bot.handle_command(
+        conn, cfg, _policy(), chat, owner, codex_telegram_bot.Command("codex_effort", ["task", "high"])
+    )
+    assert "任务" in reply
+
+    service.refresh_runtime_config(conn)
+    assert service.config.effort == "low"
+    assert service.config.private_effort == "medium"
+    assert service.config.task_effort == "high"
+
+    restarted = codex_telegram_bot.BotService(cfg)
+    assert restarted.config.effort == "low"
+    assert restarted.config.private_effort == "medium"
+    assert restarted.config.task_effort == "high"
+
+
+def test_load_config_parses_allowed_models(tmp_path: Path, monkeypatch) -> None:
+    for name in (
+        "CODEX_TELEGRAM_ENGINE",
+        "CODEX_TELEGRAM_SESSION_SCOPE",
+        "CODEX_TELEGRAM_ALLOWED_MODELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
+    assert cfg.allowed_models == ()
+
+    monkeypatch.setenv("CODEX_TELEGRAM_ALLOWED_MODELS", "gpt-5.5, gpt-6-astra")
+    cfg = codex_telegram_bot.load_config(tmp_path, require_ready=False)
+    assert cfg.allowed_models == ("gpt-5.5", "gpt-6-astra")
+
+
+def test_default_codex_bin_prefers_windows_npm_wrapper(tmp_path: Path, monkeypatch) -> None:
+    fake_npm_bin = tmp_path / "npm" / "codex.cmd"
+    fake_npm_bin.parent.mkdir()
+    fake_npm_bin.write_text("rem npm shim", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(codex_telegram_bot, "CHATGPT_APP_BIN", tmp_path / "missing-chatgpt")
+    monkeypatch.setattr(codex_telegram_bot, "CODEX_APP_BIN", tmp_path / "missing-codex")
+
+    assert codex_telegram_bot.default_codex_bin() == str(fake_npm_bin)
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "empty-appdata"))
+    assert codex_telegram_bot.default_codex_bin() == "codex"
+
+
+def test_bot_command_menu_payload_is_valid() -> None:
+    commands = codex_telegram_bot.BOT_COMMAND_MENU
+    assert 1 <= len(commands) <= 100
+    seen: set[str] = set()
+    for item in commands:
+        name = item["command"]
+        assert codex_telegram_bot.re.fullmatch(r"[a-z0-9_]{1,32}", name), name
+        assert name not in seen, name
+        seen.add(name)
+        assert 1 <= len(item["description"]) <= 256
+
+
+def test_sync_bot_command_menu_sends_payload_and_swallows_errors(tmp_path: Path, monkeypatch) -> None:
+    service = codex_telegram_bot.BotService(_config(tmp_path))
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_telegram_api(token, method, payload):
+        calls.append((token, method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(codex_telegram_bot, "telegram_api", fake_telegram_api)
+    service.sync_bot_command_menu()
+    assert calls == [
+        (
+            service.config.token,
+            "setMyCommands",
+            {
+                "commands": json.dumps(
+                    list(codex_telegram_bot.BOT_COMMAND_MENU), ensure_ascii=False
+                )
+            },
+        )
+    ]
+
+    def failing_telegram_api(token, method, payload):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(codex_telegram_bot, "telegram_api", failing_telegram_api)
+    service.sync_bot_command_menu()
