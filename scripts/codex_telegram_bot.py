@@ -38,6 +38,18 @@ SERVICE_TITLE = "Codex Telegram"
 DEFAULT_STATE_DIR = Path.home() / ".codex" / "channels" / SERVICE_NAME
 DEFAULT_WAKE_PHRASES = "codex,assistant,bot"
 PUBLIC_COMMAND_PREFIX = "codex"
+BOT_COMMAND_MENU: tuple[dict[str, str], ...] = (
+    {"command": "start", "description": "Introduce the bridge and commands"},
+    {"command": "codex_status", "description": "Show bot state, session, and last run"},
+    {"command": "codex_new", "description": "Start a fresh Codex session next message"},
+    {"command": "codex_model", "description": "Show or switch the Codex model (owner)"},
+    {"command": "codex_effort", "description": "Show or switch reasoning effort (owner)"},
+    {"command": "codex_mode", "description": "Set group trigger: decide|smart|mention (owner)"},
+    {"command": "codex_batch", "description": "Set group batching: single|batch (owner)"},
+    {"command": "codex", "description": "Set reply bubble shape: auto|single|multi (owner)"},
+    {"command": "codex_debug", "description": "Show or hide raw Desktop prompts (owner)"},
+    {"command": "codex_help", "description": "List all bridge commands"},
+)
 DEFAULT_CONTEXT_MESSAGES = 24
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
@@ -13276,6 +13288,18 @@ class BotService:
             if self.app_server is not None:
                 self.app_server.config = latest
 
+    def sync_bot_command_menu(self) -> None:
+        params = {
+            # telegram_api posts form-encoded params, so nested values must be
+            # pre-serialized, matching how react and the media tools send JSON.
+            "commands": json.dumps(list(BOT_COMMAND_MENU), ensure_ascii=False)
+        }
+        try:
+            telegram_api(self.config.token, "setMyCommands", params)
+            print(f"{utc_now()} synced {len(BOT_COMMAND_MENU)} bot commands to Telegram menu", flush=True)
+        except Exception as exc:
+            print(f"{utc_now()} bot command menu sync error: {exc}", file=sys.stderr, flush=True)
+
     def refresh_bot_info(self, conn: sqlite3.Connection) -> bool:
         try:
             result = telegram_api(self.config.token, "getMe", {})
@@ -13375,6 +13399,7 @@ class BotService:
                 f"({self.bot_id or 'unknown'})",
                 flush=True,
             )
+            self.sync_bot_command_menu()
             if self.config.desktop_outbound:
                 threading.Thread(target=self.desktop_outbound_loop, daemon=True).start()
             if self.config.auto_worker:

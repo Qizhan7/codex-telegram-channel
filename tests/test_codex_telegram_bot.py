@@ -4612,3 +4612,44 @@ def test_default_codex_bin_prefers_windows_npm_wrapper(tmp_path: Path, monkeypat
 
     monkeypatch.setenv("APPDATA", str(tmp_path / "empty-appdata"))
     assert codex_telegram_bot.default_codex_bin() == "codex"
+
+
+def test_bot_command_menu_payload_is_valid() -> None:
+    commands = codex_telegram_bot.BOT_COMMAND_MENU
+    assert 1 <= len(commands) <= 100
+    seen: set[str] = set()
+    for item in commands:
+        name = item["command"]
+        assert codex_telegram_bot.re.fullmatch(r"[a-z0-9_]{1,32}", name), name
+        assert name not in seen, name
+        seen.add(name)
+        assert 1 <= len(item["description"]) <= 256
+
+
+def test_sync_bot_command_menu_sends_payload_and_swallows_errors(tmp_path: Path, monkeypatch) -> None:
+    service = codex_telegram_bot.BotService(_config(tmp_path))
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_telegram_api(token, method, payload):
+        calls.append((token, method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(codex_telegram_bot, "telegram_api", fake_telegram_api)
+    service.sync_bot_command_menu()
+    assert calls == [
+        (
+            service.config.token,
+            "setMyCommands",
+            {
+                "commands": json.dumps(
+                    list(codex_telegram_bot.BOT_COMMAND_MENU), ensure_ascii=False
+                )
+            },
+        )
+    ]
+
+    def failing_telegram_api(token, method, payload):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(codex_telegram_bot, "telegram_api", failing_telegram_api)
+    service.sync_bot_command_menu()
