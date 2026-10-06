@@ -9,7 +9,7 @@ the repo.
 
 ## Features
 
-- Telegram text, photos, files, albums, reactions, and edited messages.
+- Telegram text, persistent Rich Messages, photos, files, albums, reactions, and edited messages.
 - Codex app-server backend with `CODEX_TELEGRAM_ENGINE=app-server`.
 - One merged Codex Desktop thread across Telegram chats with
   `CODEX_TELEGRAM_SESSION_SCOPE=shared`.
@@ -18,8 +18,10 @@ the repo.
     Codex thread in Desktop.
   - `CODEX_TELEGRAM_DESKTOP_OUTBOUND=1` mirrors new user text typed into that
     shared Desktop thread back to the current active Telegram chat.
-- Visible Telegram tools: `reply`, `send_photos`, `send_files`, `react`, and
-  `edit_message`.
+- Visible Telegram tools: `reply`, `rich_reply`, `send_photos`, `send_files`,
+  `react`, `edit_message`, and `edit_rich_message`.
+- Retained per-turn progress messages that stream the model's visible
+  commentary and fold into a collapsed summary when the turn ends.
 - Three group chat modes:
   - `decide`: every allowed group message enters Codex; the model decides
     whether a visible reply helps.
@@ -37,8 +39,10 @@ the repo.
   resident Codex thread first. If the resident judges that a separate worker
   would help, it asks for owner confirmation naturally; only after confirmation
   does it start a worker. Running checks are bridge-only, transient failures get
-  at most one retry, hard failures open a circuit, and every terminal state gets
-  one visible closure update.
+  at most one retry, and hard failures open a circuit. Successful read-only work
+  gets one deterministic closure summary without another resident model turn;
+  writes, retries, failures, uncertainty, owner choices, and external-app work
+  enter the resident once for review.
 - Public, neutral base prompt: the model is a generic Codex collaborator reached
   through Telegram, with no private persona dependency.
 
@@ -46,7 +50,8 @@ the repo.
 
 ```text
 scripts/codex_telegram_bot.py      # service, CLI, app-server bridge
-tests/test_codex_telegram_bot.py   # unit tests
+scripts/session_budget.py          # shared-session content budget counter
+tests/                             # unit tests
 docs/CODEX_TELEGRAM_BOT.md         # setup and operations guide
 launchd/com.codex.telegram.plist   # macOS LaunchAgent template
 config/*.example                   # safe config examples
@@ -73,8 +78,10 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install "pytest>=8"
 ```
 
-The app-server path has no third-party runtime dependency; `pytest` is only for
-the included verification suite.
+The app-server path has no required third-party runtime dependency; `pytest` is
+only for the included verification suite. Optionally install `tiktoken`
+(`.venv/bin/python -m pip install "tiktoken>=0.9"`) for exact token counts in
+the shared-session content budget; without it the bridge uses an estimate.
 
 On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python` and
 see [WINDOWS.md](WINDOWS.md) for background service scripts (`start_windows.ps1`,
@@ -117,8 +124,8 @@ run the included checks:
 ```bash
 .venv/bin/python scripts/codex_telegram_bot.py get-me
 .venv/bin/python scripts/codex_telegram_bot.py doctor
-.venv/bin/python -m py_compile scripts/codex_telegram_bot.py
-.venv/bin/python -m pytest -q tests/test_codex_telegram_bot.py
+.venv/bin/python -m py_compile scripts/codex_telegram_bot.py scripts/session_budget.py
+.venv/bin/python -m pytest -q
 ```
 
 Fix any `doctor` failure before continuing.
@@ -156,14 +163,20 @@ launchctl kickstart -k gui/$(id -u)/com.codex.telegram
 
 ## Commands
 
+The main commands are registered with Telegram's command menu at startup.
+
+- `/status`: show Codex account usage limits (owner, private chat).
 - `/codex_status`: show bot state.
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind to a Codex session.
-- `/codex_rollover`: start a clean shared session with a short handoff.
+- `/codex_rollover`: hand the shared session over to a fresh thread with a
+  summary before the next turn.
+- `/codex_model [model]`: show or switch the Codex model (owner).
+- `/codex_effort [private|task] low|medium|high|xhigh`: show or switch
+  reasoning effort (owner).
 - `/codex_mode decide|smart|mention`: set group trigger mode.
 - `/codex_batch single|batch|status`: set group batching.
 - `/codex auto|single|multi|status`: set visible reply bubble shape.
-- `/codex_debug on|off|status`: show or hide raw Desktop prompts.
 - `/codex_off` / `/codex_on`: disable or re-enable the chat.
 
 ## Group Modes
@@ -183,10 +196,15 @@ use `/codex_batch single` to return to immediate one-by-one handling.
 
 Private messages use a separate 2-second quiet window by default
 (`CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS=2`). Messages sent together are
-passed to Codex as one ordered batch; group behavior is unchanged.
+passed to Codex as one ordered batch; group behavior is unchanged. Processing
+batches and explicit recent-message context never mix Telegram chats.
 
-For shared app-server sessions, two consecutive stream/remote-compact failures
-retire the unhealthy thread and create a continuity handoff for the next turn.
+App-server mode also creates one new retained progress message per private turn
+and per explicitly addressed human group turn. It edits that message from
+user-visible `commentary` deltas, keeps hidden reasoning and the final answer
+out, then leaves the completed process as a collapsed Rich Message in the chat.
+If Rich Messages are unavailable, it falls back to retained plain-text edits.
+Disable it with `CODEX_TELEGRAM_STREAM_PROGRESS=0`.
 
 `smart` uses `CODEX_TELEGRAM_WAKE_PHRASES` and the optional
 `CODEX_TELEGRAM_WATCH_PHRASES_PATH` file. Wake phrases are simple consecutive
@@ -224,3 +242,24 @@ messages.
   `owner_private` / `dm` when exactly one owner is configured.
 - `mcp-channel` is only needed for the older `exec` channel-tool path and
   requires the optional `mcp` Python package.
+- After each start the bridge sends the owner one short "restarted" private
+  message (at most once per minute); set `CODEX_TELEGRAM_READY_NOTICE=0` to
+  turn it off.
+
+### Shared-session lifetime
+
+`CODEX_TELEGRAM_ROLLOVER_NEW_CONTENT_TOKENS=1000000` replaces the old
+`CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS` threshold. The shared thread keeps using
+Codex's native automatic compaction, and the bridge prepares a handover to a
+fresh thread only after this much newly appended content (new user-input text,
+textual tool results, and generated output; not history replay or images) has
+accumulated. The count is durable in `chats.sqlite`; `0` disables it.
+
+A handover waits until earlier deliveries have finished and the old thread is
+idle, then a read-only ephemeral fork writes a source-labeled summary that the
+new thread starts from. Failed preparation keeps the old thread and retries no
+sooner than five minutes later; `/codex_rollover` requests the same path.
+Inference errors keep the current thread; only a stored thread that can no
+longer be resumed is replaced, once. Native Codex transcript files are never
+rewritten by the bridge. See [the operations guide](docs/CODEX_TELEGRAM_BOT.md)
+for details.

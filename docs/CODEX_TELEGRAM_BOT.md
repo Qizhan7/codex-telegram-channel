@@ -33,6 +33,10 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install "pytest>=8"
 ```
 
+Optionally install `tiktoken` (`.venv/bin/python -m pip install "tiktoken>=0.9"`)
+so the shared-session content budget counts text with the exact `o200k_base`
+tokenizer; without it the bridge uses a byte-based estimate.
+
 Create the private config skeleton:
 
 ```bash
@@ -59,8 +63,8 @@ verify the bot and configuration:
 ```bash
 .venv/bin/python scripts/codex_telegram_bot.py get-me
 .venv/bin/python scripts/codex_telegram_bot.py doctor
-.venv/bin/python -m py_compile scripts/codex_telegram_bot.py
-.venv/bin/python -m pytest -q tests/test_codex_telegram_bot.py
+.venv/bin/python -m py_compile scripts/codex_telegram_bot.py scripts/session_budget.py
+.venv/bin/python -m pytest -q
 ```
 
 Start the foreground service and send the bot a private message:
@@ -105,9 +109,12 @@ CODEX_TELEGRAM_CONTEXT_MESSAGES=24
 CODEX_TELEGRAM_SHARED_CONTEXT_MESSAGES=8
 CODEX_TELEGRAM_STEADY_CONTEXT_MESSAGES=0
 CODEX_TELEGRAM_CONTEXT_TEXT_CHARS=800
-CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000
+CODEX_TELEGRAM_ROLLOVER_NEW_CONTENT_TOKENS=1000000
 CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5
 CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS=2
+CODEX_TELEGRAM_STREAM_PROGRESS=1
+CODEX_TELEGRAM_PROGRESS_EDIT_INTERVAL_SECONDS=0.8
+CODEX_TELEGRAM_READY_NOTICE=1
 CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS=1.5
 CODEX_TELEGRAM_DENY_UNKNOWN=0
 CODEX_TELEGRAM_IGNORE_USER_CONFIG=1
@@ -200,9 +207,38 @@ your `CODEX_TELEGRAM_WAKE_PHRASES` list includes topical words for `smart`.
 
 Private messages sent within the configured 2-second quiet window are merged into one Codex turn, so short multi-message thoughts are read together. Group batching remains controlled per chat with `/codex_batch`.
 
+Pulled Telegram updates are processed as chat-local batches, and each Codex
+turn receives recent messages and relationship rows from that chat only. Shared
+session mode still keeps one long-lived Codex thread, but turn prompts no longer
+carry a mixed-chat recent-message block.
+
 Each group turn can include a `<recent_chat_window>` block with the last five
-same-chat messages before the trigger or batch, so Codex has the local
-conversation lead-in when deciding.
+same-chat messages before the trigger or batch that are not already in the
+recent context, so Codex has the local conversation lead-in when deciding.
+Photos and files attached to same-chat context messages are downloaded when a
+turn includes those messages, so the prompt carries their local paths.
+
+If a private turn fails because the Codex account is out of usage quota, the
+bridge sends one clear quota message instead of a retry prompt. When quota
+returns, `decide` groups do not backfill the messages that piled up during the
+outage; private chats and `smart`/`mention` groups keep their normal history.
+
+## Progress Messages
+
+With `CODEX_TELEGRAM_STREAM_PROGRESS=1` (app-server engine), private turns and
+explicitly addressed human group turns create a retained progress message after
+the app-server emits its first visible `commentary` text. Hidden reasoning and
+the `final_answer` are excluded, and the normal Telegram result remains a
+separate reply. Failures that happen before real commentary, including an
+exhausted usage quota, do not leave a generic progress template behind.
+
+The bridge streams the active process through persistent Rich Message edits at
+most every `CODEX_TELEGRAM_PROGRESS_EDIT_INTERVAL_SECONDS` and folds the
+completed process into a closed `details` block that stays in the chat. If the
+Rich Message endpoint fails or the process outgrows its rich-text limit, the
+same turn falls back to retained plain-text edits and 4096-character overflow
+messages. If the service restarts mid-turn, the existing progress message is
+edited to say the turn was interrupted.
 
 For `decide` and `smart` to receive ordinary group messages, disable Telegram
 BotFather privacy mode for the bot or otherwise make sure the bot can read all
@@ -216,13 +252,13 @@ The public base prompt is neutral:
 You are a Codex collaborator reached through Telegram.
 ```
 
-Telegram only sees messages sent with the channel tools: `reply`,
-`send_photos`, `send_files`, `react`, and `edit_message`. Normal final answers
-stay in the private Codex transcript so Codex Desktop can show what happened.
-After visible tool calls, the model mirrors a short `TG sent: ...` summary into
-the private transcript.
+Telegram only sees messages sent with the channel tools: `reply`, `rich_reply`,
+`send_photos`, `send_files`, `react`, `edit_message`, and
+`edit_rich_message`. Normal final answers stay in the private Codex transcript
+so Codex Desktop can show what happened. After visible tool calls, the model
+mirrors a short `TG sent: ...` summary into the private transcript.
 
-The prompt includes source-labeled Telegram context, current chat metadata,
+The prompt includes source-labeled current-chat Telegram context, current chat metadata,
 the group `<recent_chat_window>` when applicable, attachment paths when files
 are downloaded, and a compact instruction describing whether silence is
 acceptable for the current turn.
@@ -254,11 +290,27 @@ Workers run with Telegram channel tools disabled. They only write private worker
 output; Telegram messages always come from the Telegram resident through the
 normal channel tools. When the resident starts a worker, the bridge schedules a
 private supervisor alarm. Running workers are rechecked by the bridge without
-opening resident model turns. A clearly transient failure is retried once;
+opening resident model turns. Refreshed worker state is also injected into later
+resident turns, so routine routing uses that state directly instead of issuing
+another status call or alarm. A clearly transient failure is retried once;
 configuration, version, permission, and file-descriptor failures open the retry
-circuit immediately. Completion and needs-input states enter the shared resident
-thread once for review. If that review emits no visible message, the bridge sends
-a deterministic terminal summary so the task cannot disappear silently.
+circuit immediately.
+
+The bridge records a completion-delivery policy when each worker starts. A
+successful task with explicit read-only scope is sent as a deterministic terminal
+summary, without waking the resident. Code/configuration/data changes, service or
+external actions, failed checks, retries, ambiguous scope, failures,
+`needs_input`, and legacy worker records enter the shared resident thread once for
+review. Runtime file-change events override a read-only classification. The
+terminal state and worker result are injected into that review turn, so the
+resident does not need a separate worker-status call. If review emits no visible
+message, the bridge still sends the deterministic terminal summary so the task
+cannot disappear silently.
+
+Worker prompts bound discovery: workers inspect exact paths supplied by the task
+first, never recursively scan a whole home or app-state directory, cap each
+read-only search at about 30 seconds, and report `unknown` with the checked
+scope instead of widening the search.
 
 `CODEX_TELEGRAM_AUTO_WORKER=0` is the default. The legacy auto-worker
 supervision loop can still be enabled to migrate old `auto_delivery` records,
@@ -301,8 +353,8 @@ marketplace containing exactly that one plugin. It derives the connector id
 from the installed plugin manifest, disables all other apps by default, starts
 a separate app-server with an ephemeral thread and no Telegram dynamic tools,
 then terminates that app-server when the worker exits. The capability worker
-cannot be resumed. Its private result is reviewed by the resident through the
-normal worker status path.
+cannot be resumed. Its private result always enters resident review with the
+refreshed terminal state already attached.
 
 This is a process and context boundary, not a dynamic edit of the resident's
 global config. The Desktop plugin registry is read only to resolve an
@@ -337,12 +389,41 @@ rest of the user config. The bridge refuses to replace an existing non-link
 start from accumulating unrelated MCP child processes and file descriptors.
 
 With `CODEX_TELEGRAM_SESSION_SCOPE=shared`, private chats and group chats use
-one shared Codex session. Recent context remains source-labeled by chat id, chat
-type, title, sender, and message id, so the model can distinguish where each
-message came from while keeping one continuous thread.
+one shared Codex session. Each turn's recent context comes from the current
+chat only and stays source-labeled by chat id, chat type, title, sender, and
+message id, so the model knows where each message came from while keeping one
+continuous thread.
 
 Set `CODEX_TELEGRAM_SESSION_SCOPE=per-chat` if each Telegram chat should use its
 own Codex thread.
+
+### Shared-session lifetime
+
+The shared thread relies on Codex's native automatic compaction. The bridge
+prepares a handover to a fresh thread only after the thread has accumulated
+`CODEX_TELEGRAM_ROLLOVER_NEW_CONTENT_TOKENS` (default `1000000`) of newly
+appended content; `0` disables the automatic handover. This replaces the old
+`CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS` threshold, which is no longer read.
+
+The counter is durable in `chats.sqlite`. It counts new user-input text and
+textual tool results as `o200k_base` tokens (exact with `tiktoken` installed,
+estimated otherwise) plus reported generated output tokens, including
+reasoning. Binary images/audio, history replay, and compaction output are not
+counted, so this is a stable content budget, not billed input or the live
+context size. `/codex_status` shows the current counts.
+
+Before switching, every earlier delivery must have a terminal result and the old
+thread must be idle with no running background terminals. A read-only,
+ephemeral fork of the old thread writes a source-labeled summary; the summary and
+the candidate thread are saved before the shared mapping is switched in one
+transaction. If preparation fails, the old thread stays active and the bridge
+retries no sooner than five minutes later. `/codex_rollover` requests the same
+handover before the next turn.
+
+Inference errors (transport, account/model, remote compaction) keep the current
+thread. Only a stored thread that can no longer be resumed is replaced, once;
+the replacement id is recorded before inference so a failing first response
+cannot keep creating new threads.
 
 ## Desktop Sync
 
@@ -352,6 +433,10 @@ Telegram-backed sessions:
 - shared sessions are titled `Telegram Codex - All Chats`;
 - per-chat sessions are titled `Telegram Codex - <chat title>`;
 - previews show the current Telegram source label and message preview.
+
+Native rollout transcripts belong to the app-server and are never rewritten by
+the bridge, so Desktop shows each Telegram turn's prompt exactly as Codex
+recorded it.
 
 `CODEX_TELEGRAM_DESKTOP_OUTBOUND=1` tails the shared Codex Desktop rollout file
 from a stored offset and mirrors new Desktop-authored user text back to the
@@ -364,11 +449,30 @@ The outbound path skips historical content, Telegram `<channel>` inbound events,
 `(silent)` final answers. Telegram messages are still sent by the bot account,
 not by a personal Telegram account.
 
+## Rich Messages
+
+`rich_reply` sends a formal, persistent Telegram Rich Message and returns its
+`message_id` when current-chat delivery completes immediately.
+`edit_rich_message` updates a bot-sent rich message in place. Supply exactly one
+of `markdown`, `html`, or `blocks`; native blocks cover tables, mathematical
+expressions, lists/checklists, quotations, and collapsible `details`. Use the
+ordinary `reply` tool for source code and commands intended for copy/paste.
+
+The bridge deliberately does not expose `sendRichMessageDraft`: drafts are
+private-chat-only, expire after about 30 seconds, and do not satisfy the retained
+per-turn process history contract.
+
+Rich events use the same current-chat aliases, target allowlist, thread/reply
+handling, system-prompt-echo guard, retry path, and `channel_deliveries` ledger
+as ordinary replies.
+
 ## Media And Files
 
 Incoming Telegram photos, documents, video, audio, voice, stickers, and albums
 are stored under the private `incoming/` directory. Codex receives compact
-metadata plus local paths when a turn needs the files.
+metadata plus local paths when a turn needs the files. Transient network or
+Telegram 5xx errors during `getFile` or the download itself are retried up to
+three attempts with a short backoff; permanent errors are reported at once.
 
 Outbound file tools accept local paths and `file://` URI objects. Use:
 
@@ -382,10 +486,16 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 
 ## Commands
 
-- `/codex_status`: show bot state, policy, session, Desktop sync, and last run.
+The bridge registers its main commands with Telegram's command menu at startup.
+
+- `/status`: show the Codex account usage windows, used/remaining percentage,
+  and reset times (owner, private chat only; app-server engine).
+- `/codex_status`: show bot state, policy, session, Desktop sync, content budget,
+  and last run.
 - `/codex_new`: start a fresh Codex session on the next message.
 - `/codex_resume <session_id>`: bind the chat or shared context to a session.
-- `/codex_rollover`: start a clean shared session with a bounded handoff.
+- `/codex_rollover`: hand the shared session over to a fresh thread with a
+  summary before the next turn (see Shared-session lifetime).
 - `/codex_model [model]`: show the current model and optional allowlist, or
   switch the model. The choice is owner-only, applies from the next message,
   and survives bridge restarts.
@@ -394,7 +504,6 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 - `/codex_mode decide|smart|mention`: set group trigger behavior.
 - `/codex_batch single|batch|status`: switch group batching behavior.
 - `/codex auto|single|multi|status`: switch visible reply bubble shape.
-- `/codex_debug on|off|status`: show or hide raw Desktop prompts.
 - `/codex_probe_channel`: run a reply-tool probe.
 - `/codex_off` / `/codex_on`: disable or re-enable the chat.
 
@@ -403,8 +512,8 @@ The tool surface accepts common aliases such as `files`, `file_paths`, `paths`,
 Static checks:
 
 ```bash
-python3.12 -m py_compile scripts/codex_telegram_bot.py
-python3.12 -m pytest -q tests/test_codex_telegram_bot.py
+python3.12 -m py_compile scripts/codex_telegram_bot.py scripts/session_budget.py
+python3.12 -m pytest -q
 ```
 
 Bot API identity:
@@ -454,6 +563,12 @@ instance from a Desktop/local terminal, not from a Telegram worker:
 ```bash
 launchctl kickstart -k gui/$(id -u)/<launchd-label>
 ```
+
+When the service starts and reaches Telegram, each owner receives one short
+"bridge restarted" private message (at most once per minute, so restart loops
+do not spam). Set `CODEX_TELEGRAM_READY_NOTICE=0` to turn this off. Private turns
+cut off by the restart get an interruption notice, and a cut-off turn's progress
+message is edited to say so.
 
 Then confirm a new PID, inspect the service error log for startup errors, and
 from the owner private chat request a read-only task that genuinely needs the
