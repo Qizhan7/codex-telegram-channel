@@ -7,6 +7,7 @@ dependencies = []
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+tokens = ["tiktoken>=0.9"]
 test = ["pytest>=8.0"]
 
 [tool.setuptools]
@@ -15,3 +16,4 @@ packages = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["scripts"]

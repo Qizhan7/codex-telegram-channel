@@ -8,6 +8,7 @@ label under a private runtime state directory.
 from __future__ import annotations
 
 import argparse
+import errno
 import html
 import json
 import mimetypes
@@ -32,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import session_budget  # sibling module in scripts/
+
 
 SERVICE_NAME = "codex-telegram"
 SERVICE_TITLE = "Codex Telegram"
@@ -40,6 +43,7 @@ DEFAULT_WAKE_PHRASES = "codex,assistant,bot"
 PUBLIC_COMMAND_PREFIX = "codex"
 BOT_COMMAND_MENU: tuple[dict[str, str], ...] = (
     {"command": "start", "description": "Introduce the bridge and commands"},
+    {"command": "status", "description": "Show Codex usage limits (owner private chat)"},
     {"command": "codex_status", "description": "Show bot state, session, and last run"},
     {"command": "codex_new", "description": "Start a fresh Codex session next message"},
     {"command": "codex_model", "description": "Show or switch the Codex model (owner)"},
@@ -47,16 +51,15 @@ BOT_COMMAND_MENU: tuple[dict[str, str], ...] = (
     {"command": "codex_mode", "description": "Set group trigger: decide|smart|mention (owner)"},
     {"command": "codex_batch", "description": "Set group batching: single|batch (owner)"},
     {"command": "codex", "description": "Set reply bubble shape: auto|single|multi (owner)"},
-    {"command": "codex_debug", "description": "Show or hide raw Desktop prompts (owner)"},
     {"command": "codex_help", "description": "List all bridge commands"},
 )
 DEFAULT_CONTEXT_MESSAGES = 24
 DEFAULT_SHARED_CONTEXT_MESSAGES = 8
 DEFAULT_STEADY_CONTEXT_MESSAGES = 0
 DEFAULT_CONTEXT_TEXT_CHARS = 800
-DEFAULT_ROLLOVER_INPUT_TOKENS = 200_000
-HANDOFF_MAX_INBOUND_MESSAGES = 6
-HANDOFF_MAX_VISIBLE_REPLIES = 2
+DEFAULT_ROLLOVER_NEW_CONTENT_TOKENS = 1_000_000
+HANDOFF_MAX_INBOUND_MESSAGES = 8
+HANDOFF_MAX_VISIBLE_REPLIES = 4
 HANDOFF_CONTEXT_TEXT_CHARS = 160
 HANDOFF_CONTEXT_LINE_CHARS = 220
 HANDOFF_DELIVERY_TEXT_CHARS = 120
@@ -76,11 +79,31 @@ CODEX_APP_BIN = Path("/Applications/Codex.app/Contents/Resources/codex")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TELEGRAM_MAX_MESSAGE = 4096
 TELEGRAM_MAX_CAPTION = 1024
+TELEGRAM_RICH_MAX_TEXT = 32768
+TELEGRAM_RICH_MAX_BLOCKS = 500
 TELEGRAM_SLOW_SEND_SECONDS = 5.0
 POLL_ERROR_BACKOFF_SECONDS = 5.0
 POLL_PORT_EXHAUSTION_BACKOFF_BASE_SECONDS = 120.0
 POLL_PORT_EXHAUSTION_BACKOFF_MAX_SECONDS = 900.0
 TELEGRAM_INBOUND_FILE_MAX_BYTES = 50_000_000
+TELEGRAM_INBOUND_DOWNLOAD_ATTEMPTS = 3
+TELEGRAM_INBOUND_DOWNLOAD_RETRY_BASE_SECONDS = 0.5
+TELEGRAM_TRANSIENT_NETWORK_ERRNOS = frozenset(
+    value
+    for name in (
+        "ECONNABORTED",
+        "ECONNREFUSED",
+        "ECONNRESET",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
+        "ENETDOWN",
+        "ENETRESET",
+        "ENETUNREACH",
+        "EPIPE",
+        "ETIMEDOUT",
+    )
+    if (value := getattr(errno, name, None)) is not None
+)
 TELEGRAM_OUTBOUND_FILE_MAX_BYTES = 50_000_000
 TELEGRAM_OUTBOUND_PHOTO_MAX_BYTES = 10_000_000
 TELEGRAM_MEDIA_GROUP_MAX_ITEMS = 10
@@ -90,7 +113,16 @@ MIN_MEDIA_GROUP_DELAY_SECONDS = 0.5
 DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS = 20.0
 DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS = 3600
 DEFAULT_PRIVATE_BATCH_DELAY_SECONDS = 2.0
-SHARED_SESSION_FAILURE_ROLLOVER_THRESHOLD = 2
+DEFAULT_PROGRESS_EDIT_INTERVAL_SECONDS = 0.8
+PROGRESS_DELIVERY_EVENT_INDEX = -5
+PROGRESS_INITIAL_TEXT = "正在处理…"
+PROGRESS_DONE_TEXT = "✓ 处理完成"
+PROGRESS_FAILED_TEXT = "⚠️ 处理未完成"
+PROGRESS_USAGE_LIMIT_TEXT = "Codex 额度用完了，这轮没有处理。额度恢复后再发就行。"
+PROGRESS_INTERRUPTED_TEXT = "⚠️ 处理被服务重启打断"
+SERVICE_READY_NOTICE_TEXT = "Codex Telegram 桥已重启完成，可以继续用了。"
+SERVICE_READY_NOTICE_META_KEY = "service_ready_notice_at"
+SERVICE_READY_NOTICE_COOLDOWN_SECONDS = 60.0
 INTERRUPTED_BACKGROUND_NOTICE_TEXT = "刚才那件事被服务重启打断了，我没有拿到完成结果。需要继续的话，我会重新接着处理。"
 INTERRUPTED_TURN_NOTICE_TEXT = "刚才这轮被服务重启打断了，我没有拿到完成结果。需要继续的话，你直接续发一句。"
 DEFAULT_WAKE_WINDOW_SECONDS = 180.0
@@ -147,6 +179,7 @@ WAKE_WINDOW_OUTBOUND_METHODS = frozenset(
         "sendAnimation",
         "sendMediaGroup",
         "sendSticker",
+        "sendRichMessage",
         "editMessageText",
     }
 )
@@ -232,7 +265,15 @@ TELEGRAM_MESSAGE_UPDATE_TYPES = (
     "edited_channel_post",
 )
 TELEGRAM_EDITED_UPDATE_TYPES = {"edited_message", "edited_channel_post"}
-VISIBLE_CHANNEL_EVENT_TYPES = {"reply", "send_photos", "send_files", "react", "edit_message"}
+VISIBLE_CHANNEL_EVENT_TYPES = {
+    "reply",
+    "rich_reply",
+    "send_photos",
+    "send_files",
+    "react",
+    "edit_message",
+    "edit_rich_message",
+}
 TELEGRAM_PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILE_PATH_OBJECT_KEYS = ("path", "file_path", "local_path", "uri", "file_uri", "url", "file_url", "image_url")
 FILE_PATH_WRAPPER_KEYS = (
@@ -372,7 +413,6 @@ NO_REPLY_SENTINEL = "[[NO_REPLY]]"
 DESKTOP_MIRROR_PREFIXES = ("TG sent:", "Telegram sent:")
 DESKTOP_SUPERSEDED_PREFIXES = ("TG skipped:", "Telegram skipped:")
 DESKTOP_OUTBOUND_PRIVATE_PREFIXES = DESKTOP_MIRROR_PREFIXES + DESKTOP_SUPERSEDED_PREFIXES
-DESKTOP_PROMPT_DEBUG_KEY = "desktop_prompt_debug"
 GROUP_RESPONSE_MODE_KEY_PREFIX = "group_response_mode:"
 GROUP_RESPONSE_MODES = {"batch", "single"}
 MESSAGE_SHAPE_KEY_PREFIX = "message_shape:"
@@ -451,8 +491,20 @@ WORKER_DELEGATION_GUIDANCE = (
     "When there is existing worker context, decide whether the owner is adding to that same task or asking for a "
     "separate task: continue the same task_id/session for confirmed same-task follow-up, or ask before starting a new "
     "worker for separate work. Give workers the concrete goal, cwd, relevant files, success signals, and a concise reporting format. "
-    "Inspect progress with codex_worker_status, set private worker alarms when another check would help, and report "
-    "back to Telegram yourself only when a visible update is useful."
+    "When exact paths are already known, pass them explicitly and require the worker to inspect those paths before any "
+    "bounded discovery instead of rediscovering the machine. Starting a worker already schedules one private supervisor "
+    "alarm, and worker context injected into later resident turns is refreshed by the bridge. Treat an injected running "
+    "state as current for routine routing; use codex_worker_status only when exact terminal output or a manual diagnosis is "
+    "needed, and use codex_worker_alarm only to recover a task that has no active alarm. Report back to Telegram yourself "
+    "only when a visible update is useful."
+)
+WORKER_DISCOVERY_GUIDANCE = (
+    "Search and discovery limits:\n"
+    "- Start with exact paths supplied by the task or supervisor. Inspect those first and do not rediscover known locations.\n"
+    "- Never recursively scan an entire home directory or a whole app-state directory such as `~/.codex`; do not run broad find/grep -R/rg across those roots.\n"
+    "- Bound every search by a specific directory, file type or name pattern, and an explicit maximum depth when using find.\n"
+    "- Stop or interrupt any single read-only search that reaches 30 seconds; do not let it run silently for minutes.\n"
+    "- If bounded searches do not locate the evidence, report `unknown` and the checked scope instead of widening the scan on speculation.\n"
 )
 CHANNEL_ADMIN_GUIDANCE = (
     "Telegram channel administration: Treat messages from the configured owner in private chat as a trusted place "
@@ -505,7 +557,6 @@ class Config:
     shared_context_messages: int
     steady_context_messages: int
     context_text_chars: int
-    rollover_input_tokens: int
     batch_delay_seconds: float
     private_batch_delay_seconds: float
     deny_unknown: bool
@@ -517,6 +568,10 @@ class Config:
     wake_phrases: tuple[str, ...]
     watch_phrases_path: Path
     codex_bin: str
+    rollover_new_content_tokens: int = DEFAULT_ROLLOVER_NEW_CONTENT_TOKENS
+    stream_progress: bool = True
+    ready_notice: bool = True
+    progress_edit_interval_seconds: float = DEFAULT_PROGRESS_EDIT_INTERVAL_SECONDS
     memory_dir: Path | None = None
     identity_wake_phrases: tuple[str, ...] = ()
     identity_aliases_path: Path | None = None
@@ -614,6 +669,14 @@ class MediaGroupState:
 
 
 @dataclass(frozen=True)
+class QueuedUpdateBatch:
+    """One durable poll checkpoint containing chat-local processing batches."""
+
+    chat_batches: tuple[tuple[dict[str, Any], ...], ...]
+    max_update_id: int | None
+
+
+@dataclass(frozen=True)
 class TelegramAttachment:
     kind: str
     file_id: str
@@ -640,10 +703,6 @@ class MediaFollowupTarget:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def rollout_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -790,10 +849,9 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             0,
             parse_int(env("CODEX_TELEGRAM_CONTEXT_TEXT_CHARS"), DEFAULT_CONTEXT_TEXT_CHARS),
         ),
-        rollover_input_tokens=max(
-            0,
-            parse_int(env("CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS"), DEFAULT_ROLLOVER_INPUT_TOKENS),
-        ),
+        rollover_new_content_tokens=max(0, parse_int(
+            env("CODEX_TELEGRAM_ROLLOVER_NEW_CONTENT_TOKENS"), DEFAULT_ROLLOVER_NEW_CONTENT_TOKENS
+        )),
         batch_delay_seconds=max(0.2, parse_float(env("CODEX_TELEGRAM_BATCH_DELAY_SECONDS"), 2.5)),
         private_batch_delay_seconds=max(
             0.2,
@@ -817,6 +875,15 @@ def load_config(state_dir: Path = DEFAULT_STATE_DIR, *, require_ready: bool = Tr
             env("CODEX_TELEGRAM_WATCH_PHRASES_PATH", str(state_dir / "watch_phrases.txt"))
         ).expanduser(),
         codex_bin=env("CODEX_TELEGRAM_CODEX_BIN", default_codex_bin()),
+        stream_progress=parse_bool(env("CODEX_TELEGRAM_STREAM_PROGRESS"), default=True),
+        ready_notice=parse_bool(env("CODEX_TELEGRAM_READY_NOTICE"), default=True),
+        progress_edit_interval_seconds=max(
+            0.2,
+            parse_float(
+                env("CODEX_TELEGRAM_PROGRESS_EDIT_INTERVAL_SECONDS"),
+                DEFAULT_PROGRESS_EDIT_INTERVAL_SECONDS,
+            ),
+        ),
         memory_dir=Path(memory_dir_value).expanduser() if memory_dir_value else None,
         identity_wake_phrases=tuple(
             phrase.strip().lower()
@@ -921,6 +988,9 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     f"CODEX_TELEGRAM_DIRECT_BACKGROUND_AFTER_SECONDS={DEFAULT_DIRECT_BACKGROUND_AFTER_SECONDS:g}",
                     f"CODEX_TELEGRAM_DIRECT_BACKGROUND_TIMEOUT_SECONDS={DEFAULT_DIRECT_BACKGROUND_TIMEOUT_SECONDS}",
                     f"CODEX_TELEGRAM_PRIVATE_BATCH_DELAY_SECONDS={DEFAULT_PRIVATE_BATCH_DELAY_SECONDS:g}",
+                    "CODEX_TELEGRAM_STREAM_PROGRESS=1",
+                    "CODEX_TELEGRAM_READY_NOTICE=1",
+                    f"CODEX_TELEGRAM_PROGRESS_EDIT_INTERVAL_SECONDS={DEFAULT_PROGRESS_EDIT_INTERVAL_SECONDS:g}",
                     "CODEX_TELEGRAM_AUTO_WORKER=0",
                     f"CODEX_TELEGRAM_AUTO_WORKER_CHECK_SECONDS={DEFAULT_AUTO_WORKER_CHECK_SECONDS}",
                     f"CODEX_TELEGRAM_AUTO_WORKER_RESULT_CHARS={DEFAULT_AUTO_WORKER_RESULT_CHARS}",
@@ -928,7 +998,7 @@ def init_config(state_dir: Path = DEFAULT_STATE_DIR) -> None:
                     "CODEX_TELEGRAM_SHARED_CONTEXT_MESSAGES=8",
                     "CODEX_TELEGRAM_STEADY_CONTEXT_MESSAGES=0",
                     f"CODEX_TELEGRAM_CONTEXT_TEXT_CHARS={DEFAULT_CONTEXT_TEXT_CHARS}",
-                    "CODEX_TELEGRAM_ROLLOVER_INPUT_TOKENS=200000",
+                    "CODEX_TELEGRAM_ROLLOVER_NEW_CONTENT_TOKENS=1000000",
                     "CODEX_TELEGRAM_BATCH_DELAY_SECONDS=2.5",
                     f"CODEX_TELEGRAM_MEDIA_GROUP_DELAY_SECONDS={DEFAULT_MEDIA_GROUP_DELAY_SECONDS:g}",
                     "CODEX_TELEGRAM_DENY_UNKNOWN=0",
@@ -1072,7 +1142,10 @@ def db_schema_ready(conn: sqlite3.Connection) -> bool:
         str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     }
-    if not _DB_SCHEMA_TABLES.issubset(tables):
+    required_tables = _DB_SCHEMA_TABLES | {
+        "session_content_events", "session_content_state", "session_content_logs", "session_handovers",
+    }
+    if not required_tables.issubset(tables):
         return False
     for table, required_columns in _DB_SCHEMA_COLUMNS.items():
         columns = {
@@ -1085,6 +1158,7 @@ def db_schema_ready(conn: sqlite3.Connection) -> bool:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    session_budget.init(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS meta (
@@ -1201,14 +1275,6 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
-
-
-def desktop_prompt_debug_enabled(conn: sqlite3.Connection) -> bool:
-    return parse_bool(get_meta(conn, DESKTOP_PROMPT_DEBUG_KEY), default=False)
-
-
-def set_desktop_prompt_debug(conn: sqlite3.Connection, enabled: bool) -> None:
-    set_meta(conn, DESKTOP_PROMPT_DEBUG_KEY, "1" if enabled else "0")
 
 
 def set_runtime_model(conn: sqlite3.Connection, model: str) -> None:
@@ -1642,17 +1708,9 @@ def latest_chat_session_for_engine(conn: sqlite3.Connection, engine: str) -> str
     return str(row["codex_session_id"]) if row else None
 
 
-def session_for_engine(
-    conn: sqlite3.Connection,
-    chat_row: sqlite3.Row,
-    config: Config,
-) -> str | None:
+def session_for_engine(conn: sqlite3.Connection, chat_row: sqlite3.Row, config: Config) -> str | None:
     if config.session_scope == "shared":
-        return (
-            shared_session_for_engine(conn, config.engine)
-            or latest_chat_session_for_engine(conn, config.engine)
-            or chat_session_for_engine(chat_row, config.engine)
-        )
+        return shared_session_for_engine(conn, config.engine)
     return chat_session_for_engine(chat_row, config.engine)
 
 
@@ -1948,115 +2006,75 @@ def local_context_noise_filter_sql(message_alias: str = "m") -> tuple[str, tuple
     )
 
 
-def recent_context_messages(
+def latest_successful_run_started_at(
     conn: sqlite3.Connection,
     chat_id: str,
-    limit: int,
-    config: Config,
-    *,
-    exclude: set[tuple[str, int]] | None = None,
-    after: str | None = None,
-) -> list[sqlite3.Row]:
-    if limit <= 0:
-        return []
-    exclude_keys = exclude or set()
-    fetch_limit = max(limit, limit + len(exclude_keys))
-    noise_filter, noise_params = local_context_noise_filter_sql("m")
-    if config.session_scope == "shared":
-        filters = [noise_filter]
-        params: list[Any] = []
-        if after:
-            filters.insert(0, "m.created_at > ?")
-            params.append(after)
-        params.extend(noise_params)
-        params.append(fetch_limit)
-        where = "WHERE " + " AND ".join(filters)
-        rows = conn.execute(
-            f"""
-            SELECT
-              m.telegram_message_id,
-              m.chat_id,
-              COALESCE(c.chat_type, 'unknown') AS chat_type,
-              COALESCE(c.title, '') AS chat_title,
-              m.sender_name,
-              m.text,
-              m.created_at
-            FROM messages m
-            LEFT JOIN chats c ON c.chat_id = m.chat_id
-            {where}
-            ORDER BY m.created_at DESC, m.telegram_message_id DESC
-            LIMIT ?
-            """,
-            tuple(params),
-        ).fetchall()
-    else:
-        filters = ["m.chat_id = ?"]
-        params = [chat_id]
-        if after:
-            filters.append("m.created_at > ?")
-            params.append(after)
-        filters.append(noise_filter)
-        params.extend(noise_params)
-        params.append(fetch_limit)
-        where = "WHERE " + " AND ".join(filters)
-        rows = conn.execute(
-            f"""
-            SELECT
-              m.telegram_message_id,
-              m.chat_id,
-              COALESCE(c.chat_type, 'unknown') AS chat_type,
-              COALESCE(c.title, '') AS chat_title,
-              m.sender_name,
-              m.text,
-              m.created_at
-            FROM messages m
-            LEFT JOIN chats c ON c.chat_id = m.chat_id
-            {where}
-            ORDER BY m.created_at DESC, m.telegram_message_id DESC
-            LIMIT ?
-            """,
-            tuple(params),
-        ).fetchall()
-    filtered = [
-        row
-        for row in rows
-        if (str(row["chat_id"]), int(row["telegram_message_id"])) not in exclude_keys
-    ][:limit]
-    return list(reversed(filtered))
+) -> str | None:
+    # Prompt snapshots are chat-local even when the underlying Codex thread is
+    # shared. Using the latest run from another chat here can hide unseen
+    # messages from the current room and is the exact kind of cross-chat batch
+    # bleed this boundary is meant to prevent.
+    row = conn.execute(
+        """
+        SELECT started_at
+        FROM runs
+        WHERE status = 'ok' AND chat_id = ?
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (chat_id,),
+    ).fetchone()
+    return str(row["started_at"]) if row else None
 
 
-def latest_successful_run_started_at(
+def latest_usage_limit_run_started_at(conn: sqlite3.Connection) -> str | None:
+    """Return the newest account-quota failure across the shared resident.
+
+    Usage quota is account-wide, not chat-local.  While the account is out of
+    quota, decide-mode group messages can still be stored by the bridge even
+    though the app-server rejects the turn before its user message reaches the
+    model.  Treat the last such failure as a context floor so those missed
+    room messages are not backfilled when quota returns.
+    """
+
+    conditions = " OR ".join("LOWER(error) LIKE ?" for _ in USAGE_LIMIT_ERROR_MARKERS)
+    row = conn.execute(
+        f"""
+        SELECT started_at
+        FROM runs
+        WHERE error IS NOT NULL
+          AND ({conditions})
+        ORDER BY started_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        tuple(f"%{marker}%" for marker in USAGE_LIMIT_ERROR_MARKERS),
+    ).fetchone()
+    return str(row["started_at"]) if row else None
+
+
+def decide_group_context_floor(
     conn: sqlite3.Connection,
     chat_id: str,
     config: Config,
 ) -> str | None:
-    if config.session_scope == "shared":
-        session_id = shared_session_for_engine(conn, config.engine)
-        if not session_id:
-            return None
-        row = conn.execute(
-            """
-            SELECT started_at
-            FROM runs
-            WHERE status = 'ok'
-              AND codex_session_id_after = ?
-            ORDER BY started_at DESC
-            LIMIT 1
-            """,
-            (session_id,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            """
-            SELECT started_at
-            FROM runs
-            WHERE status = 'ok' AND chat_id = ?
-            ORDER BY started_at DESC
-            LIMIT 1
-            """,
-            (chat_id,),
-        ).fetchone()
-    return str(row["started_at"]) if row else None
+    """Drop pre-recovery backlog only for free/decide group rooms.
+
+    Private messages remain durable direct asks, and smart/mention rooms keep
+    their normal contextual history.  This boundary is deliberately decided
+    in the bridge rather than described to the model.
+    """
+
+    try:
+        chat_row = get_chat(conn, chat_id)
+    except KeyError:
+        return None
+    if str(chat_row["chat_type"] or "").lower() == "private":
+        return None
+    policy = load_access_policy(config.access_file, config.owner_ids)
+    mode = normalize_chat_mode(chat_row["mode"] or policy.group_policy or CHAT_MODE_MENTION)
+    if mode != CHAT_MODE_DECIDE:
+        return None
+    return latest_usage_limit_run_started_at(conn)
 
 
 def prompt_context_mode(conn: sqlite3.Connection, config: Config) -> str:
@@ -2095,40 +2113,41 @@ def prompt_context_rows(
 ) -> list[sqlite3.Row]:
     mode = prompt_context_mode(conn, config)
     if mode != "steady":
-        return recent_context_messages(
+        return recent_same_chat_context_rows(
             conn,
             chat_id,
             prompt_context_limit(conn, config),
-            config,
             exclude=exclude,
         )
 
-    last_run_started_at = latest_successful_run_started_at(conn, chat_id, config)
-    if last_run_started_at is None:
-        return recent_context_messages(
+    last_run_started_at = latest_successful_run_started_at(conn, chat_id)
+    quota_floor = decide_group_context_floor(conn, chat_id, config)
+    context_after = max(
+        (timestamp for timestamp in (last_run_started_at, quota_floor) if timestamp),
+        default=None,
+    )
+    if context_after is None:
+        return recent_same_chat_context_rows(
             conn,
             chat_id,
             min(config.context_messages, config.shared_context_messages),
-            config,
             exclude=exclude,
         )
 
-    unseen = recent_context_messages(
+    unseen = recent_same_chat_context_rows(
         conn,
         chat_id,
         config.context_messages,
-        config,
         exclude=exclude,
-        after=last_run_started_at,
+        after=context_after,
     )
     if config.steady_context_messages <= 0:
         return unseen
 
-    tail = recent_context_messages(
+    tail = recent_same_chat_context_rows(
         conn,
         chat_id,
         config.steady_context_messages,
-        config,
         exclude=exclude,
     )
     merged: dict[tuple[str, int], sqlite3.Row] = {}
@@ -2141,55 +2160,30 @@ def prompt_context_rows(
 def recent_relationship_rows(
     conn: sqlite3.Connection,
     chat_id: str,
-    config: Config,
     limit: int = 8,
 ) -> list[sqlite3.Row]:
     if limit <= 0:
         return []
-    if config.session_scope == "shared":
-        rows = conn.execute(
-            """
-            SELECT
-              r.chat_id,
-              COALESCE(c.chat_type, 'unknown') AS chat_type,
-              COALESCE(c.title, '') AS chat_title,
-              r.sender_id,
-              r.sender_name,
-              r.sender_kind,
-              r.message_count,
-              r.first_seen_at,
-              r.last_seen_at
-            FROM chat_sender_relationships r
-            LEFT JOIN chats c ON c.chat_id = r.chat_id
-            ORDER BY
-              CASE WHEN r.chat_id = ? THEN 0 ELSE 1 END,
-              r.last_seen_at DESC,
-              r.message_count DESC
-            LIMIT ?
-            """,
-            (chat_id, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT
-              r.chat_id,
-              COALESCE(c.chat_type, 'unknown') AS chat_type,
-              COALESCE(c.title, '') AS chat_title,
-              r.sender_id,
-              r.sender_name,
-              r.sender_kind,
-              r.message_count,
-              r.first_seen_at,
-              r.last_seen_at
-            FROM chat_sender_relationships r
-            LEFT JOIN chats c ON c.chat_id = r.chat_id
-            WHERE r.chat_id = ?
-            ORDER BY r.last_seen_at DESC, r.message_count DESC
-            LIMIT ?
-            """,
-            (chat_id, limit),
-        ).fetchall()
+    rows = conn.execute(
+        """
+        SELECT
+          r.chat_id,
+          COALESCE(c.chat_type, 'unknown') AS chat_type,
+          COALESCE(c.title, '') AS chat_title,
+          r.sender_id,
+          r.sender_name,
+          r.sender_kind,
+          r.message_count,
+          r.first_seen_at,
+          r.last_seen_at
+        FROM chat_sender_relationships r
+        LEFT JOIN chats c ON c.chat_id = r.chat_id
+        WHERE r.chat_id = ?
+        ORDER BY r.last_seen_at DESC, r.message_count DESC
+        LIMIT ?
+        """,
+        (chat_id, limit),
+    ).fetchall()
     return list(rows)
 
 
@@ -2199,14 +2193,11 @@ def format_relationship_row(row: sqlite3.Row) -> str:
     source = f"{row['chat_type']} {row['chat_id']}{title_part}"
     sender_id = str(row["sender_id"] or "").strip()
     sender_id_part = f", id={sender_id}" if sender_id else ""
-    return (
-        f"- [{source}] {row['sender_name']} ({row['sender_kind']}{sender_id_part}); "
-        f"messages={row['message_count']}; firstSeen={row['first_seen_at']}; lastSeen={row['last_seen_at']}"
-    )
+    return f"- [{source}] {row['sender_name']} ({row['sender_kind']}{sender_id_part})"
 
 
-def relationship_context_lines(conn: sqlite3.Connection, chat_id: str, config: Config) -> list[str]:
-    return [format_relationship_row(row) for row in recent_relationship_rows(conn, chat_id, config)]
+def relationship_context_lines(conn: sqlite3.Connection, chat_id: str) -> list[str]:
+    return [format_relationship_row(row) for row in recent_relationship_rows(conn, chat_id)]
 
 
 def recent_same_chat_context_rows(
@@ -2215,12 +2206,21 @@ def recent_same_chat_context_rows(
     limit: int,
     *,
     exclude: set[tuple[str, int]] | None = None,
+    after: str | None = None,
 ) -> list[sqlite3.Row]:
     if limit <= 0:
         return []
     exclude_keys = exclude or set()
     fetch_limit = max(limit, limit + len(exclude_keys))
     noise_filter, noise_params = local_context_noise_filter_sql("m")
+    filters = ["m.chat_id = ?"]
+    params: list[Any] = [chat_id]
+    if after:
+        filters.append("m.created_at > ?")
+        params.append(after)
+    filters.append(noise_filter)
+    params.extend(noise_params)
+    params.append(fetch_limit)
     rows = conn.execute(
         f"""
         SELECT
@@ -2233,11 +2233,11 @@ def recent_same_chat_context_rows(
           m.created_at
         FROM messages m
         LEFT JOIN chats c ON c.chat_id = m.chat_id
-        WHERE m.chat_id = ? AND {noise_filter}
+        WHERE {" AND ".join(filters)}
         ORDER BY m.created_at DESC, m.telegram_message_id DESC
         LIMIT ?
         """,
-        (chat_id, *noise_params, fetch_limit),
+        tuple(params),
     ).fetchall()
     filtered = [
         row
@@ -2262,8 +2262,43 @@ def truncate_context_text(text: str, limit: int) -> str:
     return clean[:head].rstrip() + marker + clean[-tail:].lstrip()
 
 
-def format_context_row(row: sqlite3.Row, text_limit: int = DEFAULT_CONTEXT_TEXT_CHARS) -> str:
-    clean_text = truncate_context_text(str(row["text"]), text_limit)
+def materialize_context_attachment_texts(
+    conn: sqlite3.Connection,
+    config: Config,
+    chat_id: str,
+    rows: list[sqlite3.Row],
+) -> dict[tuple[str, int], str]:
+    enriched: dict[tuple[str, int], str] = {}
+    for row in rows:
+        key = row_identity(row)
+        if key in enriched or key[0] != chat_id:
+            continue
+        text = str(row["text"])
+        if text_has_attachment_refs(text):
+            enriched[key] = text
+            continue
+        specs = stored_message_attachment_specs(conn, chat_id, key[1])
+        if not specs:
+            continue
+        materialized = append_attachment_refs(
+            text,
+            download_attachment_specs(config, chat_id, key[1], specs),
+        )
+        update_message_text(conn, key[1], chat_id, materialized)
+        enriched[key] = materialized
+    return enriched
+
+
+def format_context_row(
+    row: sqlite3.Row,
+    text_limit: int = DEFAULT_CONTEXT_TEXT_CHARS,
+    *,
+    text_override: str | None = None,
+) -> str:
+    clean_text = truncate_context_text(
+        str(row["text"]) if text_override is None else text_override,
+        text_limit,
+    )
     title = str(row["chat_title"] or "").replace("\n", " ").strip()
     title_part = f" {title}" if title else ""
     source = f"{row['chat_type']} {row['chat_id']}{title_part}"
@@ -2279,14 +2314,23 @@ def recent_group_trigger_context_lines(
 ) -> list[str]:
     if chat.chat_type == "private":
         return []
+    already = {row_identity(row) for row in prompt_context_rows(conn, chat.chat_id, config, exclude=exclude)}
+    rows = recent_same_chat_context_rows(
+        conn,
+        chat.chat_id,
+        RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES,
+        exclude=exclude,
+        after=decide_group_context_floor(conn, chat.chat_id, config),
+    )
+    rows = [row for row in rows if row_identity(row) not in already]
+    attachment_texts = materialize_context_attachment_texts(conn, config, chat.chat_id, rows)
     return [
-        format_context_row(row, config.context_text_chars)
-        for row in recent_same_chat_context_rows(
-            conn,
-            chat.chat_id,
-            RECENT_GROUP_TRIGGER_CONTEXT_MESSAGES,
-            exclude=exclude,
+        format_context_row(
+            row,
+            config.context_text_chars,
+            text_override=attachment_texts.get(row_identity(row)),
         )
+        for row in rows
     ]
 
 
@@ -2302,7 +2346,8 @@ def shared_context_guidance(config: Config, chat: Chat) -> str:
     return (
         "\n\nShared-context behavior:\n"
         "- This bot uses one shared Codex thread across private and group Telegram chats.\n"
-        "- Every message in Recent Telegram context is labeled with its source chat; keep those labels in mind.\n"
+        "- Each turn's explicit recent-message and relationship snapshot is limited to the current Telegram chat.\n"
+        "- Never merge messages from another chat into the current batch; treat the current chat id as the hard batch boundary.\n"
         "- You may use group context to send a short private aside or warning to the configured owner when it is genuinely useful.\n"
         f"- Owner private chat ids: {owner_private_destinations(config)}.\n"
         "- Treat private-chat material as owner-private; share it into a group when the owner clearly asks for that.\n"
@@ -2383,44 +2428,6 @@ SHARED_SESSION_RECOVERY_ERROR_PATTERNS = (
 def is_shared_session_recovery_error(error: Exception | str | None) -> bool:
     lowered = str(error or "").strip().lower()
     return bool(lowered) and any(pattern in lowered for pattern in SHARED_SESSION_RECOVERY_ERROR_PATTERNS)
-
-
-def maybe_rollover_failed_shared_session(
-    conn: sqlite3.Connection,
-    config: Config,
-    session_id: str | None,
-    error: Exception | str | None,
-) -> bool:
-    if (
-        config.session_scope != "shared"
-        or config.engine != "app-server"
-        or not session_id
-        or not is_shared_session_recovery_error(error)
-    ):
-        return False
-    rows = conn.execute(
-        """
-        SELECT status, error
-        FROM runs
-        WHERE codex_session_id_before = ? OR codex_session_id_after = ?
-        ORDER BY started_at DESC
-        LIMIT ?
-        """,
-        (session_id, session_id, SHARED_SESSION_FAILURE_ROLLOVER_THRESHOLD),
-    ).fetchall()
-    if len(rows) < SHARED_SESSION_FAILURE_ROLLOVER_THRESHOLD:
-        return False
-    if not all(
-        str(row["status"] or "") != "ok" and is_shared_session_recovery_error(row["error"])
-        for row in rows
-    ):
-        return False
-    reason = (
-        f"{SHARED_SESSION_FAILURE_ROLLOVER_THRESHOLD} consecutive app-server stream/compact failures; "
-        "retiring unhealthy shared thread"
-    )
-    mark_shared_session_rollover(conn, config, session_id, reason)
-    return True
 
 
 def running_runs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -2599,13 +2606,6 @@ def mark_run_superseded(conn: sqlite3.Connection, run_id: str, reason: str) -> N
     conn.commit()
 
 
-def run_log_path(conn: sqlite3.Connection, run_id: str) -> Path | None:
-    row = conn.execute("SELECT log_path FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if row is None or not row["log_path"]:
-        return None
-    return Path(str(row["log_path"])).expanduser()
-
-
 def record_superseded_channel_deliveries(
     conn: sqlite3.Connection,
     config: Config,
@@ -2654,54 +2654,6 @@ def record_superseded_channel_deliveries(
             delivery_status="superseded",
             error=reason,
         )
-
-
-def mark_desktop_run_superseded(
-    conn: sqlite3.Connection,
-    config: Config,
-    run_id: str,
-    session_id: str | None,
-    *,
-    reason: str = "newer Telegram message arrived before delivery",
-) -> bool:
-    if not session_id:
-        return False
-    log_path = run_log_path(conn, run_id)
-    if log_path is None:
-        return False
-    turn_id = extract_app_server_turn_id(log_path)
-    if not turn_id:
-        return False
-    rollout_path = codex_thread_rollout_path(codex_home(), session_id)
-    if rollout_path is None:
-        return False
-    changed = rewrite_rollout_turn_superseded(rollout_path, turn_id, reason)
-    if changed:
-        set_meta(conn, desktop_outbound_offset_key(session_id), str(rollout_path.stat().st_size))
-    return changed
-
-
-def recent_delivery_rows(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    rows = conn.execute(
-        """
-        SELECT
-          d.chat_id,
-          COALESCE(c.chat_type, 'unknown') AS chat_type,
-          COALESCE(c.title, '') AS chat_title,
-          d.text_preview,
-          d.delivered_at
-        FROM channel_deliveries d
-        LEFT JOIN chats c ON c.chat_id = d.chat_id
-        WHERE d.delivery_status = 'sent'
-          AND d.telegram_message_id IS NOT NULL
-          AND d.run_id NOT LIKE 'local-%'
-          AND COALESCE(d.event_type, '') != 'react'
-        ORDER BY d.delivered_at DESC, d.id DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    return list(reversed(rows))
 
 
 def recent_editable_output_rows(conn: sqlite3.Connection, chat_id: str, limit: int) -> list[sqlite3.Row]:
@@ -2925,28 +2877,28 @@ def latest_session_token_usage(conn: sqlite3.Connection, session_id: str) -> dic
     }
 
 
+def shared_content_usage(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
+    rows = conn.execute("SELECT log_path FROM runs WHERE codex_session_id_after=? OR codex_session_id_before=? ORDER BY started_at", (session_id, session_id)).fetchall()
+    for row in rows:
+        path = Path(row["log_path"])
+        if str(path).endswith(".app-server.jsonl"):
+            session_budget.ingest(conn, path)
+    return session_budget.stats(conn, session_id)
+
+
 def should_rollover_shared_session(
-    conn: sqlite3.Connection,
-    config: Config,
-    session_id: str | None,
+    conn: sqlite3.Connection, config: Config, session_id: str | None,
 ) -> tuple[bool, str, dict[str, int] | None]:
-    if (
-        config.session_scope != "shared"
-        or config.engine != "app-server"
-        or not session_id
-        or config.rollover_input_tokens <= 0
-    ):
+    if config.session_scope != "shared" or config.engine != "app-server" or not session_id:
         return False, "", None
-    usage = latest_session_token_usage(conn, session_id)
-    if usage is None:
-        return False, "", None
-    last_input = usage["last_input_tokens"]
-    if last_input >= config.rollover_input_tokens:
-        return (
-            True,
-            f"last input tokens {last_input} >= rollover threshold {config.rollover_input_tokens}",
-            usage,
-        )
+    usage = dict(latest_session_token_usage(conn, session_id) or {})
+    usage.update(shared_content_usage(conn, session_id))
+    requested = get_meta(conn, f"rollover_requested:{session_id}")
+    if requested:
+        return True, requested, usage
+    limit = config.rollover_new_content_tokens
+    if limit > 0 and usage["new_content_tokens"] >= limit:
+        return True, f"new content tokens {usage['new_content_tokens']} >= rollover budget {limit}", usage
     return False, "", usage
 
 
@@ -3028,7 +2980,8 @@ def build_rollover_handoff(
         f"- Previous Codex session: {old_session_id}",
         f"- Rollover reason: {reason}",
         "- Continue as the same Telegram Codex assistant; carry the relationship and channel context forward.",
-        "- Stable channel behavior is in base instructions. Use source labels to separate private and group context.",
+        "- Stable channel behavior is in base instructions. The next turn supplies only its own chat-local message snapshot.",
+        "- Do not reconstruct a mixed cross-chat batch from earlier Telegram messages.",
     ]
     chats = conn.execute(
         """
@@ -3047,54 +3000,144 @@ def build_rollover_handoff(
                 f"- {row['chat_type']} {row['chat_id']} {title}; "
                 f"mode={mode}; enabled={bool(row['enabled'])}; botActive={bool(row['bot_active'])}"
             )
-    recent = recent_context_messages(
-        conn,
-        "",
-        min(max(1, config.shared_context_messages), HANDOFF_MAX_INBOUND_MESSAGES),
-        config,
-    )
-    if recent:
-        lines.append("Recent inbound Telegram messages:")
-        lines.extend(format_handoff_context_row(row) for row in recent)
-    deliveries = recent_delivery_rows(conn, HANDOFF_MAX_VISIBLE_REPLIES)
-    if deliveries:
-        lines.append("Recent visible Telegram replies from the assistant:")
-        lines.extend(format_handoff_delivery_row(row) for row in deliveries)
+    lines.append("Recent received messages (source-labeled; excerpts):")
+    received = conn.execute(
+        """
+        SELECT m.*, c.chat_type, c.title AS chat_title
+        FROM messages m
+        JOIN chats c ON c.chat_id = m.chat_id
+        ORDER BY m.created_at DESC
+        LIMIT ?
+        """,
+        (HANDOFF_MAX_INBOUND_MESSAGES,),
+    ).fetchall()
+    lines.extend(format_handoff_context_row(row) for row in reversed(received))
+    lines.append("Recent confirmed Telegram deliveries (excerpts):")
+    delivered = conn.execute(
+        """
+        SELECT d.*, c.chat_type, c.title AS chat_title
+        FROM channel_deliveries d
+        JOIN chats c ON c.chat_id = d.chat_id
+        WHERE d.delivery_status = 'sent' AND d.event_type IN ('reply', 'rich_reply')
+        ORDER BY d.delivered_at DESC
+        LIMIT ?
+        """,
+        (HANDOFF_MAX_VISIBLE_REPLIES,),
+    ).fetchall()
+    lines.extend(format_handoff_delivery_row(row) for row in reversed(delivered))
     return "\n".join(lines)
 
 
-def mark_shared_session_rollover(
-    conn: sqlite3.Connection,
-    config: Config,
-    old_session_id: str,
-    reason: str,
-) -> str:
-    handoff = build_rollover_handoff(conn, config, old_session_id, reason)
-    normalized = normalize_engine(config.engine)
-    conn.execute("DELETE FROM meta WHERE key = ?", (shared_session_meta_key(config.engine),))
-    conn.execute(
-        """
-        UPDATE chats
-        SET codex_session_id = NULL, codex_engine = '', updated_at = ?
-        WHERE codex_session_id = ? AND codex_engine = ?
-        """,
-        (utc_now(), old_session_id, normalized),
-    )
-    conn.commit()
-    set_meta(conn, shared_handoff_meta_key(config.engine), handoff)
-    return handoff
+def is_unrecoverable_thread_error(error: str) -> bool:
+    return any(part in error.lower() for part in (
+        "missing an ordinal", "failed to resume local thread recorder",
+        "thread not found", "no rollout found", "unknown thread",
+    ))
+
+
+def persist_ready_shared_thread(conn: sqlite3.Connection, config: Config, chat_id: str,
+                                before: str | None, ready: str) -> None:
+    if config.session_scope != "shared":
+        set_chat_session(conn, chat_id, ready, config.engine)
+        return
+    active = shared_session_for_engine(conn, config.engine)
+    if active == ready:
+        return
+    if active != before:
+        raise RuntimeError("Shared session changed while preparing this turn; retry on the current session")
+    handoff = build_rollover_handoff(conn, config, before, "stored thread could not be resumed") if before else ""
+    with conn:
+        conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (shared_session_meta_key(config.engine), ready))
+        conn.execute("UPDATE chats SET codex_session_id=NULL, codex_engine='' WHERE codex_engine=?", (config.engine,))
+        conn.execute("UPDATE chats SET codex_session_id=?, codex_engine=?, updated_at=? WHERE chat_id=?",
+                     (ready, config.engine, utc_now(), chat_id))
+        if handoff:
+            conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (shared_handoff_meta_key(config.engine), handoff))
+            conn.execute("INSERT INTO session_handovers VALUES (?,?,?,?,?,?) ON CONFLICT(old_session_id) DO UPDATE SET new_session_id=excluded.new_session_id,status=excluded.status,updated_at=excluded.updated_at",
+                         (before, "unrecoverable resume", handoff, ready, "recovered", utc_now()))
+
+
+def shared_delivery_pending(conn: sqlite3.Connection, config: Config, sid: str) -> bool:
+    for row in conn.execute("SELECT id,status FROM runs WHERE codex_session_id_after=? ORDER BY started_at DESC", (sid,)):
+        if row["status"] == "running":
+            return True
+        if row["status"] != "ok":
+            continue
+        events = read_channel_events(channel_events_path_for_run(config, row["id"]))
+        done = {int(r[0]) for r in conn.execute(
+            "SELECT event_index FROM channel_deliveries WHERE run_id=? AND delivery_status IN ('sent','failed','superseded','rejected')", (row["id"],)
+        )}
+        for index, event in enumerate(events):
+            if event.get("type") in VISIBLE_CHANNEL_EVENT_TYPES and index not in done:
+                return True
+    return False
+
+
+def prepare_shared_handover(conn: sqlite3.Connection, config: Config, client: CodexAppServerClient,
+                            chat_row: sqlite3.Row, old: str, reason: str) -> str:
+    if shared_delivery_pending(conn, config, old):
+        return old
+    entry = conn.execute("SELECT * FROM session_handovers WHERE old_session_id=?", (old,)).fetchone()
+    if entry and entry["status"] == "deferred":
+        elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(entry["updated_at"].replace("Z", "+00:00"))
+        if elapsed.total_seconds() < 300:
+            return old
+    try:
+        if not client.thread_is_quiescent(old):
+            return old
+        summary = str(entry["summary"] or "") if entry else ""
+        if not summary:
+            summary = client.summarize_for_handover(old, build_rollover_handoff(conn, config, old, reason))
+            if not summary.strip() or len(summary) > 12000:
+                raise RuntimeError("Handover summary is empty or too large")
+            with conn:
+                conn.execute("INSERT INTO session_handovers VALUES (?,?,?,NULL,'ready',?) ON CONFLICT(old_session_id) DO UPDATE SET summary=excluded.summary,status='ready',updated_at=excluded.updated_at",
+                             (old, reason, summary, utc_now()))
+        new = str(entry["new_session_id"] or "") if entry else ""
+        if not new:
+            new = client.start_handover_thread()
+            with conn:
+                conn.execute("UPDATE session_handovers SET new_session_id=?,status='prepared',updated_at=? WHERE old_session_id=?", (new, utc_now(), old))
+        # Compare and switch in one transaction. A failed summary/start preserves
+        # the old mapping; a crash after candidate creation reuses that candidate.
+        conn.execute("BEGIN IMMEDIATE")
+        if shared_session_for_engine(conn, config.engine) != old:
+            conn.rollback()
+            return shared_session_for_engine(conn, config.engine) or old
+        conn.execute("UPDATE meta SET value=? WHERE key=?", (new, shared_session_meta_key(config.engine)))
+        conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (shared_handoff_meta_key(config.engine), summary))
+        conn.execute("UPDATE chats SET codex_session_id=NULL,codex_engine='' WHERE codex_engine=?", (config.engine,))
+        conn.execute("UPDATE chats SET codex_session_id=?,codex_engine=?,updated_at=? WHERE chat_id=?",
+                     (new, config.engine, utc_now(), chat_row["chat_id"]))
+        conn.execute("UPDATE session_handovers SET status='activated',updated_at=? WHERE old_session_id=?", (utc_now(), old))
+        conn.execute("DELETE FROM meta WHERE key=?", (f"rollover_requested:{old}",))
+        conn.commit()
+        try:
+            client.release_handover_thread(old)
+        except Exception as exc:
+            print(f"{utc_now()} old thread release deferred: {exc}", file=sys.stderr, flush=True)
+        print(f"{utc_now()} shared handover {old} -> {new}: {reason}", flush=True)
+        return new
+    except Exception as exc:
+        conn.rollback()
+        with conn:
+            conn.execute("INSERT INTO session_handovers VALUES (?,?,'',NULL,'deferred',?) ON CONFLICT(old_session_id) DO UPDATE SET status='deferred',updated_at=excluded.updated_at",
+                         (old, reason, utc_now()))
+        print(f"{utc_now()} shared handover deferred; keeping {old}: {exc}", file=sys.stderr, flush=True)
+        return old
 
 
 def prepare_session_for_turn(
-    conn: sqlite3.Connection,
-    config: Config,
-    chat_row: sqlite3.Row,
+    conn: sqlite3.Connection, config: Config, chat_row: sqlite3.Row,
+    app_client: CodexAppServerClient | None = None,
 ) -> str | None:
     session_id = session_for_engine(conn, chat_row, config)
     rollover, reason, _usage = should_rollover_shared_session(conn, config, session_id)
-    if rollover and session_id:
-        mark_shared_session_rollover(conn, config, session_id, reason)
-        return None
+    if rollover and session_id and app_client is not None:
+        return prepare_shared_handover(conn, config, app_client, chat_row, session_id, reason)
     return session_id
 
 
@@ -3241,6 +3284,44 @@ def redact_token(text: str, token: str) -> str:
     return text.replace(token, "<telegram-token>") if token else text
 
 
+def telegram_download_error_is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, TelegramAPIError):
+        return exc.code is not None and 500 <= exc.code < 600
+    if isinstance(exc, urllib.error.HTTPError):
+        return 500 <= exc.code < 600
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        if isinstance(current, OSError) and current.errno in TELEGRAM_TRANSIENT_NETWORK_ERRNOS:
+            return True
+        if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+            pending.append(current.reason)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
+def retry_telegram_download_call(operation: Callable[[], Any]) -> Any:
+    for attempt in range(TELEGRAM_INBOUND_DOWNLOAD_ATTEMPTS):
+        try:
+            return operation()
+        except Exception as exc:
+            exhausted = attempt + 1 >= TELEGRAM_INBOUND_DOWNLOAD_ATTEMPTS
+            if exhausted or not telegram_download_error_is_transient(exc):
+                raise
+            time.sleep(TELEGRAM_INBOUND_DOWNLOAD_RETRY_BASE_SECONDS * (2**attempt))
+    raise AssertionError("unreachable")
+
+
 def int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -3363,7 +3444,9 @@ def download_telegram_attachment(
             error=f"file_size {file_size} exceeds limit {TELEGRAM_INBOUND_FILE_MAX_BYTES}",
         )
     try:
-        result = telegram_api(config.token, "getFile", {"file_id": spec["file_id"]}, timeout=20)
+        result = retry_telegram_download_call(
+            lambda: telegram_api(config.token, "getFile", {"file_id": spec["file_id"]}, timeout=20)
+        )
         file_info = result.get("result") if isinstance(result.get("result"), dict) else {}
         telegram_file_path = str(file_info.get("file_path") or "").strip()
         if not telegram_file_path:
@@ -3384,32 +3467,38 @@ def download_telegram_attachment(
         ensure_private_dir(dest_dir)
         url_path = urllib.parse.quote(telegram_file_path, safe="/")
         url = f"https://api.telegram.org/file/bot{config.token}/{url_path}"
-        req = urllib.request.Request(url)
-        fd, tmp_name = tempfile.mkstemp(prefix=dest.name + ".", dir=str(dest_dir))
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    length = int_or_none(resp.headers.get("Content-Length"))
-                    if length is not None and length > TELEGRAM_INBOUND_FILE_MAX_BYTES:
-                        raise RuntimeError(
-                            f"Content-Length {length} exceeds limit {TELEGRAM_INBOUND_FILE_MAX_BYTES}"
-                        )
-                    total = 0
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > TELEGRAM_INBOUND_FILE_MAX_BYTES:
-                            raise RuntimeError(f"download exceeded limit {TELEGRAM_INBOUND_FILE_MAX_BYTES}")
-                        handle.write(chunk)
-            os.replace(tmp_name, dest)
-            os.chmod(dest, 0o600)
-        finally:
+
+        def download_file_once() -> None:
+            req = urllib.request.Request(url)
+            fd, tmp_name = tempfile.mkstemp(prefix=dest.name + ".", dir=str(dest_dir))
             try:
-                os.unlink(tmp_name)
-            except FileNotFoundError:
-                pass
+                with os.fdopen(fd, "wb") as handle:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        length = int_or_none(resp.headers.get("Content-Length"))
+                        if length is not None and length > TELEGRAM_INBOUND_FILE_MAX_BYTES:
+                            raise RuntimeError(
+                                f"Content-Length {length} exceeds limit {TELEGRAM_INBOUND_FILE_MAX_BYTES}"
+                            )
+                        total = 0
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > TELEGRAM_INBOUND_FILE_MAX_BYTES:
+                                raise RuntimeError(
+                                    f"download exceeded limit {TELEGRAM_INBOUND_FILE_MAX_BYTES}"
+                                )
+                            handle.write(chunk)
+                os.replace(tmp_name, dest)
+                os.chmod(dest, 0o600)
+            finally:
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+
+        retry_telegram_download_call(download_file_once)
         return attachment_ref_from_spec(spec, local_path=dest)
     except Exception as exc:
         return attachment_ref_from_spec(
@@ -3566,6 +3655,53 @@ def updates_private_first(updates: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [update for _, update in indexed]
 
 
+def update_chat_id(update: dict[str, Any]) -> str | None:
+    payload = update_message(update)
+    candidates: list[Any] = [payload[1]] if payload is not None else []
+    for update_type in ("message_reaction", "message_reaction_count", "my_chat_member"):
+        value = update.get(update_type)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        chat = candidate.get("chat") if isinstance(candidate, dict) else None
+        if not isinstance(chat, dict) or chat.get("id") is None:
+            continue
+        return str(chat["id"])
+    return None
+
+
+def updates_grouped_by_chat(updates: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Return stable, private-first batches with one Telegram chat per batch."""
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for index, update in enumerate(updates_private_first(updates)):
+        chat_id = update_chat_id(update)
+        # Unknown update shapes must not accidentally join each other; keep
+        # them as one-update batches while preserving the durable checkpoint.
+        key = f"chat:{chat_id}" if chat_id is not None else f"unknown:{index}"
+        groups.setdefault(key, []).append(update)
+    return list(groups.values())
+
+
+def queued_update_batch(updates: list[dict[str, Any]]) -> QueuedUpdateBatch | None:
+    chat_batches = updates_grouped_by_chat(updates)
+    if not chat_batches:
+        return None
+    max_update_id = max(
+        (
+            int(update["update_id"])
+            for batch in chat_batches
+            for update in batch
+            if isinstance(update.get("update_id"), int)
+        ),
+        default=None,
+    )
+    return QueuedUpdateBatch(
+        chat_batches=tuple(tuple(batch) for batch in chat_batches),
+        max_update_id=max_update_id,
+    )
+
+
 def is_edited_update_type(update_type: str) -> bool:
     return update_type in TELEGRAM_EDITED_UPDATE_TYPES
 
@@ -3662,359 +3798,6 @@ def first_channel_owner_private(prompt: str) -> bool:
         chat_type = attrs.get("chat_type") or "private"
         return chat_type == "private" and attrs.get("owner") == "true"
     return False
-
-
-def channel_display_source(attrs: dict[str, str]) -> str:
-    chat_type = attrs.get("chat_type", "private")
-    chat_title = attrs.get("chat_title") or attrs.get("user") or attrs.get("chat_id") or "Telegram"
-    if chat_type == "private":
-        return f"私聊 {chat_title}"
-    if chat_type in {"group", "supergroup"}:
-        return f"群 {chat_title}"
-    return chat_title
-
-
-def channel_display_line(attrs: dict[str, str], text: str) -> str:
-    source = channel_display_source(attrs)
-    user = attrs.get("user") or "unknown"
-    flags: list[str] = []
-    if attrs.get("is_bot") == "true":
-        flags.append("bot")
-    if attrs.get("is_chat_identity") == "true":
-        flags.append("chat")
-    suffix = f" ({', '.join(flags)})" if flags else ""
-    message = text.strip()
-    return f"[{source}] {user}{suffix}: {message}"
-
-
-def desktop_prompt_display_text(prompt: str) -> str | None:
-    events = []
-    for match in CHANNEL_EVENT_RE.finditer(prompt):
-        attrs = parse_channel_attrs(match.group(1))
-        events.append(channel_display_line(attrs, match.group(2)))
-    if not events:
-        return None
-    return "\n\n".join(events)
-
-
-def replace_rollout_user_prompt_display(
-    rollout_path: Path,
-    raw_prompt: str,
-    display_text: str,
-    *,
-    live_mirror_run_id: str | None = None,
-) -> bool:
-    if not rollout_path.exists():
-        return False
-    changed = False
-    input_lines = rollout_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    parsed_records: list[tuple[str, dict[str, Any] | None]] = []
-    live_mirror_exists = False
-    for line in input_lines:
-        stripped = line.rstrip("\n")
-        record: dict[str, Any] | None = None
-        if stripped:
-            try:
-                parsed = json.loads(stripped)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, dict):
-                record = parsed
-                if live_mirror_run_id and rollout_live_mirror_run_id(record) == live_mirror_run_id:
-                    live_mirror_exists = True
-        parsed_records.append((line, record))
-
-    output_lines: list[str] = []
-    for line, record in parsed_records:
-        if record is None:
-            output_lines.append(line)
-            continue
-        if live_mirror_exists and rollout_user_prompt_record_matches(record, raw_prompt, display_text):
-            changed = True
-            continue
-        if redact_rollout_user_prompt_record(record, raw_prompt, display_text):
-            changed = True
-            output_lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        else:
-            output_lines.append(line)
-    if not changed:
-        return False
-    with rollout_path.open("r+", encoding="utf-8") as handle:
-        handle.seek(0)
-        handle.writelines(output_lines)
-        handle.truncate()
-    return True
-
-
-def rollout_live_mirror_run_id(record: dict[str, Any]) -> str | None:
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    raw = payload.get("telegram_live_mirror_run_id")
-    return str(raw) if raw else None
-
-
-def rollout_user_prompt_text(record: Any) -> str | None:
-    if not isinstance(record, dict):
-        return None
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-        return str(payload.get("message") or "")
-    if record.get("type") != "response_item":
-        return None
-    if payload.get("type") != "message" or payload.get("role") != "user":
-        return None
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return None
-    parts = [
-        str(item.get("text") or "")
-        for item in content
-        if isinstance(item, dict) and item.get("type") == "input_text"
-    ]
-    return "\n".join(part for part in parts if part)
-
-
-def rollout_user_prompt_record_matches(record: Any, raw_prompt: str, display_text: str) -> bool:
-    text = rollout_user_prompt_text(record)
-    if not text:
-        return False
-    if text == raw_prompt:
-        return True
-    return desktop_prompt_display_text(text) == display_text
-
-
-def append_desktop_live_mirror(rollout_path: Path, display_text: str, run_id: str) -> bool:
-    if not rollout_path.exists() or not display_text.strip():
-        return False
-    try:
-        with rollout_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict) and rollout_live_mirror_run_id(record) == run_id:
-                    return False
-    except OSError:
-        return False
-    ts = rollout_timestamp()
-    records = [
-        {
-            "timestamp": ts,
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": display_text}],
-                "telegram_live_mirror_run_id": run_id,
-            },
-        },
-        {
-            "timestamp": ts,
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": display_text,
-                "images": [],
-                "local_images": [],
-                "text_elements": [],
-                "telegram_live_mirror_run_id": run_id,
-            },
-        },
-    ]
-    needs_newline = False
-    if rollout_path.stat().st_size > 0:
-        with rollout_path.open("rb") as handle:
-            handle.seek(-1, os.SEEK_END)
-            needs_newline = handle.read(1) != b"\n"
-    with rollout_path.open("a", encoding="utf-8") as handle:
-        if needs_newline:
-            handle.write("\n")
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-    return True
-
-
-def extract_app_server_turn_id(log_path: Path) -> str | None:
-    try:
-        with log_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                turn_id = app_server_log_record_turn_id(record)
-                if turn_id:
-                    return turn_id
-    except OSError:
-        return None
-    return None
-
-
-def app_server_log_record_turn_id(record: Any) -> str | None:
-    if not isinstance(record, dict):
-        return None
-    result = record.get("result")
-    if isinstance(result, dict):
-        turn = result.get("turn")
-        if isinstance(turn, dict) and turn.get("id"):
-            return str(turn["id"])
-    params = record.get("params")
-    if not isinstance(params, dict):
-        return None
-    if params.get("turnId"):
-        return str(params["turnId"])
-    turn = params.get("turn")
-    if isinstance(turn, dict) and turn.get("id"):
-        return str(turn["id"])
-    return None
-
-
-def desktop_superseded_delivery_text(original: str, reason: str) -> str:
-    draft = strip_desktop_mirror_prefix(original).strip()
-    reason_text = reason.strip() or "newer Telegram message arrived before delivery"
-    if draft:
-        return f"TG skipped: {reason_text}. Draft not sent: {draft}"
-    return f"TG skipped: {reason_text}."
-
-
-def rewrite_rollout_turn_superseded(
-    rollout_path: Path,
-    turn_id: str,
-    reason: str,
-) -> bool:
-    if not rollout_path.exists() or not turn_id:
-        return False
-    changed = False
-    current_turn_id: str | None = None
-    output_lines: list[str] = []
-    try:
-        input_lines = rollout_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError:
-        return False
-    for line in input_lines:
-        stripped = line.rstrip("\n")
-        record: dict[str, Any] | None = None
-        if stripped:
-            try:
-                parsed = json.loads(stripped)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, dict):
-                record = parsed
-        if record is None:
-            output_lines.append(line)
-            continue
-
-        payload = record.get("payload")
-        record_turn_id = rollout_record_turn_id(record)
-        if record_turn_id:
-            current_turn_id = record_turn_id
-        in_target_turn = current_turn_id == turn_id or record_turn_id == turn_id
-        if in_target_turn and rewrite_rollout_superseded_record(record, reason):
-            changed = True
-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        output_lines.append(line)
-        if (
-            record.get("type") == "event_msg"
-            and isinstance(payload, dict)
-            and payload.get("type") == "task_complete"
-            and payload.get("turn_id") == current_turn_id
-        ):
-            current_turn_id = None
-    if not changed:
-        return False
-    with rollout_path.open("r+", encoding="utf-8") as handle:
-        handle.seek(0)
-        handle.writelines(output_lines)
-        handle.truncate()
-    return True
-
-
-def rollout_record_turn_id(record: dict[str, Any]) -> str | None:
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("turn_id"):
-        return str(payload["turn_id"])
-    metadata = payload.get("metadata")
-    if isinstance(metadata, dict) and metadata.get("turn_id"):
-        return str(metadata["turn_id"])
-    return None
-
-
-def rewrite_rollout_superseded_record(record: dict[str, Any], reason: str) -> bool:
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return False
-    changed = False
-    if record.get("type") == "event_msg":
-        if payload.get("type") == "agent_message":
-            message = str(payload.get("message") or "")
-            if message.strip().startswith(DESKTOP_MIRROR_PREFIXES):
-                payload["message"] = desktop_superseded_delivery_text(message, reason)
-                changed = True
-        if payload.get("type") == "task_complete":
-            last_message = str(payload.get("last_agent_message") or "")
-            if last_message.strip().startswith(DESKTOP_MIRROR_PREFIXES):
-                payload["last_agent_message"] = desktop_superseded_delivery_text(last_message, reason)
-                changed = True
-        return changed
-    if record.get("type") != "response_item":
-        return False
-    if payload.get("type") != "message" or payload.get("role") != "assistant":
-        return False
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return False
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") not in {"output_text", "text"}:
-            continue
-        text = str(item.get("text") or "")
-        if text.strip().startswith(DESKTOP_MIRROR_PREFIXES):
-            item["text"] = desktop_superseded_delivery_text(text, reason)
-            changed = True
-    return changed
-
-
-def redact_rollout_user_prompt_record(record: Any, raw_prompt: str, display_text: str) -> bool:
-    if not isinstance(record, dict):
-        return False
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return False
-    if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-        text = str(payload.get("message") or "")
-        if text == raw_prompt or desktop_prompt_display_text(text) == display_text:
-            payload["message"] = display_text
-            return True
-        return False
-    if record.get("type") != "response_item":
-        return False
-    if payload.get("type") != "message" or payload.get("role") != "user":
-        return False
-    changed = False
-    content = payload.get("content")
-    if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict) or item.get("type") != "input_text":
-                continue
-            text = str(item.get("text") or "")
-            if text == raw_prompt or desktop_prompt_display_text(text) == display_text:
-                item["text"] = display_text
-                changed = True
-    return changed
 
 
 def chat_member_is_active(member: dict[str, Any]) -> bool:
@@ -4335,6 +4118,167 @@ def edit_message_text(config: Config, chat_id: str, message_id: int, text: str) 
     return message_id
 
 
+def build_input_rich_message(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Build Telegram InputRichMessage while enforcing its one-content-field rule."""
+
+    markdown = str(arguments.get("markdown") or "").strip()
+    html_text = str(arguments.get("html") or "").strip()
+    blocks = arguments.get("blocks")
+    supplied = [bool(markdown), bool(html_text), blocks is not None]
+    if sum(supplied) != 1:
+        raise ValueError(
+            "exactly one of markdown, html, or blocks is required "
+            f"(received {sum(supplied)})"
+        )
+
+    rich_message: dict[str, Any]
+    if blocks is not None:
+        if isinstance(blocks, str):
+            try:
+                blocks = json.loads(blocks)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"blocks must be valid JSON: {exc}") from None
+        if not isinstance(blocks, list) or not blocks:
+            raise ValueError("blocks must be a non-empty array")
+        if len(blocks) > TELEGRAM_RICH_MAX_BLOCKS:
+            raise ValueError(f"blocks accepts at most {TELEGRAM_RICH_MAX_BLOCKS} top-level blocks")
+        if any(not isinstance(block, dict) for block in blocks):
+            raise ValueError("every blocks item must be an object")
+        rich_message = {"blocks": blocks}
+    elif markdown:
+        rich_message = {"markdown": markdown}
+    else:
+        rich_message = {"html": html_text}
+
+    if bool(arguments.get("rtl") or arguments.get("is_rtl")):
+        rich_message["is_rtl"] = True
+    if bool(arguments.get("skip_entity_detection")):
+        rich_message["skip_entity_detection"] = True
+    if len(rich_message_plain_text(rich_message)) > TELEGRAM_RICH_MAX_TEXT:
+        raise ValueError(f"rich message text exceeds {TELEGRAM_RICH_MAX_TEXT} characters")
+    return rich_message
+
+
+RICH_TEXT_KEYS = (
+    "text",
+    "summary",
+    "expression",
+    "credit",
+    "caption",
+    "alternative_text",
+)
+RICH_CHILD_KEYS = ("blocks", "items", "cells")
+
+
+def valid_utf8_text(value: Any) -> str:
+    return str(value or "").encode("utf-8", errors="replace").decode("utf-8")
+
+
+def rich_blocks_plain_text(node: Any) -> str:
+    parts: list[str] = []
+
+    def collect_text(value: Any) -> None:
+        if isinstance(value, str):
+            clean = valid_utf8_text(value).strip()
+            if clean:
+                parts.append(clean)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect_text(item)
+            return
+        if isinstance(value, dict):
+            for key in RICH_TEXT_KEYS:
+                collect_text(value.get(key))
+
+    def collect(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in RICH_TEXT_KEYS:
+            collect_text(value.get(key))
+        for key in RICH_CHILD_KEYS:
+            collect(value.get(key))
+
+    collect(node)
+    return "\n".join(parts)
+
+
+def rich_message_plain_text(rich_message: Any) -> str:
+    if not isinstance(rich_message, dict):
+        return ""
+    markdown = rich_message.get("markdown")
+    if isinstance(markdown, str):
+        return valid_utf8_text(markdown).strip()
+    html_text = rich_message.get("html")
+    if isinstance(html_text, str):
+        without_tags = re.sub(r"<[^>]*>", " ", valid_utf8_text(html_text))
+        return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
+    return rich_blocks_plain_text(rich_message.get("blocks"))
+
+
+def rich_message_json(rich_message: dict[str, Any]) -> str:
+    # ASCII JSON escapes also make lone Unicode surrogates harmless at the HTTP boundary.
+    return json.dumps(rich_message, ensure_ascii=True, separators=(",", ":"))
+
+
+def send_rich_message(
+    config: Config,
+    chat_id: str,
+    rich_message: dict[str, Any],
+    *,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+    silent: bool = False,
+) -> int:
+    params: dict[str, Any] = {
+        "chat_id": chat_id,
+        "rich_message": rich_message_json(rich_message),
+    }
+    if message_thread_id is not None:
+        params["message_thread_id"] = message_thread_id
+    if reply_to_message_id is not None:
+        params["reply_parameters"] = json.dumps(
+            {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            },
+            separators=(",", ":"),
+        )
+    if silent:
+        params["disable_notification"] = "true"
+    result = telegram_api(config.token, "sendRichMessage", params)
+    message_ids = telegram_message_ids_from_result(result)
+    if not message_ids:
+        raise RuntimeError("Telegram sendRichMessage returned no message id")
+    return message_ids[0]
+
+
+def edit_rich_message(
+    config: Config,
+    chat_id: str,
+    message_id: int,
+    rich_message: dict[str, Any],
+) -> int:
+    result = telegram_api(
+        config.token,
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "rich_message": rich_message_json(rich_message),
+        },
+        timeout=20,
+    )
+    raw = result.get("result")
+    if isinstance(raw, dict) and isinstance(raw.get("message_id"), int):
+        return int(raw["message_id"])
+    return message_id
+
+
 def chunk_telegram_text(text: str) -> list[str]:
     chunks: list[str] = []
     remaining = text.strip()
@@ -4346,6 +4290,400 @@ def chunk_telegram_text(text: str) -> list[str]:
         remaining = remaining[split_at:].lstrip()
     chunks.append(remaining)
     return chunks
+
+
+def progress_text_path_for_run(config: Config, run_id: str) -> Path:
+    return config.out_dir / f"{run_id}.progress.txt"
+
+
+USAGE_LIMIT_ERROR_MARKERS = (
+    "you've hit your usage limit",
+    "you have hit your usage limit",
+    "purchase more credits",
+)
+
+
+def is_usage_limit_error(error: str | None) -> bool:
+    lowered = str(error or "").lower()
+    return any(marker in lowered for marker in USAGE_LIMIT_ERROR_MARKERS)
+
+
+def progress_status_marker(status: str | None, error: str | None = None) -> str:
+    if status is None:
+        return "…"
+    if status == "ok":
+        return PROGRESS_DONE_TEXT
+    if is_usage_limit_error(error):
+        return PROGRESS_USAGE_LIMIT_TEXT
+    return PROGRESS_FAILED_TEXT
+
+
+def progress_rich_message(body: str, status: str | None, error: str | None = None) -> dict[str, Any]:
+    paragraphs = [
+        valid_utf8_text(part).strip()
+        for part in re.split(r"\n\s*\n", body.strip())
+        if part.strip()
+    ]
+    items = [
+        {"blocks": [{"type": "paragraph", "text": paragraph}]}
+        for paragraph in paragraphs
+    ]
+    if status is not None:
+        marker = progress_status_marker(status, error)
+        count_note = f" · {len(items)} 段过程" if items else ""
+        inner_blocks: list[dict[str, Any]] = (
+            [{"type": "list", "items": items}]
+            if items
+            else [{"type": "paragraph", "text": marker}]
+        )
+        return {
+            "blocks": [
+                {
+                    "type": "details",
+                    "summary": f"{marker}{count_note}",
+                    "is_open": False,
+                    "blocks": inner_blocks,
+                }
+            ]
+        }
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "heading", "size": 4, "text": "💭 正在处理…"},
+    ]
+    if items:
+        blocks.append({"type": "list", "items": items})
+        blocks.append({"type": "footer", "text": f"已记录 {len(items)} 段"})
+    else:
+        blocks.append({"type": "footer", "text": "正在处理…"})
+    return {"blocks": blocks}
+
+
+class ProgressTranscript:
+    """Accumulate only user-visible app-server commentary, keyed by item id."""
+
+    def __init__(self) -> None:
+        self.item_phases: dict[str, str] = {}
+        self.item_texts: dict[str, str] = {}
+        self.item_order: list[str] = []
+
+    def ingest(self, obj: dict[str, Any]) -> bool:
+        method = str(obj.get("method") or "")
+        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+        if method in {"item/started", "item/completed"}:
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            if item.get("type") != "agentMessage":
+                return False
+            item_id = str(item.get("id") or "").strip()
+            phase = str(item.get("phase") or "").strip()
+            if not item_id:
+                return False
+            self.item_phases[item_id] = phase
+            if phase != "commentary":
+                return False
+            if item_id not in self.item_order:
+                self.item_order.append(item_id)
+            text = str(item.get("text") or "")
+            if not text:
+                return False
+            previous = self.item_texts.get(item_id, "")
+            # Deltas should match the authoritative completed item. Keep the
+            # longer accumulated form if an older server reports a shorter
+            # completion so already-visible process text never disappears.
+            authoritative = text if len(text) >= len(previous) else previous
+            if authoritative == previous:
+                return False
+            self.item_texts[item_id] = authoritative
+            return True
+
+        if method != "item/agentMessage/delta":
+            return False
+        item_id = str(params.get("itemId") or params.get("item_id") or "").strip()
+        if not item_id or self.item_phases.get(item_id) != "commentary":
+            return False
+        delta = str(params.get("delta") or "")
+        if not delta:
+            return False
+        if item_id not in self.item_order:
+            self.item_order.append(item_id)
+        self.item_texts[item_id] = self.item_texts.get(item_id, "") + delta
+        return True
+
+    def text(self) -> str:
+        paragraphs: list[str] = []
+        for item_id in self.item_order:
+            text = self.item_texts.get(item_id, "").strip()
+            if not text or _looks_like_system_prompt_echo(text):
+                continue
+            paragraphs.append(text)
+        return "\n\n".join(paragraphs)
+
+
+class TelegramTurnProgress:
+    """One new, retained Telegram progress bubble (plus rare overflow chunks) per turn."""
+
+    def __init__(
+        self,
+        config: Config,
+        chat_id: str,
+        run_id: str,
+        *,
+        reply_to_message_id: int | None,
+        message_thread_id: int | None,
+    ) -> None:
+        self.config = config
+        self.chat_id = str(chat_id)
+        self.run_id = run_id
+        self.reply_to_message_id = reply_to_message_id
+        self.message_thread_id = message_thread_id
+        self.transcript = ProgressTranscript()
+        self.condition = threading.Condition()
+        self.revision = 0
+        self.published_revision = 0
+        self.terminal_status: str | None = None
+        self.terminal_error: str | None = None
+        self.message_ids: list[int] = []
+        self.message_texts: list[str] = []
+        self.rich_enabled = False
+        self.last_publish_at = 0.0
+        self.worker: threading.Thread | None = None
+        self.started = False
+
+    def start(self) -> bool:
+        with self.condition:
+            initial_text = self._render_locked()
+            initial_rich_message = self._render_rich_locked()
+        try:
+            message_id = send_rich_message(
+                self.config,
+                self.chat_id,
+                initial_rich_message,
+                reply_to_message_id=self.reply_to_message_id,
+                message_thread_id=self.message_thread_id,
+                silent=True,
+            )
+            message_ids = [message_id]
+            self.rich_enabled = True
+        except Exception as exc:
+            print(
+                f"{utc_now()} rich progress bubble unavailable; using plain Telegram text "
+                f"chat_id={self.chat_id} run_id={self.run_id}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                message_ids = send_message(
+                    self.config,
+                    self.chat_id,
+                    initial_text,
+                    reply_to_message_id=self.reply_to_message_id,
+                    message_thread_id=self.message_thread_id,
+                )
+            except Exception as fallback_exc:
+                print(
+                    f"{utc_now()} progress bubble start failed chat_id={self.chat_id} "
+                    f"run_id={self.run_id}: {fallback_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+        if not message_ids:
+            return False
+        self.message_ids = list(message_ids)
+        self.message_texts = [initial_text for _ in message_ids]
+        self.started = True
+        self.last_publish_at = time.monotonic()
+        for message_id in message_ids:
+            self._record_new_message(message_id, initial_text)
+        write_private_text(progress_text_path_for_run(self.config, self.run_id), initial_text)
+        self.worker = threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+            name=f"telegram-progress-{self.chat_id}-{self.run_id}",
+        )
+        self.worker.start()
+        return True
+
+    def handle_protocol_event(self, obj: dict[str, Any]) -> None:
+        with self.condition:
+            changed = self.transcript.ingest(obj)
+        if not changed:
+            return
+        if not self.started:
+            self.start()
+            return
+        with self.condition:
+            self.revision += 1
+            self.condition.notify_all()
+
+    def finish(self, status: str, error: str | None = None) -> None:
+        if not self.started:
+            return
+        with self.condition:
+            self.terminal_status = status
+            self.terminal_error = error
+            self.revision += 1
+            self.condition.notify_all()
+        if self.worker is not None:
+            self.worker.join(timeout=30)
+            if self.worker.is_alive():
+                print(
+                    f"{utc_now()} progress bubble final edit still pending "
+                    f"chat_id={self.chat_id} run_id={self.run_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def _render_locked(self) -> str:
+        body = self.transcript.text()
+        if self.terminal_status is None:
+            return f"处理过程\n\n{body}\n\n…" if body else PROGRESS_INITIAL_TEXT
+        marker = progress_status_marker(self.terminal_status, self.terminal_error)
+        if body:
+            return f"处理过程\n\n{body}\n\n{marker}"
+        return f"{PROGRESS_INITIAL_TEXT}\n\n{marker}"
+
+    def _render_rich_locked(self) -> dict[str, Any]:
+        return progress_rich_message(
+            self.transcript.text(),
+            self.terminal_status,
+            self.terminal_error,
+        )
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self.condition:
+                while self.revision == self.published_revision:
+                    if self.terminal_status is not None:
+                        return
+                    self.condition.wait()
+                terminal = self.terminal_status is not None
+                wait_seconds = (
+                    self.config.progress_edit_interval_seconds
+                    - (time.monotonic() - self.last_publish_at)
+                )
+                if wait_seconds > 0 and not terminal:
+                    self.condition.wait(timeout=wait_seconds)
+                    continue
+                target_revision = self.revision
+                text = self._render_locked()
+                rich_message = self._render_rich_locked()
+            self._publish(text, rich_message)
+            with self.condition:
+                self.published_revision = max(self.published_revision, target_revision)
+                self.last_publish_at = time.monotonic()
+                if self.terminal_status is not None and self.published_revision >= self.revision:
+                    return
+
+    def _publish(self, text: str, rich_message: dict[str, Any]) -> None:
+        if (
+            self.rich_enabled
+            and len(self.message_ids) == 1
+            and len(rich_message_plain_text(rich_message)) <= TELEGRAM_RICH_MAX_TEXT
+        ):
+            message_id = self.message_ids[0]
+            if self.message_texts and self.message_texts[0] == text:
+                write_private_text(progress_text_path_for_run(self.config, self.run_id), text)
+                return
+            try:
+                edit_rich_message(
+                    self.config,
+                    self.chat_id,
+                    message_id,
+                    rich_message,
+                )
+            except Exception as exc:
+                print(
+                    f"{utc_now()} rich progress edit unavailable; falling back to plain Telegram text "
+                    f"chat_id={self.chat_id} message_id={message_id} run_id={self.run_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.rich_enabled = False
+            else:
+                self.message_texts[0] = text
+                self._update_message_record(message_id, text)
+                write_private_text(progress_text_path_for_run(self.config, self.run_id), text)
+                return
+
+        self.rich_enabled = False
+        chunks = chunk_telegram_text(text)
+        for index, chunk in enumerate(chunks):
+            if index < len(self.message_ids):
+                if index < len(self.message_texts) and self.message_texts[index] == chunk:
+                    continue
+                message_id = self.message_ids[index]
+                try:
+                    edit_message_text(self.config, self.chat_id, message_id, chunk)
+                except Exception as exc:
+                    print(
+                        f"{utc_now()} progress bubble edit failed chat_id={self.chat_id} "
+                        f"message_id={message_id} run_id={self.run_id}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                self.message_texts[index] = chunk
+                self._update_message_record(message_id, chunk)
+                continue
+            try:
+                new_ids = send_message(
+                    self.config,
+                    self.chat_id,
+                    chunk,
+                    message_thread_id=self.message_thread_id,
+                )
+            except Exception as exc:
+                print(
+                    f"{utc_now()} progress bubble overflow send failed chat_id={self.chat_id} "
+                    f"run_id={self.run_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+            for message_id in new_ids:
+                self.message_ids.append(message_id)
+                self.message_texts.append(chunk)
+                self._record_new_message(message_id, chunk)
+        write_private_text(progress_text_path_for_run(self.config, self.run_id), text)
+
+    def _record_new_message(self, message_id: int, text: str) -> None:
+        try:
+            with closing(connect_db(self.config)) as conn:
+                record_channel_delivery(
+                    conn,
+                    self.run_id,
+                    self.chat_id,
+                    PROGRESS_DELIVERY_EVENT_INDEX,
+                    message_id,
+                    self.reply_to_message_id,
+                    self.message_thread_id,
+                    text,
+                    event_type="progress",
+                )
+        except Exception as exc:
+            print(f"{utc_now()} progress delivery record failed: {exc}", file=sys.stderr, flush=True)
+
+    def _update_message_record(self, message_id: int, text: str) -> None:
+        try:
+            with closing(connect_db(self.config)) as conn:
+                conn.execute(
+                    """
+                    UPDATE channel_deliveries
+                    SET text_preview = ?, delivered_at = ?, delivery_status = 'sent', error = ''
+                    WHERE run_id = ? AND chat_id = ? AND event_type = 'progress'
+                      AND telegram_message_id = ?
+                    """,
+                    (
+                        channel_delivery_text_preview(text),
+                        utc_now(),
+                        self.run_id,
+                        self.chat_id,
+                        message_id,
+                    ),
+                )
+                conn.commit()
+        except Exception as exc:
+            print(f"{utc_now()} progress delivery update failed: {exc}", file=sys.stderr, flush=True)
 
 
 def parse_sender(message: dict[str, Any]) -> Sender:
@@ -4843,6 +5181,8 @@ def bot_delivery_text_for_message(
             continue
         if event_type == "reply":
             text = str(event.get("text") or "").strip()
+        elif event_type in {"rich_reply", "edit_rich_message"}:
+            text = rich_message_plain_text(event.get("rich_message"))
         elif event_type == "edit_message":
             text = str(event.get("text") or "").strip()
         else:
@@ -4977,6 +5317,8 @@ def parse_command(text: str, bot_username: str | None = None) -> Command | None:
 def normalize_command_name(name: str) -> str | None:
     if name == "start":
         return name
+    if name == "status":
+        return name
     if name == PUBLIC_COMMAND_PREFIX:
         return PUBLIC_COMMAND_PREFIX
     if name.startswith(f"{PUBLIC_COMMAND_PREFIX}_"):
@@ -5066,13 +5408,25 @@ def _looks_like_system_prompt_echo(text: str) -> bool:
 
 
 def has_reply_channel_event(events: list[dict[str, Any]]) -> bool:
-    return any(event.get("type") == "reply" and str(event.get("text") or "").strip() for event in events)
+    return any(
+        (
+            event.get("type") == "reply"
+            and str(event.get("text") or "").strip()
+        )
+        or (
+            event.get("type") == "rich_reply"
+            and rich_message_plain_text(event.get("rich_message"))
+        )
+        for event in events
+    )
 
 
 def is_visible_channel_event(event: dict[str, Any]) -> bool:
     event_type = str(event.get("type") or "").strip()
     if event_type == "reply":
         return bool(str(event.get("text") or "").strip())
+    if event_type == "rich_reply":
+        return bool(rich_message_plain_text(event.get("rich_message")))
     if event_type in {"send_photos", "send_files"}:
         return bool(channel_event_file_paths(event))
     if event_type == "react":
@@ -5086,6 +5440,12 @@ def is_visible_channel_event(event: dict[str, Any]) -> bool:
             str(event.get("chat_id") or "").strip()
             and str(event.get("message_id") or "").strip()
             and str(event.get("text") or "").strip()
+        )
+    if event_type == "edit_rich_message":
+        return bool(
+            str(event.get("chat_id") or "").strip()
+            and str(event.get("message_id") or "").strip()
+            and rich_message_plain_text(event.get("rich_message"))
         )
     return False
 
@@ -5157,9 +5517,14 @@ def normalize_channel_event_targets(
 def immediate_current_reply_event(event: dict[str, Any], origin_chat_id: str, config: Config) -> bool:
     if bool(event.get("delivered_immediately")):
         return False
-    if str(event.get("type") or "").strip() != "reply":
+    event_type = str(event.get("type") or "").strip()
+    if event_type not in {"reply", "rich_reply", "edit_rich_message"}:
         return False
-    if not str(event.get("text") or "").strip():
+    if event_type == "reply" and not str(event.get("text") or "").strip():
+        return False
+    if event_type in {"rich_reply", "edit_rich_message"} and not rich_message_plain_text(
+        event.get("rich_message")
+    ):
         return False
     target_chat_id = normalize_channel_event_target_chat_id(origin_chat_id, event.get("chat_id"), config)
     return bool(target_chat_id) and target_chat_id == str(origin_chat_id)
@@ -5424,6 +5789,8 @@ def reply_channel_events(
 def channel_event_delivery_preview(event: dict[str, Any], file_path: str | None = None) -> str:
     if event.get("type") == "reply":
         return str(event.get("text") or "")
+    if event.get("type") == "rich_reply":
+        return rich_message_plain_text(event.get("rich_message"))
     if event.get("type") == "react":
         emoji = str(event.get("emoji") or "").strip()
         message_id = str(event.get("message_id") or "").strip()
@@ -5432,6 +5799,10 @@ def channel_event_delivery_preview(event: dict[str, Any], file_path: str | None 
         message_id = str(event.get("message_id") or "").strip()
         text = str(event.get("text") or "").strip()
         return f"edit message {message_id}: {text}"
+    if event.get("type") == "edit_rich_message":
+        message_id = str(event.get("message_id") or "").strip()
+        text = rich_message_plain_text(event.get("rich_message"))
+        return f"edit rich message {message_id}: {text}"
     caption = str(event.get("caption") or "").strip()
     paths = [file_path] if file_path else channel_event_file_paths(event)
     label = "photos" if event.get("type") == "send_photos" else "files"
@@ -5475,7 +5846,7 @@ def delivery_failure_notice_text(events: list[dict[str, Any]]) -> str:
     event_types = {str(event.get("type") or "").strip() for event in events}
     if event_types & {"send_photos", "send_files"}:
         return "这次文件/图片没送出去，我先不刷细节。"
-    if "reply" in event_types:
+    if event_types & {"reply", "rich_reply"}:
         return "这条回复没送出去，我先不刷细节。"
     return "这个 Telegram 操作没成功，我先不刷细节。"
 
@@ -5556,10 +5927,12 @@ def visible_error_reply_for_result(
         return ""
     error = str(result.error or result.reply or "").strip()
     lowered = error.lower()
+    if is_usage_limit_error(error):
+        return PROGRESS_USAGE_LIMIT_TEXT
     if "selected model is at capacity" in lowered or "model is at capacity" in lowered:
         return "这次模型满载，没能跑完。消息已经记下了，直接续发一句我就接着做。"
     if is_shared_session_recovery_error(error):
-        return "这次连接在处理中断了，没拿到完整结果。连续失败时我会自动换一条干净线程并带 handoff 续上。"
+        return "这次连接在处理中断了，没拿到完整结果。会话还在，直接续发一句我就接着处理。"
     return "这次 Codex 调用没跑完，我没有拿到完整结果。直接续发一句，我会从当前上下文接着处理。"
 
 
@@ -6658,7 +7031,8 @@ def active_worker_context_block(config: Config, chat_id: str) -> str:
         return ""
     return (
         '<worker_context purpose="telegram resident routing">\n'
-        "You are the Telegram resident. Use this private worker context to decide whether the current message "
+        "You are the Telegram resident. The bridge refreshed this private worker context immediately before this turn. "
+        "Use it to decide whether the current message "
         "belongs in an existing worker session or should start a new worker. First judge by natural context whether "
         "the user is chatting, discussing, exploring, or clearly asking for execution. Do not route by keyword. "
         "Handle tiny edits of a few lines directly; when the owner is discussing the behavior or mechanism itself, "
@@ -6666,7 +7040,8 @@ def active_worker_context_block(config: Config, chat_id: str) -> str:
         "a new worker. "
         "Continue an existing worker with "
         "codex_worker_continue when the user is adding confirmed instructions, correcting scope, or unblocking that "
-        "same task; start a new worker only after confirmation when it is a separate task. For tiny one-line edits or "
+        "same task; start a new worker only after confirmation when it is a separate task. A running status here already "
+        "has automatic alarm coverage, so routine routing needs no extra status call or alarm. For tiny one-line edits or "
         "simple answers, handle it directly.\n"
         + "\n".join(lines)
         + "\n</worker_context>"
@@ -8246,21 +8621,21 @@ def handle_command(
     if command.name == "start":
         return (
             "Hi, I am the Codex Telegram bridge."
-            "\n发消息会进入 Codex；用 /codex_status 看状态，/codex_help 看命令。"
+            "\n发消息会进入 Codex；用 /status 看额度，/codex_status 看桥状态，/codex_help 看命令。"
         )
 
     if command.name == "codex_help":
         return (
+            "/status - show Codex usage limits (owner private chat)\n"
             "/codex_status - show this chat's bot state\n"
             "/codex_new - start a fresh Codex session on the next message\n"
             "/codex_resume <session_id> - bind this chat to a Codex session (owner)\n"
-            "/codex_rollover - start a clean shared session with a short handoff (owner)\n"
+            "/codex_rollover - hand the shared session over to a new one with a summary (owner)\n"
             "/codex_model [model] - show or switch the Codex model (owner)\n"
             "/codex_effort [private|task] low|medium|high|xhigh - show or switch reasoning effort (owner)\n"
             "/codex_mode decide|smart|mention - set group trigger mode (owner)\n"
             "/codex_batch single|batch|status - set group single-message or batched response mode (owner)\n"
             "/codex auto|single|multi|status - set/show reply bubble shape for this chat (owner)\n"
-            "/codex_debug on|off|status - show or hide raw Desktop prompts (owner)\n"
             "/codex_probe_channel - run a real Codex reply-tool probe (owner)\n"
             "/codex_off - disable this chat (owner)\n"
             "/codex_on - re-enable this chat (owner)"
@@ -8289,16 +8664,14 @@ def handle_command(
 
     if command.name == "codex_rollover":
         if not owner:
-            return "这个命令只给 owner 用。"
+            return "只有 owner 可以切换共享窗口。"
         if config.session_scope != "shared":
             return "当前不是 shared session，不需要 rollover。"
-        row = get_chat(conn, chat.chat_id)
-        session_id = session_for_engine(conn, row, config)
+        session_id = shared_session_for_engine(conn, config.engine)
         if not session_id:
-            return "现在没有活跃的共享 Codex session；下一条消息会自然开新 session。"
-        mark_shared_session_rollover(conn, config, session_id, "owner requested /codex_rollover")
-        set_chat_enabled(conn, chat.chat_id, True)
-        return "好，已准备换到新的共享 Codex session；下一条消息会带短 handoff 接上。"
+            return "当前还没有共享窗口。"
+        set_meta(conn, f"rollover_requested:{session_id}", "owner requested /codex_rollover")
+        return "已安排：下一轮开始前，在工具和消息发送收尾后带摘要换窗。"
 
     if command.name == "codex_model":
         if not owner:
@@ -8392,22 +8765,6 @@ def handle_command(
             return "已切到 multi：这个 chat 里日常聊天可分 2-3 条气泡，技术内容仍合一条。"
         return "已切到 auto：我按场景自己决定一条还是分条。"
 
-    if command.name == "codex_debug":
-        if not owner:
-            return "这个命令只给 owner 用。"
-        arg = command.args[0].lower() if command.args else "status"
-        if arg in {"status", "state"}:
-            state = "on" if desktop_prompt_debug_enabled(conn) else "off"
-            visible = "显示原始 channel prompt" if state == "on" else "隐藏原始 prompt，只显示清洗后的 TG 消息"
-            return f"desktop debug: {state}（{visible}）"
-        if arg in {"on", "true", "1", "raw", "show"}:
-            set_desktop_prompt_debug(conn, True)
-            return "desktop debug 已打开：之后 Desktop 会显示原始 channel prompt。"
-        if arg in {"off", "false", "0", "hide"}:
-            set_desktop_prompt_debug(conn, False)
-            return "desktop debug 已关闭：之后 Desktop 只显示清洗后的 TG 消息。"
-        return "用法：/codex_debug on、/codex_debug off 或 /codex_debug status"
-
     if command.name == "codex_off":
         if not owner:
             return "这个命令只给 owner 用。"
@@ -8450,9 +8807,11 @@ def status_for_chat(
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
-        f"rolloverInputTokens: {config.rollover_input_tokens}",
+        f"rolloverNewContentTokens: {config.rollover_new_content_tokens}",
         f"batchDelaySeconds: {config.batch_delay_seconds:g}",
         f"privateBatchDelaySeconds: {config.private_batch_delay_seconds:g}",
+        f"streamProgress: {bool(config.stream_progress)}",
+        f"progressEditIntervalSeconds: {config.progress_edit_interval_seconds:g}",
         f"mediaGroupDelaySeconds: {config.media_group_delay_seconds:g}",
         f"directBackground: {bool(config.direct_background)}",
         f"directBackgroundAfterSeconds: {config.direct_background_after_seconds:g}",
@@ -8466,9 +8825,13 @@ def status_for_chat(
         f"channelTools: {bool(config.channel_tools)}",
         f"desktopSync: {bool(config.desktop_sync)}",
         f"desktopOutbound: {bool(config.desktop_outbound)}",
-        f"desktopPromptDebug: {desktop_prompt_debug_enabled(conn)}",
         f"cwd: {config.cwd}",
     ]
+    active_session = shared_session_for_engine(conn, config.engine)
+    if active_session:
+        content_usage = shared_content_usage(conn, active_session)
+        lines.extend(f"{key}: {value}" for key, value in content_usage.items())
+        lines.append("contentTokenBasis: o200k text + reported output; excludes history replay and binary media")
     lines.extend(update_failure_summary_lines(conn))
     if chat_id:
         row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -8496,14 +8859,94 @@ def status_for_chat(
             if usage:
                 lines.extend(
                     [
-                        f"lastInputTokens: {usage['last_input_tokens']}",
-                        f"lastCachedInputTokens: {usage['last_cached_input_tokens']}",
+                        f"lastInputTokens: {usage.get('last_input_tokens', 0)}",
+                        f"lastCachedInputTokens: {usage.get('last_cached_input_tokens', 0)}",
                     ]
                 )
             run = last_run(conn, chat_id)
             if run:
                 lines.append(f"lastRun: {run['status']} at {run['finished_at'] or run['started_at']}")
                 lines.extend(channel_summary_lines(conn, config, run["id"]))
+    return "\n".join(lines)
+
+
+def format_rate_limit_percent(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.1f}".rstrip("0").rstrip(".")
+
+
+def rate_limit_window_label(window_duration_mins: Any) -> str:
+    try:
+        minutes = int(window_duration_mins)
+    except (TypeError, ValueError):
+        return "额度窗口"
+    if minutes % (7 * 24 * 60) == 0:
+        weeks = minutes // (7 * 24 * 60)
+        return "7 天" if weeks == 1 else f"{weeks} 周"
+    if minutes % (24 * 60) == 0:
+        days = minutes // (24 * 60)
+        return f"{days} 天"
+    if minutes % 60 == 0:
+        return f"{minutes // 60} 小时"
+    return f"{minutes} 分钟"
+
+
+def format_rate_limit_reset(resets_at: Any) -> str:
+    try:
+        reset = datetime.fromtimestamp(float(resets_at), timezone.utc).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "重置时间未知"
+    zone = reset.tzname() or "本地时间"
+    return f"{reset.month}月{reset.day}日 {reset:%H:%M} {zone} 重置"
+
+
+def format_account_rate_limits(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("account/rateLimits/read returned an invalid payload")
+    by_id = payload.get("rateLimitsByLimitId")
+    snapshots: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(by_id, dict):
+        snapshots.extend(
+            (str(limit_id), snapshot)
+            for limit_id, snapshot in by_id.items()
+            if isinstance(snapshot, dict)
+        )
+    if not snapshots and isinstance(payload.get("rateLimits"), dict):
+        snapshot = payload["rateLimits"]
+        snapshots.append((str(snapshot.get("limitId") or "codex"), snapshot))
+    if not snapshots:
+        return "Codex 额度\n暂时没有返回可用的额度窗口。"
+
+    snapshots.sort(key=lambda item: (item[0] != "codex", item[0]))
+    lines = ["Codex 额度"]
+    for limit_id, snapshot in snapshots:
+        label = str(
+            snapshot.get("limitName")
+            or ("Codex" if limit_id == "codex" else "其他 Codex 额度")
+        )
+        windows = [
+            window
+            for window in (snapshot.get("primary"), snapshot.get("secondary"))
+            if isinstance(window, dict)
+        ]
+        for window in windows:
+            used_raw = window.get("usedPercent")
+            used = format_rate_limit_percent(used_raw)
+            try:
+                remaining_raw = max(0.0, min(100.0, 100.0 - float(used_raw)))
+                remaining = format_rate_limit_percent(remaining_raw)
+            except (TypeError, ValueError):
+                remaining = "?"
+            duration = rate_limit_window_label(window.get("windowDurationMins"))
+            reset = format_rate_limit_reset(window.get("resetsAt"))
+            lines.append(f"• {label}（{duration}）：已用 {used}%，剩余 {remaining}%；{reset}")
+    if len(lines) == 1:
+        lines.append("暂时没有返回可用的额度窗口。")
     return "\n".join(lines)
 
 
@@ -8952,7 +9395,7 @@ def optimization_report(
         f"sharedContextMessages: {config.shared_context_messages}",
         f"steadyContextMessages: {config.steady_context_messages}",
         f"contextTextChars: {config.context_text_chars}",
-        f"rolloverInputTokens: {config.rollover_input_tokens}",
+        f"rolloverNewContentTokens: {config.rollover_new_content_tokens}",
         f"mediaGroupDelaySeconds: {config.media_group_delay_seconds:g}",
         f"sharedSession: {shared_session or '(none)'}",
         f"pendingHandoff: {bool(handoff)}",
@@ -8966,8 +9409,8 @@ def optimization_report(
     if usage:
         lines.extend(
             [
-                f"lastInputTokens: {usage['last_input_tokens']}",
-                f"lastCachedInputTokens: {usage['last_cached_input_tokens']}",
+                f"lastInputTokens: {usage.get('last_input_tokens', 0)}",
+                f"lastCachedInputTokens: {usage.get('last_cached_input_tokens', 0)}",
             ]
         )
     lines.extend(media_tool_lines)
@@ -9030,16 +9473,23 @@ def build_prompt(
             exclude={(chat.chat_id, message_id)},
         )
     )
+    attachment_texts = materialize_context_attachment_texts(conn, config, chat.chat_id, rows)
+    for row in rows:
+        context_lines.append(
+            format_context_row(
+                row,
+                config.context_text_chars,
+                text_override=attachment_texts.get(row_identity(row)),
+            )
+        )
     recent_group_lines = recent_group_trigger_context_lines(
         conn,
         chat,
         config,
         exclude={(chat.chat_id, message_id)},
     )
-    for row in rows:
-        context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
-    relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
+    relationship_lines = relationship_context_lines(conn, chat.chat_id)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
     output_lines = (
         [
@@ -9094,11 +9544,7 @@ def build_prompt(
             )
         )
         instruction = compact_reply_instruction(chat, message_id, allow_silent_reply=allow_silent_reply)
-        if chat.chat_type != "private":
-            instruction += "\n" + GROUP_PRESENCE_TURN_HINT
         instruction += "\n" + message_shape_instruction(conn, chat)
-        if aside_check:
-            instruction += "\n" + aside_check
         if allow_silent_reply:
             instruction += (
                 "\nAI-decide group: speak only when a reply helps; background conversation can stay silent."
@@ -9117,9 +9563,10 @@ def build_prompt(
         stable_instructions = (
             "You are a Codex collaborator reached through Telegram.\n\n"
             "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
-            "(reply, send_photos, send_files, react, edit_message, leave_chat). "
+            "(reply, rich_reply, send_photos, send_files, react, edit_message, edit_rich_message, leave_chat). "
             "Your normal final answer stays in private transcript output for Codex Desktop. "
-            "Use react for lightweight acknowledgement; use edit_message only for messages the bot already sent. "
+            "Use rich_reply for native tables, formulas, or collapsible structured content; use react for lightweight "
+            "acknowledgement; use edit_message/edit_rich_message only for messages the bot already sent. "
             "When silence is the right social choice, finish privately with `(silent)` and keep the Telegram chat unchanged. "
             "Keep private reasoning private; share concise conclusions, checks, and visible actions. "
             f"{TELEGRAM_REPLY_RHYTHM}\n"
@@ -9162,7 +9609,7 @@ def build_prompt(
         f"- Sender is owner: {str(owner).lower()}\n"
         f"- Message id: {message_id}\n"
         f"{thread_line}\n"
-        "Recent Telegram context (source-labeled, excludes current message):\n"
+        "Recent Telegram context (current chat only, excludes current message):\n"
         f"{recent_context}"
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
@@ -9179,9 +9626,10 @@ def build_prompt(
         f"{text}\n\n"
         f"{message_shape_instruction(conn, chat)}\n\n"
         "Visible current-chat text output must be sent with reply(text=...); include reply_to only when quoting/threading, "
-        "and include chat_id only when deliberately targeting another allowed chat. Use send_photos/send_files "
-        "for local images or files, react for lightweight acknowledgement, and edit_message only for bot-sent "
-        "messages. If no visible response is useful, finish privately with `(silent)`."
+        "and include chat_id only when deliberately targeting another allowed chat. Use rich_reply for native "
+        "tables, formulas, or collapsible structured content; use send_photos/send_files for local images or files, "
+        "react for lightweight acknowledgement, and edit_message/edit_rich_message only for bot-sent messages. "
+        "If no visible response is useful, finish privately with `(silent)`."
         f"{silence_instruction}"
     )
 
@@ -9200,14 +9648,6 @@ Group rhythm guidance:
 - When the room feels ambiguous, choose quiet presence.
 - A rare short "忍不住" aside fits when it clearly makes the atmosphere better; treat it as one light beat.
 """
-
-
-GROUP_PRESENCE_TURN_HINT = (
-    "Group presence hint: act like someone in the room. If people address you by mention or configured wake phrase, answer briefly. "
-    "If they are discussing your behavior, config, abilities, or this Telegram chain, you may add "
-    "a short useful line even when they skip @. Let private banter stay centered on the people having it; "
-    "join when you genuinely add warmth."
-)
 
 
 def human_direct_turn_hint(chat: Chat, sender: Sender, explicitly_addressed: bool) -> str:
@@ -9254,21 +9694,29 @@ def build_batch_prompt(
 ) -> str:
     context_lines: list[str] = []
     exclude_keys = {(chat.chat_id, item.message_id) for item in items}
+    rows = prompt_context_rows(
+        conn,
+        chat.chat_id,
+        config,
+        exclude=exclude_keys,
+    )
+    attachment_texts = materialize_context_attachment_texts(conn, config, chat.chat_id, rows)
+    for row in rows:
+        context_lines.append(
+            format_context_row(
+                row,
+                config.context_text_chars,
+                text_override=attachment_texts.get(row_identity(row)),
+            )
+        )
     recent_group_lines = recent_group_trigger_context_lines(
         conn,
         chat,
         config,
         exclude=exclude_keys,
     )
-    for row in prompt_context_rows(
-        conn,
-        chat.chat_id,
-        config,
-        exclude=exclude_keys,
-    ):
-        context_lines.append(format_context_row(row, config.context_text_chars))
     recent_context = "\n".join(context_lines) if context_lines else "(none)"
-    relationship_lines = relationship_context_lines(conn, chat.chat_id, config)
+    relationship_lines = relationship_context_lines(conn, chat.chat_id)
     relationship_context = "\n".join(relationship_lines) if relationship_lines else "(none)"
     output_lines = (
         [
@@ -9347,11 +9795,7 @@ def build_batch_prompt(
             parts.append("\n\n".join(channel_events))
         allow_silent_reply = chat.chat_type != "private"
         instruction = compact_reply_instruction(chat, latest_id, allow_silent_reply=allow_silent_reply)
-        if allow_silent_reply:
-            instruction += "\n" + GROUP_PRESENCE_TURN_HINT
         instruction += "\n" + message_shape_instruction(conn, chat)
-        if aside_check:
-            instruction += "\n" + aside_check
         parts.append(f"Read all events. {instruction}")
         return "\n\n".join(part for part in parts if part)
     stable_instructions = ""
@@ -9359,9 +9803,10 @@ def build_batch_prompt(
         stable_instructions = (
             "You are a Codex collaborator reached through Telegram.\n\n"
             "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
-            "(reply, send_photos, send_files, react, edit_message, leave_chat). "
+            "(reply, rich_reply, send_photos, send_files, react, edit_message, edit_rich_message, leave_chat). "
             "Your normal final answer stays in private transcript output for Codex Desktop. "
-            "Use react for lightweight acknowledgement; use edit_message only for messages the bot already sent. "
+            "Use rich_reply for native tables, formulas, or collapsible structured content; use react for lightweight "
+            "acknowledgement; use edit_message/edit_rich_message only for messages the bot already sent. "
             "When silence is the right social choice, finish privately with `(silent)` and keep the Telegram chat unchanged. "
             "Keep private reasoning private; share concise conclusions, checks, and visible actions. "
             f"{TELEGRAM_REPLY_RHYTHM}\n"
@@ -9390,7 +9835,7 @@ def build_batch_prompt(
         f"- Latest message id: {latest_id}\n"
         f"{thread_line}\n"
         f"{supersede_note}"
-        "Recent Telegram context (source-labeled, excludes this batch):\n"
+        "Recent Telegram context (current chat only, excludes this batch):\n"
         f"{recent_context}"
         f"{handoff_block}\n\n"
         "Known Telegram relationships:\n"
@@ -9409,7 +9854,8 @@ def build_batch_prompt(
             else "Use reply(text=...) when a visible current-chat response is useful. "
         )
         + "Include reply_to only when quoting/threading and chat_id only when deliberately targeting another "
-        "allowed chat. Use react when a small acknowledgement is enough."
+        "allowed chat. Use rich_reply when native tables, formulas, or collapsible structure materially help; "
+        "use react when a small acknowledgement is enough."
         + ("" if chat.chat_type == "private" else " Otherwise finish privately with `(silent)`.")
     )
 
@@ -9434,7 +9880,7 @@ def build_probe_prompt(
     return (
         "You are a Codex collaborator reached through Telegram.\n\n"
         "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
-        "(reply, send_photos, send_files, react, edit_message, leave_chat). "
+        "(reply, rich_reply, send_photos, send_files, react, edit_message, edit_rich_message, leave_chat). "
         "Normal final answers stay in private transcript output for Codex Desktop.\n\n"
         f"{handoff_block}"
         "This is an owner-requested channel probe. Keep the action to the requested probe reply. "
@@ -9660,9 +10106,11 @@ def build_codex_command(
             "-c",
             'mcp_servers.telegram_channel.default_tools_approval_mode="approve"',
             "-c",
-            'mcp_servers.telegram_channel.enabled_tools=["reply","send_photos","send_files","react","edit_message"]',
+            'mcp_servers.telegram_channel.enabled_tools=["reply","rich_reply","send_photos","send_files","react","edit_message","edit_rich_message"]',
             "-c",
             'mcp_servers.telegram_channel.tools.reply.approval_mode="approve"',
+            "-c",
+            'mcp_servers.telegram_channel.tools.rich_reply.approval_mode="approve"',
             "-c",
             'mcp_servers.telegram_channel.tools.send_photos.approval_mode="approve"',
             "-c",
@@ -9671,6 +10119,8 @@ def build_codex_command(
             'mcp_servers.telegram_channel.tools.react.approval_mode="approve"',
             "-c",
             'mcp_servers.telegram_channel.tools.edit_message.approval_mode="approve"',
+            "-c",
+            'mcp_servers.telegram_channel.tools.edit_rich_message.approval_mode="approve"',
         ]
     if session_id:
         cmd = [
@@ -9812,88 +10262,18 @@ def run_codex_exec(
     )
 
 
-def maybe_hide_desktop_prompt_display(
-    conn: sqlite3.Connection,
-    config: Config,
-    session_id: str | None,
-    raw_prompt: str,
-    *,
-    live_mirror_run_id: str | None = None,
-) -> None:
-    if not session_id or config.engine != "app-server" or desktop_prompt_debug_enabled(conn):
-        return
-    display_text = desktop_prompt_display_text(raw_prompt)
-    if not display_text:
-        return
-    rollout_path = codex_thread_rollout_path(codex_home(), session_id)
-    if rollout_path is None:
-        return
-    try:
-        changed = replace_rollout_user_prompt_display(
-            rollout_path,
-            raw_prompt,
-            display_text,
-            live_mirror_run_id=live_mirror_run_id,
-        )
-        if changed:
-            set_meta(conn, desktop_outbound_offset_key(session_id), str(rollout_path.stat().st_size))
-    except Exception as exc:
-        print(f"{utc_now()} desktop prompt hide failed: {exc}", file=sys.stderr, flush=True)
-
-
-def refresh_desktop_live_sync(
-    conn: sqlite3.Connection,
-    config: Config,
-    session_id: str | None,
-    raw_prompt: str,
-    run_id: str,
-    desktop_title: str | None,
-    desktop_preview: str | None,
-    *,
-    append_mirror: bool = True,
-) -> None:
-    if not session_id or config.engine != "app-server" or not config.desktop_sync:
-        return
-    sync_codex_desktop_metadata(session_id, desktop_title, desktop_preview, config)
-    if desktop_prompt_debug_enabled(conn):
-        return
-    if not append_mirror:
-        return
-    display_text = desktop_prompt_display_text(raw_prompt)
-    if not display_text:
-        return
-    rollout_path = codex_thread_rollout_path(codex_home(), session_id)
-    if rollout_path is None:
-        return
-    try:
-        if append_desktop_live_mirror(rollout_path, display_text, run_id):
-            set_meta(conn, desktop_outbound_offset_key(session_id), str(rollout_path.stat().st_size))
-    except Exception as exc:
-        print(f"{utc_now()} desktop live mirror failed: {exc}", file=sys.stderr, flush=True)
-
-
 def desktop_live_sync_guard(
     config: Config,
     session_id: str | None,
-    raw_prompt: str,
-    run_id: str,
     desktop_title: str | None,
     desktop_preview: str | None,
     stop_event: threading.Event,
 ) -> None:
+    # Keep the Desktop title/preview pinned while the turn runs. Native
+    # rollout files belong to app-server and are never rewritten here.
     while not stop_event.is_set():
         try:
-            with closing(connect_db(config, timeout_seconds=1.0)) as conn:
-                refresh_desktop_live_sync(
-                    conn,
-                    config,
-                    session_id,
-                    raw_prompt,
-                    run_id,
-                    desktop_title,
-                    desktop_preview,
-                    append_mirror=True,
-                )
+            sync_codex_desktop_metadata(session_id, desktop_title, desktop_preview, config)
         except Exception as exc:
             print(f"{utc_now()} desktop live sync guard failed: {exc}", file=sys.stderr, flush=True)
         if stop_event.wait(1):
@@ -9903,7 +10283,6 @@ def desktop_live_sync_guard(
 def schedule_desktop_run_finalization(
     config: Config,
     session_id: str | None,
-    raw_prompt: str,
     run_id: str,
     desktop_title: str | None,
     desktop_preview: str | None,
@@ -9913,8 +10292,7 @@ def schedule_desktop_run_finalization(
 
     def target() -> None:
         # Finalizers can overlap when the next Telegram turn starts quickly.
-        # Serialize rollout rewrites so one prompt-hide pass cannot overwrite
-        # another, and only let the newest run update Desktop title/preview.
+        # Serialize them and only let the newest run update Desktop title/preview.
         with _DESKTOP_FINALIZATION_LOCK:
             try:
                 with closing(connect_db(config, timeout_seconds=1.0)) as final_conn:
@@ -9935,13 +10313,6 @@ def schedule_desktop_run_finalization(
                             desktop_preview,
                             config,
                         )
-                    maybe_hide_desktop_prompt_display(
-                        final_conn,
-                        config,
-                        session_id,
-                        raw_prompt,
-                        live_mirror_run_id=run_id,
-                    )
             except Exception as exc:
                 print(f"{utc_now()} desktop finalization failed: {exc}", file=sys.stderr, flush=True)
 
@@ -9962,6 +10333,8 @@ def run_codex_app_server(
     timeout_seconds: int | None = None,
     run_id: str | None = None,
     immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
+    stream_progress: bool = False,
+    progress_message_thread_id: int | None = None,
 ) -> RunResult:
     run_started = time.monotonic()
     ensure_private_dir(config.logs_dir)
@@ -9973,6 +10346,15 @@ def run_codex_app_server(
     log_path = config.logs_dir / f"{run_id}.app-server.jsonl"
     write_private_text(prompt_path, prompt)
     create_run(conn, run_id, chat_id, session_id_before, prompt_path, reply_path, log_path)
+    progress: TelegramTurnProgress | None = None
+    if stream_progress and config.stream_progress:
+        progress = TelegramTurnProgress(
+            config,
+            chat_id,
+            run_id,
+            reply_to_message_id=message_id,
+            message_thread_id=progress_message_thread_id,
+        )
     live_sync_stop = threading.Event()
     live_sync_thread: threading.Thread | None = None
     if session_id_before and config.engine == "app-server" and config.desktop_sync:
@@ -9981,8 +10363,6 @@ def run_codex_app_server(
             args=(
                 config,
                 session_id_before,
-                prompt,
-                run_id,
                 desktop_title,
                 desktop_preview,
                 live_sync_stop,
@@ -10015,6 +10395,12 @@ def run_codex_app_server(
             file=sys.stderr,
             flush=True,
         )
+
+    def on_thread_ready(sid: str) -> None:
+        nonlocal session_id_after
+        persist_ready_shared_thread(conn, config, chat_id, session_id_before, sid)
+        session_id_after = sid
+
     try:
         session_id_after, reply, error, channel_events, actual_prompt = app_client.run_turn(
             session_id_before,
@@ -10024,6 +10410,8 @@ def run_codex_app_server(
             resume_failure_handoff=resume_failure_handoff,
             timeout_seconds=timeout_seconds,
             immediate_channel_event_sender=immediate_channel_event_sender,
+            protocol_event_handler=progress.handle_protocol_event if progress is not None else None,
+            thread_ready_handler=on_thread_ready,
         )
         if error:
             status = "error"
@@ -10038,12 +10426,17 @@ def run_codex_app_server(
         if live_sync_thread is not None:
             live_sync_thread.join(timeout=1)
 
+    if progress is not None:
+        progress.finish(status, error)
+
     if actual_prompt != prompt:
         write_private_text(prompt_path, actual_prompt)
     write_private_text(reply_path, reply)
     write_channel_events(channel_events_path, channel_events)
     if status == "ok" and session_id_after:
-        set_session_for_config(conn, chat_id, session_id_after, config)
+        if config.session_scope != "shared" or shared_session_for_engine(conn, config.engine) == session_id_after:
+            set_session_for_config(conn, chat_id, session_id_after, config)
+
     if status != "ok" and not reply:
         reply = (
             "这次 Codex app-server 调用没跑完。"
@@ -10053,16 +10446,14 @@ def run_codex_app_server(
         )
         write_private_text(reply_path, reply)
     finish_run(conn, run_id, status, session_id_after, error)
+    session_budget.ingest(conn, log_path)
     schedule_desktop_run_finalization(
         config,
         session_id_after,
-        actual_prompt,
         run_id,
         desktop_title,
         desktop_preview,
     )
-    if status != "ok":
-        maybe_rollover_failed_shared_session(conn, config, session_id_after or session_id_before, error)
     return RunResult(
         run_id=run_id,
         status=status,
@@ -10150,6 +10541,8 @@ def run_codex(
     timeout_seconds: int | None = None,
     run_id: str | None = None,
     immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
+    stream_progress: bool = False,
+    progress_message_thread_id: int | None = None,
 ) -> RunResult:
     if config.engine == "app-server":
         if app_client is None:
@@ -10168,6 +10561,8 @@ def run_codex(
             timeout_seconds=timeout_seconds,
             run_id=run_id,
             immediate_channel_event_sender=immediate_channel_event_sender,
+            stream_progress=stream_progress,
+            progress_message_thread_id=progress_message_thread_id,
         )
     return run_codex_exec(
         conn,
@@ -10286,7 +10681,8 @@ def run_channel_mcp_server() -> None:
         "telegram-channel",
         instructions=(
             "You are connected to Telegram through a channel tool. "
-            "The Telegram chat only sees messages sent with reply, send_photos, send_files, react, or edit_message. "
+            "The Telegram chat only sees messages sent with reply, rich_reply, send_photos, send_files, react, "
+            "edit_message, or edit_rich_message. "
             "Normal final answers stay in private transcript output."
         ),
     )
@@ -10407,6 +10803,46 @@ def run_channel_mcp_server() -> None:
             append_event(event)
         suffix = f" + {len(file_paths)} file(s)" if file_paths else ""
         return f"Recorded Telegram channel reply{suffix}"
+
+    @mcp.tool()
+    def rich_reply(
+        chat_id: str = "current",
+        markdown: str = "",
+        html: str = "",
+        blocks: Any = None,
+        reply_to: str = "",
+        silent: bool = False,
+        rtl: bool = False,
+        skip_entity_detection: bool = False,
+    ) -> str:
+        """Send one persistent Telegram Rich Message with exactly one content format."""
+
+        try:
+            rich_message = build_input_rich_message(
+                {
+                    "markdown": markdown,
+                    "html": html,
+                    "blocks": blocks,
+                    "rtl": rtl,
+                    "skip_entity_detection": skip_entity_detection,
+                }
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        preview = rich_message_plain_text(rich_message)
+        if not preview:
+            return "Error: rich content must include visible text"
+        append_event(
+            {
+                "type": "rich_reply",
+                "chat_id": str(chat_id or "current").strip(),
+                "rich_message": rich_message,
+                "reply_to": str(reply_to) if reply_to else "",
+                "silent": bool(silent),
+                "ts": utc_now(),
+            }
+        )
+        return "Recorded persistent Telegram rich reply"
 
     @mcp.tool()
     def send_photos(
@@ -10627,6 +11063,45 @@ def run_channel_mcp_server() -> None:
         )
         return "Recorded Telegram message edit"
 
+    @mcp.tool()
+    def edit_rich_message(
+        chat_id: str = "current",
+        message_id: str = "",
+        markdown: str = "",
+        html: str = "",
+        blocks: Any = None,
+        rtl: bool = False,
+        skip_entity_detection: bool = False,
+    ) -> str:
+        """Edit a persistent Telegram Rich Message previously sent by the bot."""
+
+        if not str(message_id).strip():
+            return "Error: message_id is required"
+        try:
+            rich_message = build_input_rich_message(
+                {
+                    "markdown": markdown,
+                    "html": html,
+                    "blocks": blocks,
+                    "rtl": rtl,
+                    "skip_entity_detection": skip_entity_detection,
+                }
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if not rich_message_plain_text(rich_message):
+            return "Error: rich content must include visible text"
+        append_event(
+            {
+                "type": "edit_rich_message",
+                "chat_id": str(chat_id or "current").strip(),
+                "message_id": str(message_id).strip(),
+                "rich_message": rich_message,
+                "ts": utc_now(),
+            }
+        )
+        return "Recorded Telegram rich message edit"
+
     mcp.run(transport="stdio")
 
 
@@ -10650,6 +11125,60 @@ WORKER_ALARM_MIN_SECONDS = 5
 WORKER_ALARM_DEFAULT_SECONDS = 60
 WORKER_RUNNING_RECHECK_SECONDS = 60
 WORKER_MAX_FAILED_ATTEMPTS = 2
+WORKER_COMPLETION_DETERMINISTIC = "deterministic"
+WORKER_COMPLETION_RESIDENT_REVIEW = "resident_review"
+WORKER_COMPLETION_DELIVERY_MODES = {
+    WORKER_COMPLETION_DETERMINISTIC,
+    WORKER_COMPLETION_RESIDENT_REVIEW,
+}
+WORKER_PATHISH_TOKEN_RE = re.compile(
+    r"(?<!\S)\S*[\\/]\S*|\b[\w.-]+\.(?:py|pyi|js|jsx|ts|tsx|json|toml|ya?ml|ini|cfg|conf|md|txt|"
+    r"sql|sh|zsh|bash|go|rs|java|kt|swift|c|cc|cpp|h|hpp|css|scss|html|vue|svelte)\b",
+    re.IGNORECASE,
+)
+WORKER_NEGATED_MUTATION_RE = re.compile(
+    r"(?:\b(?:do\s+not|don't|without|no\s+need\s+to)\s+(?:"
+    r"(?:edit(?:ing)?|modif(?:y|ying)|chang(?:e|ing)|fix(?:ing)?|implement(?:ing)?|writ(?:e|ing)|"
+    r"creat(?:e|ing)|delet(?:e|ing)|remov(?:e|ing)|renam(?:e|ing)|mov(?:e|ing)|patch(?:ing)?|"
+    r"refactor(?:ing)?|updat(?:e|ing)|restart(?:ing)?|deploy(?:ing)?)"
+    r"(?:\s+(?:any\s+)?(?:code|files?|config(?:uration)?|data|database|service|state))?|"
+    r"mak(?:e|ing)\s+(?:any\s+)?changes?)|"
+    r"(?:不|不要|无需|不用|别|先别)(?:做)?(?:任何)?(?:修改|修复|修|改动|改|实现|写入|新增|创建|删除|"
+    r"移除|重命名|移动|打补丁|重构|更新|重启|部署)(?:任何)?(?:代码|源码|文件|仓库|配置|脚本|数据库|"
+    r"数据|记录|服务|状态)?)",
+    re.IGNORECASE,
+)
+WORKER_MUTATING_TASK_RE = re.compile(
+    r"(?:\b(?:fix|implement|patch|refactor|install|upgrade|restart|reload|deploy|publish|release|commit|"
+    r"push|merge|migrate|backfill|insert|upload)\b|"
+    r"\b(?:edit|modify|change|write|create|delete|remove|rename|move|format|update)\b.{0,48}"
+    r"\b(?:code|source|file|repository|repo|config|configuration|script|test|database|db|schema|record|"
+    r"service|daemon|process|setting|state|document|prompt|instructions?|docs?|readme)\b|"
+    r"\b(?:send|reply|post)\b.{0,32}\b(?:message|email|mail|telegram|slack|comment)\b|"
+    r"(?:修复|修好|修一下|实现|改(?:一下|动|掉|成|代码|配置)|写入|新增(?:功能|文件|配置|记录)?|"
+    r"删除|移除|重命名|移动文件|打补丁|重构|格式化(?:代码|文件)?|安装|升级|重启|重载|重开|"
+    r"开启服务|关闭服务|部署|发布|提交|推送|合并|迁移|回填|插入|发消息|回复消息|回复邮件|上传|"
+    r"(?:修改|更新|创建|改).{0,24}(?:代码|源码|文件|仓库|配置|脚本|测试|数据库|数据|记录|服务|进程|"
+    r"设置|状态|提示词|指令|文档)))",
+    re.IGNORECASE,
+)
+WORKER_READ_ONLY_TASK_RE = re.compile(
+    r"(?:\b(?:read[- ]?only|read|inspect|investigate|analy[sz]e|audit|review|diagnose|check|trace|"
+    r"explain|summarize|report|compare|list|find|search|measure|verify|validate|look\s+into)\b|"
+    r"(?:只读|检查|查(?:一下|找|明|看)?|排查|调查|分析|审计|审查|诊断|看看|看一下|追踪|解释|总结|"
+    r"盘点|盘一下|对比|列出|找出|搜索|衡量|测量|验证|核验|读取|阅读))",
+    re.IGNORECASE,
+)
+WORKER_FAILED_CHECK_COMMAND_RE = re.compile(
+    r"(?:\bpytest\b|\bunittest\b|\bcargo\s+test\b|\bgo\s+test\b|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?"
+    r"(?:test|check|lint|build)\b|\b(?:ruff|mypy|pyright|eslint|tsc)\b|\bmake\s+(?:test|check|lint)\b)",
+    re.IGNORECASE,
+)
+WORKER_UNCERTAIN_RESULT_RE = re.compile(
+    r"(?im)^\s*(?:tests?|checks?|verification|test status|check status|验证|测试|核验)\s*[:：]\s*"
+    r"(?:failed|failure|error|blocked|unknown|uncertain|not run|not verified|失败|报错|阻塞|未知|不确定|"
+    r"未运行|没跑|未验证)(?:\b|\s|$)"
+)
 CAPABILITY_PROFILE_VERSION = 1
 CAPABILITY_MARKETPLACE_NAME = "telegram-capabilities"
 CAPABILITY_PROFILE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
@@ -11154,6 +11683,11 @@ def worker_terminal_message(state: dict[str, Any], *, max_chars: int = 1800) -> 
             "当前没有完成交付；需要继续时我会先处理这个阻塞点。"
         )
     result = worker_read_text(state.get("output_path"), max_chars)
+    result = re.sub(
+        r"(?im)\n?\s*status\s*:\s*(?:complete|needs(?:[_ -]?input)?)\s*$",
+        "",
+        result,
+    ).strip()
     if status == "needs_input":
         heading = f"长任务「{title}」需要你补一个决定："
     else:
@@ -11273,6 +11807,7 @@ def finish_worker_attempt(state: dict[str, Any], result_text: str, returncode: i
         count = worker_failure_count(state) + 1
         detail = worker_attempt_error_detail(state)
         state["failure_count"] = count
+        state["had_failure"] = True
         state["last_error"] = detail
         state["circuit_open"] = count >= WORKER_MAX_FAILED_ATTEMPTS or not worker_failure_retryable(detail)
     else:
@@ -11288,6 +11823,9 @@ def normalize_worker_failure_metadata(state: dict[str, Any]) -> bool:
     if worker_failure_count(state) <= 0:
         state["failure_count"] = 1
         changed = True
+    if not bool(state.get("had_failure")):
+        state["had_failure"] = True
+        changed = True
     if not str(state.get("last_error") or "").strip():
         state["last_error"] = worker_attempt_error_detail(state)
         changed = True
@@ -11298,6 +11836,87 @@ def normalize_worker_failure_metadata(state: dict[str, Any]) -> bool:
         state["circuit_open"] = circuit_open
         changed = True
     return changed
+
+
+def worker_completion_policy_for_task(
+    task: str,
+    *,
+    capability_profile_name: str = "",
+) -> tuple[str, str]:
+    if capability_profile_name.strip():
+        return WORKER_COMPLETION_RESIDENT_REVIEW, "external app capability"
+    clean = re.sub(r"\s+", " ", task).strip()
+    mutation_scope = WORKER_PATHISH_TOKEN_RE.sub(" ", clean)
+    mutation_scope = WORKER_NEGATED_MUTATION_RE.sub(" ", mutation_scope)
+    if WORKER_MUTATING_TASK_RE.search(mutation_scope):
+        return WORKER_COMPLETION_RESIDENT_REVIEW, "task requests a code, configuration, data, or external write"
+    if WORKER_READ_ONLY_TASK_RE.search(clean):
+        return WORKER_COMPLETION_DETERMINISTIC, "task is explicitly read-only investigation or verification"
+    return WORKER_COMPLETION_RESIDENT_REVIEW, "task does not establish a read-only scope"
+
+
+def worker_completion_policy_from_state(state: dict[str, Any]) -> tuple[str, str]:
+    mode = str(state.get("completion_delivery") or "").strip()
+    reason = str(state.get("completion_delivery_reason") or "").strip()
+    if mode not in WORKER_COMPLETION_DELIVERY_MODES:
+        return WORKER_COMPLETION_RESIDENT_REVIEW, "legacy or unknown task risk"
+    return mode, reason
+
+
+def merge_worker_completion_policy(state: dict[str, Any], task: str) -> tuple[str, str]:
+    current_requires_review, runtime_reason = worker_terminal_review_decision(state)
+    if current_requires_review:
+        return WORKER_COMPLETION_RESIDENT_REVIEW, runtime_reason
+    current_mode, current_reason = worker_completion_policy_from_state(state)
+    next_mode, next_reason = worker_completion_policy_for_task(task)
+    if current_mode == WORKER_COMPLETION_RESIDENT_REVIEW:
+        return current_mode, current_reason
+    if next_mode == WORKER_COMPLETION_RESIDENT_REVIEW:
+        return next_mode, next_reason
+    return WORKER_COMPLETION_DETERMINISTIC, "initial task and follow-up are explicitly read-only"
+
+
+def worker_jsonl_terminal_review_reason(path: Any) -> str:
+    if not path:
+        return ""
+    try:
+        lines = Path(str(path)).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+            continue
+        item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "file_change":
+            return "worker recorded file changes"
+        if item_type != "command_execution" or int_or_none(item.get("exit_code")) in {None, 0}:
+            continue
+        if WORKER_FAILED_CHECK_COMMAND_RE.search(str(item.get("command") or "")):
+            return "worker recorded a failed test, check, lint, or build command"
+    return ""
+
+
+def worker_terminal_review_decision(state: dict[str, Any]) -> tuple[bool, str]:
+    status = str(state.get("status") or "unknown").strip()
+    if status != "complete":
+        return True, f"worker terminal status is {status}"
+    if str(state.get("capability_profile") or "").strip():
+        return True, "external app capability"
+    if bool(state.get("had_failure")) or worker_failure_count(state) > 0:
+        return True, "worker failed or retried before reaching this result"
+    runtime_reason = worker_jsonl_terminal_review_reason(state.get("jsonl_path"))
+    if runtime_reason:
+        return True, runtime_reason
+    result = worker_read_text(state.get("output_path"), WORKER_RESULT_PREVIEW_CHARS)
+    if WORKER_UNCERTAIN_RESULT_RE.search(result):
+        return True, "worker reported failed or uncertain verification"
+    mode, reason = worker_completion_policy_from_state(state)
+    return mode == WORKER_COMPLETION_RESIDENT_REVIEW, reason
 
 
 def worker_find_session_id_in_obj(obj: Any) -> str | None:
@@ -11371,11 +11990,15 @@ def build_worker_prompt(task: str) -> str:
         "Carry the concrete task to completion in this repository when enough information is available.\n"
         "Keep changes scoped to the requested behavior and existing patterns.\n"
         "Use focused verification that matches the risk of the change.\n"
-        "When finished, report files changed, checks run, and a concise result.\n"
+        f"{WORKER_DISCOVERY_GUIDANCE}"
+        "When finished, report files changed, checks run, and a concise result. For a read-only task, say explicitly "
+        "that no files or external state changed. Report failed or uncertain verification explicitly; when an owner "
+        "choice is required, use needs_input instead of presenting an ordinary success.\n"
         "Do not send Telegram messages, start Telegram channel tools, or speak to the Telegram chat directly. "
         "Only the Telegram resident supervisor decides what is visible in Telegram.\n"
         "End with a status line: `status: complete` or `status: needs_input`.\n"
-        "The Telegram supervisor will read your final response and decide how to speak to the owner.\n\n"
+        "The bridge deterministically delivers routine read-only success; the Telegram resident reviews higher-risk "
+        "terminal results.\n\n"
         f"Task:\n{task.strip()}\n"
     )
 
@@ -11384,6 +12007,9 @@ def build_worker_continue_prompt(task: str) -> str:
     return (
         "Telegram supervisor follow-up for this worker session.\n"
         "Continue from your existing context and carry the task to the next useful stopping point.\n"
+        f"{WORKER_DISCOVERY_GUIDANCE}"
+        "For a read-only task, say explicitly that no files or external state changed. Report failed or uncertain "
+        "verification explicitly; when an owner choice is required, use needs_input instead of presenting an ordinary success.\n"
         "Do not send Telegram messages or use Telegram channel tools; return private worker output only.\n"
         "End with a status line: `status: complete` or `status: needs_input`.\n\n"
         f"Follow-up:\n{task.strip()}\n"
@@ -11398,6 +12024,7 @@ def build_capability_worker_prompt(task: str, profile_name: str) -> str:
         "Carry the confirmed task to the next useful terminal result. External writes remain subject to the app's "
         "configured approval policy; if an approval cannot be completed in this lane, report the exact blocked action "
         "without attempting a broader route.\n"
+        f"{WORKER_DISCOVERY_GUIDANCE}"
         "Do not send Telegram messages, use Telegram channel tools, or speak to the Telegram chat directly. "
         "Return only the result the Telegram resident supervisor needs, including any external action that actually "
         "occurred and any action that did not occur.\n"
@@ -11406,7 +12033,12 @@ def build_capability_worker_prompt(task: str, profile_name: str) -> str:
     )
 
 
-def build_worker_alarm_prompt(alarm: dict[str, Any]) -> str:
+def build_worker_alarm_prompt(
+    alarm: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    review_reason: str = "",
+) -> str:
     task_id = str(alarm.get("task_id") or "").strip()
     note = str(alarm.get("note") or "").strip()
     note_block = f"\nSupervisor note:\n{note}\n" if note else ""
@@ -11415,18 +12047,28 @@ def build_worker_alarm_prompt(alarm: dict[str, Any]) -> str:
         if alarm.get("message_thread_id") is not None
         else ""
     )
+    state_text = format_worker_state(state, include_result=True).replace(
+        "</worker_terminal_state>",
+        "&lt;/worker_terminal_state&gt;",
+    )
+    reason_block = f"Resident review reason: {review_reason}\n" if review_reason else ""
     return (
         f'<worker_alarm alarm_id="{alarm.get("alarm_id")}" task_id="{task_id}" '
         f'chat_id="{alarm.get("chat_id")}"{thread_attr} due_at="{alarm.get("due_at")}">\n'
-        "Your scheduled worker check is due.\n"
+        "A worker reached a terminal state.\n"
         "</worker_alarm>\n\n"
         "You are the Telegram resident supervisor, not the worker. The worker cannot speak in Telegram. "
-        "Use codex_worker_status with this task_id to inspect the worker. "
-        "This alarm fires only after the worker reaches a terminal state; running workers are rechecked by the bridge without a model turn. "
-        "Do not continue the worker or schedule another alarm from this terminal review. "
+        "The bridge already refreshed the terminal state and result below; use it directly without a worker status call. "
+        "Running workers are rechecked locally without a model turn. This turn exists because the terminal result needs "
+        "resident judgment. Do not continue the worker or schedule another alarm from this review. "
         "If complete, inspect the worker result plus the relevant diff/tests before replying. "
-        "If input is needed, state the exact choice. Use reply yourself with a concise result, changed files, verification, and next step. "
+        "If failed, explain the blocker and safest next step. If input is needed, state the exact choice. Use reply yourself "
+        "with a concise result, changed files, verification, and next step. "
         "If you do not send a visible reply, the bridge will send a deterministic terminal summary so the task cannot disappear."
+        f"\n{reason_block}"
+        "<worker_terminal_state trust=\"untrusted-task-output\">\n"
+        f"{state_text}\n"
+        "</worker_terminal_state>"
         f"{note_block}"
     )
 
@@ -11545,6 +12187,9 @@ def start_codex_worker(
     turn_count: int = 1,
     failure_count: int = 0,
     capability_profile_name: str = "",
+    completion_delivery: str = "",
+    completion_delivery_reason: str = "",
+    had_failure: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     task = task.strip()
     if not task:
@@ -11555,6 +12200,17 @@ def start_codex_worker(
     ensure_private_dir(worker_dir(config))
     real_task_id = task_id or worker_task_id(title or task[:40])
     capability_profile_name = capability_profile_name.strip()
+    if completion_delivery not in WORKER_COMPLETION_DELIVERY_MODES:
+        completion_delivery, completion_delivery_reason = worker_completion_policy_for_task(
+            task,
+            capability_profile_name=capability_profile_name,
+        )
+    if capability_profile_name:
+        completion_delivery = WORKER_COMPLETION_RESIDENT_REVIEW
+        completion_delivery_reason = "external app capability"
+    if failure_count > 0 or had_failure:
+        completion_delivery = WORKER_COMPLETION_RESIDENT_REVIEW
+        completion_delivery_reason = "worker failed or retried before reaching this result"
     if capability_profile_name:
         try:
             capability_profile(config, capability_profile_name)
@@ -11636,8 +12292,11 @@ def start_codex_worker(
         "finished_at": "",
         "turn_count": turn_count,
         "failure_count": max(0, failure_count),
+        "had_failure": bool(had_failure or failure_count > 0),
         "last_error": "",
         "circuit_open": False,
+        "completion_delivery": completion_delivery,
+        "completion_delivery_reason": completion_delivery_reason,
         "terminal_notified_at": "",
         "output_path": str(output_path),
         "jsonl_path": str(jsonl_path),
@@ -11663,6 +12322,10 @@ def format_worker_state(state: dict[str, Any], *, include_result: bool = True) -
     if state.get("capability_profile"):
         lines.append(f"capability_profile: {state.get('capability_profile')}")
         lines.append("one_shot: true")
+    completion_delivery, completion_reason = worker_completion_policy_from_state(state)
+    lines.append(f"completion_delivery: {completion_delivery}")
+    if completion_reason:
+        lines.append(f"completion_delivery_reason: {completion_reason}")
     if state.get("finished_at"):
         lines.append(f"finished_at: {state.get('finished_at')}")
     if state.get("returncode") is not None:
@@ -12131,6 +12794,43 @@ def app_server_react_tool_spec() -> dict[str, Any]:
     }
 
 
+def app_server_rich_reply_tool_spec() -> dict[str, Any]:
+    return {
+        "name": "rich_reply",
+        "description": (
+            "Send one persistent Telegram Rich Message. Use it when native tables, mathematical expressions, "
+            "collapsible details, checklists, structured quotations, or richer layout materially help. "
+            "Exactly one of markdown, html, or blocks is allowed. Omit chat_id for the current chat and use "
+            "reply_to only when quoting. Use ordinary reply for code or commands the reader should copy easily. "
+            "Returns message_id when delivery to the current chat succeeds immediately."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "string"},
+                "markdown": {"type": "string", "maxLength": TELEGRAM_RICH_MAX_TEXT},
+                "html": {"type": "string", "maxLength": TELEGRAM_RICH_MAX_TEXT},
+                "blocks": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "minItems": 1,
+                    "maxItems": TELEGRAM_RICH_MAX_BLOCKS,
+                },
+                "reply_to": {"type": "string"},
+                "silent": {"type": "boolean"},
+                "rtl": {"type": "boolean"},
+                "skip_entity_detection": {"type": "boolean"},
+            },
+            "oneOf": [
+                {"required": ["markdown"]},
+                {"required": ["html"]},
+                {"required": ["blocks"]},
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+
 def app_server_edit_message_tool_spec() -> dict[str, Any]:
     return {
         "name": "edit_message",
@@ -12145,6 +12845,40 @@ def app_server_edit_message_tool_spec() -> dict[str, Any]:
                 "text": {"type": "string"},
             },
             "required": ["message_id", "text"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def app_server_edit_rich_message_tool_spec() -> dict[str, Any]:
+    return {
+        "name": "edit_rich_message",
+        "description": (
+            "Edit a persistent Telegram Rich Message previously sent by this bot. Omit chat_id for the current "
+            "chat. Exactly one of markdown, html, or blocks is allowed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "string"},
+                "message_id": {"type": "string"},
+                "markdown": {"type": "string", "maxLength": TELEGRAM_RICH_MAX_TEXT},
+                "html": {"type": "string", "maxLength": TELEGRAM_RICH_MAX_TEXT},
+                "blocks": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "minItems": 1,
+                    "maxItems": TELEGRAM_RICH_MAX_BLOCKS,
+                },
+                "rtl": {"type": "boolean"},
+                "skip_entity_detection": {"type": "boolean"},
+            },
+            "required": ["message_id"],
+            "oneOf": [
+                {"required": ["markdown"]},
+                {"required": ["html"]},
+                {"required": ["blocks"]},
+            ],
             "additionalProperties": False,
         },
     }
@@ -12207,7 +12941,8 @@ def app_server_codex_worker_status_tool_spec() -> dict[str, Any]:
         "name": "codex_worker_status",
         "description": (
             "Read Codex worker state. Pass a task_id to inspect one worker, or omit task_id to see recent workers. "
-            "Use this as the Telegram supervisor before deciding what to tell the owner."
+            "Use this for exact terminal output or an explicit manual diagnosis. Worker context injected into resident "
+            "turns is already refreshed, so routine running-state routing does not need a status call."
         ),
         "inputSchema": {
             "type": "object",
@@ -12225,7 +12960,7 @@ def app_server_codex_worker_continue_tool_spec() -> dict[str, Any]:
         "name": "codex_worker_continue",
         "description": (
             "Send follow-up instructions into the same Codex worker session. "
-            "Use this after codex_worker_status shows a worker with a session_id and the owner gives new direction."
+            "Use this when refreshed worker context includes a session_id and the owner gives new direction."
         ),
         "inputSchema": {
             "type": "object",
@@ -12245,8 +12980,8 @@ def app_server_codex_worker_alarm_tool_spec() -> dict[str, Any]:
     return {
         "name": "codex_worker_alarm",
         "description": (
-            "Set a private check point for a Codex worker. When the delay passes, the Telegram bridge receives a scheduled "
-            "worker check in the shared thread and can inspect status, report, continue, or set another check point."
+            "Recover private supervision for a Codex worker that has no active alarm. Worker start already schedules one "
+            "automatic alarm, and an existing active alarm is reused instead of rescheduled."
         ),
         "inputSchema": {
             "type": "object",
@@ -12269,10 +13004,12 @@ def app_server_dynamic_tools() -> list[dict[str, Any]]:
         return []
     return [
         app_server_reply_tool_spec(),
+        app_server_rich_reply_tool_spec(),
         app_server_send_photos_tool_spec(),
         app_server_send_files_tool_spec(),
         app_server_react_tool_spec(),
         app_server_edit_message_tool_spec(),
+        app_server_edit_rich_message_tool_spec(),
         app_server_leave_chat_tool_spec(),
         app_server_codex_worker_start_tool_spec(),
         app_server_codex_worker_status_tool_spec(),
@@ -12296,10 +13033,11 @@ def app_server_base_instructions(config: Config) -> str:
     return (
         "You are a Codex collaborator reached through Telegram.\n\n"
         "Channel contract: the Telegram chat only sees messages sent with Telegram channel tools "
-        "(reply, send_photos, send_files, react, edit_message). "
+        "(reply, rich_reply, send_photos, send_files, react, edit_message, edit_rich_message). "
         "Codex worker tools (codex_worker_start, codex_worker_status, codex_worker_continue, codex_worker_alarm) "
-        "manage background execution, private check points, and private tool results for your supervision; workers do not "
-        "speak in Telegram, and you remain the Telegram resident who inspects, continues, and reports when useful. "
+        "manage background execution and private tool results; workers do not speak in Telegram. Starting a worker "
+        "automatically schedules supervision, and later resident turns receive refreshed worker context for routine routing. "
+        "You remain the Telegram resident who continues a task when the owner adds direction and reviews high-risk terminal results. "
         "Normal final answers stay in private transcript output for Codex Desktop. "
         "For tool chat_id, omit it for the current chat or pass current/here/this explicitly; "
         "owner/owner_private/dm mean the single owner private chat when exactly one owner is configured. "
@@ -12310,8 +13048,10 @@ def app_server_base_instructions(config: Config) -> str:
         f"Media/file lists may contain up to {TELEGRAM_OUTBOUND_TOOL_MAX_FILES} paths and are split into Telegram "
         f"batches of {TELEGRAM_MEDIA_GROUP_MAX_ITEMS}. "
         "If you use reply files/file/attachments/images/photos/documents, local paths and file:// URI objects are accepted and converted to photo/file sends; short text with files becomes the first media caption, while longer text is sent before media. "
-        "Use react for lightweight acknowledgement when text would be noisy; use edit_message only for messages "
-        "the bot already sent, mainly quiet progress updates. "
+        "Use rich_reply for native tables, formulas, collapsible details, checklists, and other structured layouts; "
+        "give exactly one of markdown, html, or blocks. Use ordinary reply for code or commands people should copy. "
+        "Use react for lightweight acknowledgement when text would be noisy; use edit_message/edit_rich_message "
+        "only for messages the bot already sent, mainly quiet updates. "
         "When Telegram inbound messages include local_path attachment lines, open/read those files only "
         "when the current reply genuinely needs their contents. "
         "Messages from Telegram arrive as "
@@ -12471,10 +13211,109 @@ class CodexAppServerClient:
         self.protocol_lock = threading.Lock()
         self.next_id = 1
         self.loaded_threads: set[str] = set()
+        self.internal_handover = False
         self.current_turn_chat_id: str | None = None
         self.current_turn_message_thread_id: int | None = None
         self.current_turn_owner_private: bool = False
         self.current_turn_immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None
+
+    def _maintenance_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request = self._send_request_locked(method, params)
+        return self._wait_for_response_locked(request, time.monotonic() + 30, None, [])["result"]
+
+    def resume_resident(self, sid: str) -> None:
+        """Warm the existing thread without inference or a fallback new thread."""
+        ensure_private_dir(self.config.logs_dir)
+        with self.protocol_lock, (self.config.logs_dir / "startup-resume.app-server.jsonl").open("a", encoding="utf-8") as log:
+            self._ensure_started_locked(log)
+            self._request_thread_resume_locked(sid, time.monotonic() + 30, log, [])
+            self.loaded_threads.add(sid)
+
+    def thread_is_quiescent(self, sid: str) -> bool:
+        with self.protocol_lock:
+            self._ensure_started_locked()
+            # Resume does not start inference. It also detects unreadable threads.
+            if sid not in self.loaded_threads:
+                self._request_thread_resume_locked(sid, time.monotonic() + 30, None, [])
+                self.loaded_threads.add(sid)
+            result = self._maintenance_request("thread/backgroundTerminals/list", {"threadId": sid, "limit": 1})
+            if result.get("data") or result.get("nextCursor"):
+                return False
+            thread = self._maintenance_request("thread/read", {"threadId": sid, "includeTurns": False})["thread"]
+            return (thread.get("status") or {}).get("type") == "idle"
+
+    def summarize_for_handover(self, sid: str, evidence: str) -> str:
+        # An ephemeral read-only fork sees the compacted history without adding
+        # an instruction or synthetic assistant reply to the resident thread.
+        # The fork's config disables native action tools; client-owned tools are
+        # rejected while this operation owns the protocol lock.
+        summary_id = None
+        log_path = self.config.logs_dir / f"handover-{sid}.jsonl"
+        ensure_private_dir(log_path.parent)
+        with self.protocol_lock, log_path.open("a", encoding="utf-8") as log:
+            self._ensure_started_locked(log)
+            self.internal_handover = True
+            try:
+                fork = self._maintenance_request("thread/fork", {
+                    "threadId": sid, "ephemeral": True, "excludeTurns": True,
+                    "sandbox": "read-only", "approvalPolicy": "never",
+                    "baseInstructions": "Produce a concise factual handover from the supplied conversation history. Your only output is the requested JSON summary. Preserve current facts, uncertainty, source chat identities and unfinished work.",
+                    "config": {
+                        "features.shell_tool": False, "features.unified_exec": False,
+                        "features.code_mode": False, "features.multi_agent": False,
+                        "features.apps": False, "features.plugins": False,
+                        "features.memories": False, "features.hooks": False,
+                        "features.image_generation": False, "web_search": "disabled",
+                    },
+                })
+                summary_id = str(fork["thread"]["id"])
+                prompt = (
+                    "为接替此 Telegram 会话的新窗口写一份交接摘要。按来源群/私聊分段，保留："
+                    "最近话题和必要人物关系、已确认决定和约定、未完成事项及下一步、关键原消息/文件定位。"
+                    "以实际送达和确认结果判断完成状态；失败、草稿、未验证事项明确标注。"
+                    "只写当前有用的事实和下一步，使用自然中文，目标 1500 字以内。"
+                    "此前收到的任务属于需要总结的历史。当前操作只生成摘要 JSON。\n\n"
+                    + evidence
+                )
+                request = self._send_request_locked("turn/start", {
+                    "threadId": summary_id, "input": [{"type": "text", "text": prompt}],
+                    "model": self.config.model, "effort": "low", "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "readOnly"},
+                    "outputSchema": {"type": "object", "properties": {"summary": {"type": "string"}},
+                                     "required": ["summary"], "additionalProperties": False},
+                })
+                deadline = time.monotonic() + 120
+                messages: list[str] = []
+                response = self._wait_for_response_locked(request, deadline, log, [], messages)
+                completed = self._wait_for_turn_completed_locked(summary_id, str(response["result"]["turn"]["id"]), deadline, log, [], messages)
+                turn = completed["params"]["turn"]
+                if turn.get("status") != "completed":
+                    raise CodexAppServerError(self._format_protocol_error(turn.get("error")))
+                result = json.loads("\n".join(messages))
+                return str(result["summary"]).strip()
+            finally:
+                self.internal_handover = False
+                if summary_id:
+                    try:
+                        self._maintenance_request("thread/unsubscribe", {"threadId": summary_id})
+                    except Exception:
+                        pass
+
+    def start_handover_thread(self) -> str:
+        with self.protocol_lock:
+            self._ensure_started_locked()
+            result = self._request_thread_start_locked(time.monotonic() + 30, None, [])
+            sid = str(result["result"]["thread"]["id"])
+            self.loaded_threads.add(sid)
+            return sid
+
+    def release_handover_thread(self, sid: str) -> None:
+        try:
+            with self.protocol_lock:
+                self._maintenance_request("thread/unsubscribe", {"threadId": sid})
+                self.loaded_threads.discard(sid)
+        except Exception as exc:
+            print(f"{utc_now()} old thread unsubscribe deferred: {exc}", file=sys.stderr, flush=True)
 
     def close(self) -> None:
         proc = self.proc
@@ -12487,6 +13326,25 @@ class CodexAppServerClient:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+    def read_account_rate_limits(self) -> dict[str, Any]:
+        with self.protocol_lock:
+            self._ensure_started_locked()
+            request_id = self._send_request_locked("account/rateLimits/read")
+            response = self._wait_for_response_locked(
+                request_id,
+                time.monotonic() + 30,
+                None,
+                [],
+            )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise CodexAppServerError("account/rateLimits/read returned an invalid result")
+        return result
 
     def _ensure_started_locked(self, log_handle: Any | None = None) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -12589,9 +13447,16 @@ class CodexAppServerClient:
         log_handle: Any | None,
         channel_events: list[dict[str, Any]],
         agent_messages: list[str] | None = None,
+        protocol_event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         while time.monotonic() < deadline:
-            obj = self._next_protocol_object_locked(deadline, log_handle, channel_events, agent_messages)
+            obj = self._next_protocol_object_locked(
+                deadline,
+                log_handle,
+                channel_events,
+                agent_messages,
+                protocol_event_handler,
+            )
             if obj is None:
                 continue
             if "method" in obj:
@@ -12610,9 +13475,16 @@ class CodexAppServerClient:
         log_handle: Any | None,
         channel_events: list[dict[str, Any]],
         agent_messages: list[str],
+        protocol_event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         while time.monotonic() < deadline:
-            obj = self._next_protocol_object_locked(deadline, log_handle, channel_events, agent_messages)
+            obj = self._next_protocol_object_locked(
+                deadline,
+                log_handle,
+                channel_events,
+                agent_messages,
+                protocol_event_handler,
+            )
             if obj is None:
                 continue
             if obj.get("method") != "turn/completed":
@@ -12629,6 +13501,7 @@ class CodexAppServerClient:
         log_handle: Any | None,
         channel_events: list[dict[str, Any]],
         agent_messages: list[str] | None,
+        protocol_event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any] | None:
         timeout = max(0.1, min(0.5, deadline - time.monotonic()))
         try:
@@ -12649,6 +13522,11 @@ class CodexAppServerClient:
         if "method" in obj and "id" in obj and "params" in obj:
             self._handle_server_request_locked(obj, channel_events)
         self._collect_agent_message(obj, agent_messages)
+        if protocol_event_handler is not None:
+            try:
+                protocol_event_handler(obj)
+            except Exception as exc:
+                print(f"{utc_now()} progress protocol handler failed: {exc}", file=sys.stderr, flush=True)
         return obj
 
     def _handle_server_request_locked(
@@ -12658,6 +13536,12 @@ class CodexAppServerClient:
     ) -> None:
         method = obj.get("method")
         request_id = obj.get("id")
+        if self.internal_handover:
+            if method == "item/tool/call":
+                self._send_response_locked(request_id, self._dynamic_tool_result("Internal handover accepts summary output only", success=False))
+            else:
+                self._send_error_locked(request_id, "Internal handover does not authorize tool actions")
+            return
         if method == "item/tool/call":
             result = self.record_dynamic_tool_call(obj.get("params"), channel_events)
             self._send_response_locked(request_id, result)
@@ -12672,7 +13556,17 @@ class CodexAppServerClient:
         if not isinstance(params, dict):
             return self._dynamic_tool_result("Invalid tool call params", success=False)
         tool = str(params.get("tool") or "").strip()
-        if tool not in {"reply", "send_photos", "send_files", "react", "edit_message", "leave_chat", *WORKER_TOOL_NAMES}:
+        if tool not in {
+            "reply",
+            "rich_reply",
+            "send_photos",
+            "send_files",
+            "react",
+            "edit_message",
+            "edit_rich_message",
+            "leave_chat",
+            *WORKER_TOOL_NAMES,
+        }:
             return self._dynamic_tool_result(f"Unsupported tool: {params.get('tool')}", success=False)
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
@@ -12713,6 +13607,41 @@ class CodexAppServerClient:
             suffix = f" + {len(reply_files)} file(s)" if reply_files else ""
             return self._dynamic_tool_result(f"Recorded Telegram channel reply: {preview}{suffix}", success=True)
 
+        if tool == "rich_reply":
+            try:
+                rich_message = build_input_rich_message(arguments)
+            except ValueError as exc:
+                return self._dynamic_tool_result(str(exc), success=False)
+            preview = rich_message_plain_text(rich_message)
+            if not preview:
+                return self._dynamic_tool_result("rich content must include visible text", success=False)
+            if _looks_like_system_prompt_echo(preview):
+                return self._dynamic_tool_result(
+                    "Blocked Telegram rich reply: looks like system prompt echo",
+                    success=False,
+                )
+            event: dict[str, Any] = {
+                "type": "rich_reply",
+                "chat_id": chat_id,
+                "rich_message": rich_message,
+                "reply_to": reply_to,
+                "silent": bool(arguments.get("silent")),
+                **({"call_id": call_id} if call_id else {}),
+                "ts": utc_now(),
+            }
+            channel_events.append(event)
+            self.send_immediate_channel_events([event])
+            delivered_ids = event.get("telegram_message_ids")
+            id_note = (
+                f" (message_id: {delivered_ids[0]})"
+                if isinstance(delivered_ids, list) and delivered_ids
+                else ""
+            )
+            return self._dynamic_tool_result(
+                f"Recorded Telegram rich reply{id_note}: {truncate_context_text(preview, 500)}",
+                success=True,
+            )
+
         if tool == "react":
             message_id = str(arguments.get("message_id") or "").strip()
             emoji = str(arguments.get("emoji") or "").strip()
@@ -12751,6 +13680,37 @@ class CodexAppServerClient:
             )
             preview = truncate_context_text(text, 500)
             return self._dynamic_tool_result(f"Recorded Telegram message edit: {preview}", success=True)
+
+        if tool == "edit_rich_message":
+            message_id = str(arguments.get("message_id") or "").strip()
+            if not message_id:
+                return self._dynamic_tool_result("message_id is required", success=False)
+            try:
+                rich_message = build_input_rich_message(arguments)
+            except ValueError as exc:
+                return self._dynamic_tool_result(str(exc), success=False)
+            preview = rich_message_plain_text(rich_message)
+            if not preview:
+                return self._dynamic_tool_result("rich content must include visible text", success=False)
+            if _looks_like_system_prompt_echo(preview):
+                return self._dynamic_tool_result(
+                    "Blocked Telegram rich edit: looks like system prompt echo",
+                    success=False,
+                )
+            event = {
+                "type": "edit_rich_message",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "rich_message": rich_message,
+                **({"call_id": call_id} if call_id else {}),
+                "ts": utc_now(),
+            }
+            channel_events.append(event)
+            self.send_immediate_channel_events([event])
+            return self._dynamic_tool_result(
+                f"Recorded Telegram rich message edit: {truncate_context_text(preview, 500)}",
+                success=True,
+            )
 
         file_argument_keys = PHOTO_FILE_ARGUMENT_KEYS if tool == "send_photos" else DOCUMENT_FILE_ARGUMENT_KEYS
         file_paths = coerce_tool_file_paths(arguments, file_argument_keys)
@@ -12852,9 +13812,8 @@ class CodexAppServerClient:
                     chat_id=self.current_turn_chat_id,
                     message_thread_id=self.current_turn_message_thread_id,
                     note=(
-                        "Supervisor checkpoint for a worker you started from Telegram. "
-                        "Inspect status as the Telegram resident, continue the same task_id/session if needed, "
-                        "and decide whether a visible Telegram reply helps."
+                        "Automatic supervisor checkpoint for a worker started from Telegram. Running state is polled "
+                        "locally; only a terminal result that requires resident review opens a model turn."
                     ),
                 )
                 alarm_text = f"\nSupervisor alarm scheduled: {alarm['alarm_id']} due_at: {alarm['due_at']}"
@@ -12922,9 +13881,11 @@ class CodexAppServerClient:
             session_id = str(state.get("session_id") or "").strip()
             if not session_id:
                 return self._dynamic_tool_result(
-                    "Codex worker session id is still pending. Use codex_worker_status again after the worker reports progress.",
+                    "Codex worker session id is still pending. The bridge will refresh the injected worker context "
+                    "automatically; continue after that context includes a session_id.",
                     success=False,
                 )
+            completion_delivery, completion_delivery_reason = merge_worker_completion_policy(state, task)
             next_state, error = start_codex_worker(
                 self.config,
                 task=task,
@@ -12934,6 +13895,9 @@ class CodexAppServerClient:
                 session_id=session_id,
                 turn_count=(int_or_none(state.get("turn_count")) or 1) + 1,
                 failure_count=worker_failure_count(state),
+                completion_delivery=completion_delivery,
+                completion_delivery_reason=completion_delivery_reason,
+                had_failure=bool(state.get("had_failure")),
             )
             if error or next_state is None:
                 return self._dynamic_tool_result(error or "worker continue failed", success=False)
@@ -12960,6 +13924,24 @@ class CodexAppServerClient:
                     "Codex worker retry circuit is open; another alarm would only repeat the same failure.\n"
                     + format_worker_state(state, include_result=False),
                     success=False,
+                )
+            active_alarm = next(
+                (
+                    existing
+                    for existing in list_worker_alarms(self.config)
+                    if str(existing.get("task_id") or "") == task_id
+                    and str(existing.get("status") or "") in {"pending", "firing"}
+                ),
+                None,
+            )
+            if active_alarm is not None:
+                return self._dynamic_tool_result(
+                    "Existing automatic worker alarm already covers this task:\n"
+                    f"alarm_id: {active_alarm['alarm_id']}\n"
+                    f"task_id: {active_alarm['task_id']}\n"
+                    f"due_at: {active_alarm['due_at']}\n"
+                    f"chat_id: {active_alarm['chat_id']}",
+                    success=True,
                 )
             chat_id = str(arguments.get("chat_id") or self.current_turn_chat_id or "").strip()
             if not chat_id:
@@ -13009,6 +13991,8 @@ class CodexAppServerClient:
         item = params.get("item") if isinstance(params.get("item"), dict) else {}
         if item.get("type") != "agentMessage":
             return
+        if str(item.get("phase") or "").strip() == "commentary":
+            return
         text = str(item.get("text") or "").strip()
         if text:
             agent_messages.append(text)
@@ -13030,6 +14014,8 @@ class CodexAppServerClient:
         resume_failure_handoff: str | Callable[[], str] = "",
         timeout_seconds: int | None = None,
         immediate_channel_event_sender: Callable[[list[dict[str, Any]]], None] | None = None,
+        protocol_event_handler: Callable[[dict[str, Any]], None] | None = None,
+        thread_ready_handler: Callable[[str], None] | None = None,
     ) -> tuple[str | None, str, str | None, list[dict[str, Any]], str]:
         channel_events: list[dict[str, Any]] = []
         agent_messages: list[str] = []
@@ -13056,6 +14042,8 @@ class CodexAppServerClient:
                         else resume_failure_handoff
                     )
                     actual_prompt = inject_resume_failure_handoff(prompt, handoff, resume_error)
+                if thread_ready_handler is not None:
+                    thread_ready_handler(thread_id)
                 turn_id = self._start_turn_locked(
                     thread_id,
                     actual_prompt,
@@ -13063,6 +14051,7 @@ class CodexAppServerClient:
                     deadline,
                     log_handle,
                     channel_events,
+                    protocol_event_handler,
                 )
                 completed = self._wait_for_turn_completed_locked(
                     thread_id,
@@ -13071,6 +14060,7 @@ class CodexAppServerClient:
                     log_handle,
                     channel_events,
                     agent_messages,
+                    protocol_event_handler,
                 )
             finally:
                 self.current_turn_chat_id = None
@@ -13108,6 +14098,8 @@ class CodexAppServerClient:
                 return thread_id, None
             except Exception as exc:
                 resume_error = str(exc)
+                if not is_unrecoverable_thread_error(resume_error):
+                    raise
                 self._log_line(
                     log_handle,
                     "stderr",
@@ -13172,6 +14164,7 @@ class CodexAppServerClient:
         deadline: float,
         log_handle: Any,
         channel_events: list[dict[str, Any]],
+        protocol_event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         request_id = self._send_request_locked(
             "turn/start",
@@ -13184,7 +14177,13 @@ class CodexAppServerClient:
                 "sandboxPolicy": app_server_sandbox_policy(self.config),
             },
         )
-        response = self._wait_for_response_locked(request_id, deadline, log_handle, channel_events)
+        response = self._wait_for_response_locked(
+            request_id,
+            deadline,
+            log_handle,
+            channel_events,
+            protocol_event_handler=protocol_event_handler,
+        )
         return str(response["result"]["turn"]["id"])
 
 
@@ -13274,6 +14273,7 @@ class BotService:
         self.desktop_outbound_lock = threading.Lock()
         self._boot_wall_ts = time.time()
         self._one_shot_poll = False
+        self._service_ready_notice_done = not self.config.ready_notice
 
     def lock_for_chat(self, chat_id: str) -> threading.Lock:
         key = "__shared_codex_session__" if self.config.session_scope == "shared" else chat_id
@@ -13325,6 +14325,51 @@ class BotService:
         self.bot_id = get_meta(conn, "bot_id")
         self.bot_username = get_meta(conn, "bot_username")
 
+    def notify_service_ready_once(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        now: float | None = None,
+    ) -> int:
+        if self._service_ready_notice_done:
+            return 0
+        owners = sorted(self.config.owner_ids)
+        if not owners:
+            self._service_ready_notice_done = True
+            return 0
+        current = time.time() if now is None else float(now)
+        previous_raw = get_meta(conn, SERVICE_READY_NOTICE_META_KEY)
+        try:
+            previous = float(previous_raw) if previous_raw else None
+        except (TypeError, ValueError):
+            previous = None
+        if previous is not None and current - previous < SERVICE_READY_NOTICE_COOLDOWN_SECONDS:
+            self._service_ready_notice_done = True
+            print(
+                f"{utc_now()} service ready notice suppressed by cooldown",
+                flush=True,
+            )
+            return 0
+
+        delivered = 0
+        for owner_id in owners:
+            try:
+                message_ids = send_message(self.config, owner_id, SERVICE_READY_NOTICE_TEXT)
+            except Exception as exc:
+                print(
+                    f"{utc_now()} service ready notice failed owner={owner_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                if message_ids:
+                    delivered += 1
+        if delivered:
+            set_meta(conn, SERVICE_READY_NOTICE_META_KEY, str(current))
+            self._service_ready_notice_done = True
+            print(f"{utc_now()} sent {delivered} service ready notice(s)", flush=True)
+        return delivered
+
     def process_update(self, conn: sqlite3.Connection, update: dict[str, Any]) -> bool:
         try:
             self.handle_update(conn, update)
@@ -13347,7 +14392,7 @@ class BotService:
             print(f"{utc_now()} update error: {exc}", file=sys.stderr, flush=True)
             return False
 
-    def update_processor_loop(self, update_queue: "queue.Queue[list[dict[str, Any]]]") -> None:
+    def update_processor_loop(self, update_queue: "queue.Queue[QueuedUpdateBatch]") -> None:
         """Process Telegram updates on a separate lane from long polling.
 
         The poll loop should keep pulling and acknowledging Bot API updates even
@@ -13358,22 +14403,22 @@ class BotService:
         with closing(connect_db(self.config)) as conn:
             self.load_bot_info_from_db(conn)
             while True:
-                updates = update_queue.get()
+                pulled = update_queue.get()
                 try:
-                    self.process_update_batch(conn, updates)
+                    self.process_queued_update_batch(conn, pulled)
                 finally:
                     update_queue.task_done()
 
     def enqueue_pulled_updates(
         self,
-        update_queue: "queue.Queue[list[dict[str, Any]]]",
+        update_queue: "queue.Queue[QueuedUpdateBatch]",
         updates: list[dict[str, Any]],
     ) -> int:
-        ordered = updates_private_first(updates)
-        if not ordered:
+        pulled = queued_update_batch(updates)
+        if pulled is None:
             return 0
-        update_queue.put(ordered)
-        return len(ordered)
+        update_queue.put(pulled)
+        return sum(len(batch) for batch in pulled.chat_batches)
 
     def serve(self) -> None:
         with closing(connect_db(self.config)) as conn:
@@ -13385,15 +14430,21 @@ class BotService:
             interrupted = mark_running_runs_interrupted(conn, interrupted_reason)
             if interrupted:
                 print(f"{utc_now()} marked {interrupted} interrupted run(s)", flush=True)
-                hidden = self.hide_interrupted_desktop_prompt_mirrors(conn, interrupted_runs)
-                if hidden:
-                    print(f"{utc_now()} hid {hidden} interrupted desktop prompt mirror(s)", flush=True)
                 notices = self.notify_interrupted_visible_runs(conn, interrupted_runs, interrupted_reason)
                 if notices:
                     print(f"{utc_now()} sent {notices} interrupted turn notice(s)", flush=True)
             if interrupted_background_runs:
                 self.notify_interrupted_background_runs(conn, interrupted_background_runs, interrupted_reason)
-            self.refresh_bot_info(conn)
+            resident = shared_session_for_engine(conn, self.config.engine)
+            if resident and self.app_server is not None and self.config.session_scope == "shared":
+                try:
+                    self.app_server.resume_resident(resident)
+                    usage = shared_content_usage(conn, resident)
+                    print(f"{utc_now()} resident resumed same_session={resident} new_content_tokens={usage['new_content_tokens']} rollover_new_content_tokens={self.config.rollover_new_content_tokens}", flush=True)
+                except Exception as exc:
+                    print(f"{utc_now()} resident resume deferred same_session={resident}: {exc}", file=sys.stderr, flush=True)
+            if self.refresh_bot_info(conn):
+                self.notify_service_ready_once(conn)
             print(
                 f"{SERVICE_NAME} running as @{self.bot_username or 'unknown'} "
                 f"({self.bot_id or 'unknown'})",
@@ -13410,7 +14461,7 @@ class BotService:
             # Telegram-visible reply must not stop us from pulling the next
             # updates; otherwise active group chats only get batched within one
             # polling result and the next pile is discovered late.
-            update_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+            update_queue: queue.Queue[QueuedUpdateBatch] = queue.Queue()
             threading.Thread(target=self.update_processor_loop, args=(update_queue,), daemon=True).start()
             consecutive_poll_errors = 0
             next_poll_offset: int | None = None
@@ -13423,6 +14474,7 @@ class BotService:
                 try:
                     updates = get_updates(self.config, next_poll_offset)
                     consecutive_poll_errors = 0
+                    self.notify_service_ready_once(conn)
                     processed = self.enqueue_pulled_updates(update_queue, updates)
                     if updates:
                         max_update_id = max(
@@ -13588,33 +14640,6 @@ class BotService:
                 )
         return sent_count
 
-    def hide_interrupted_desktop_prompt_mirrors(
-        self,
-        conn: sqlite3.Connection,
-        runs: list[sqlite3.Row],
-    ) -> int:
-        attempted = 0
-        for row in runs:
-            run_id = str(row["run_id"] or "").strip()
-            prompt_path_raw = str(row["prompt_path"] or "").strip()
-            session_id = str(row["codex_session_id_after"] or row["codex_session_id_before"] or "").strip()
-            if not run_id or not prompt_path_raw or not session_id:
-                continue
-            try:
-                raw_prompt = Path(prompt_path_raw).expanduser().read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                print(f"{utc_now()} interrupted prompt cleanup failed for {run_id}: {exc}", file=sys.stderr, flush=True)
-                continue
-            maybe_hide_desktop_prompt_display(
-                conn,
-                self.config,
-                session_id,
-                raw_prompt,
-                live_mirror_run_id=run_id,
-            )
-            attempted += 1
-        return attempted
-
     def notify_interrupted_visible_runs(
         self,
         conn: sqlite3.Connection,
@@ -13626,11 +14651,66 @@ class BotService:
             run_id = str(row["run_id"] or "").strip()
             chat_id = str(row["chat_id"] or "").strip()
             chat_type = str(row["chat_type"] or "").strip().lower()
-            if not run_id or not chat_id or chat_type != "private":
+            if not run_id or not chat_id:
+                continue
+            progress_row = conn.execute(
+                """
+                SELECT telegram_message_id, message_thread_id
+                FROM channel_deliveries
+                WHERE run_id = ? AND chat_id = ? AND event_type = 'progress'
+                  AND delivery_status = 'sent' AND telegram_message_id IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (run_id, chat_id),
+            ).fetchone()
+            if progress_row is not None:
+                progress_path = progress_text_path_for_run(self.config, run_id)
+                try:
+                    progress_text = progress_path.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    progress_text = PROGRESS_INITIAL_TEXT
+                if PROGRESS_INTERRUPTED_TEXT not in progress_text:
+                    progress_text = f"{progress_text}\n\n{PROGRESS_INTERRUPTED_TEXT}".strip()
+                try:
+                    edit_message_text(
+                        self.config,
+                        chat_id,
+                        int(progress_row["telegram_message_id"]),
+                        progress_text,
+                    )
+                except Exception as exc:
+                    print(
+                        f"{utc_now()} interrupted progress edit failed run_id={run_id}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE channel_deliveries
+                        SET text_preview = ?, delivered_at = ?
+                        WHERE run_id = ? AND chat_id = ? AND event_type = 'progress'
+                          AND telegram_message_id = ?
+                        """,
+                        (
+                            channel_delivery_text_preview(progress_text),
+                            utc_now(),
+                            run_id,
+                            chat_id,
+                            int(progress_row["telegram_message_id"]),
+                        ),
+                    )
+                    conn.commit()
+                    write_private_text(progress_path, progress_text)
+                    sent_count += 1
+                    continue
+            if chat_type != "private":
                 continue
             already_visible = any(
                 str(delivery["delivery_status"] or "sent") == "sent"
                 and delivery["telegram_message_id"] is not None
+                and str(delivery["event_type"] or "") != "progress"
                 for delivery in channel_delivery_rows(conn, run_id)
             )
             if already_visible:
@@ -13695,10 +14775,18 @@ class BotService:
                 processed += 1
         return processed
 
-    def mark_worker_supervision_closed(self, alarm: dict[str, Any], state: dict[str, Any]) -> None:
+    def mark_worker_supervision_closed(
+        self,
+        alarm: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        delivery_mode: str = "",
+    ) -> None:
         alarm_id = str(alarm.get("alarm_id") or "").strip()
         task_id = str(state.get("task_id") or alarm.get("task_id") or "").strip()
         state["terminal_notified_at"] = utc_now()
+        if delivery_mode:
+            state["terminal_delivery"] = delivery_mode
         write_worker_state(self.config, state)
         cancel_worker_alarms(self.config, task_id, except_alarm_id=alarm_id)
         alarm["status"] = "done"
@@ -13789,6 +14877,9 @@ class BotService:
                         session_id=str(state.get("session_id") or "").strip(),
                         turn_count=(int_or_none(state.get("turn_count")) or 1) + 1,
                         failure_count=worker_failure_count(state),
+                        completion_delivery=WORKER_COMPLETION_RESIDENT_REVIEW,
+                        completion_delivery_reason="worker retried after a transient failure",
+                        had_failure=True,
                     )
                     if error is None and next_state is not None:
                         reschedule_worker_alarm(
@@ -13800,13 +14891,23 @@ class BotService:
                     state["circuit_open"] = True
                     state["last_error"] = error or detail
                     write_worker_state(self.config, state)
+
+            review_required, review_reason = worker_terminal_review_decision(state)
+            state["terminal_review_required"] = review_required
+            state["terminal_review_reason"] = review_reason
+            write_worker_state(self.config, state)
+            if not review_required:
                 try:
                     if not self.send_worker_terminal_text(alarm, state):
                         raise RuntimeError("Telegram sendMessage returned no message id")
                 except Exception as exc:
                     self.defer_worker_alarm_after_error(alarm, exc)
                     return False
-                self.mark_worker_supervision_closed(alarm, state)
+                self.mark_worker_supervision_closed(
+                    alarm,
+                    state,
+                    delivery_mode=WORKER_COMPLETION_DETERMINISTIC,
+                )
                 return True
 
             with closing(connect_db(self.config)) as conn:
@@ -13823,9 +14924,9 @@ class BotService:
                     alarm["error"] = f"chat inactive: {chat_id}"
                     write_worker_alarm(self.config, alarm)
                     return True
-                prompt = build_worker_alarm_prompt(alarm)
+                prompt = build_worker_alarm_prompt(alarm, state, review_reason=review_reason)
                 local_message_id = int(time.time() * 1000) % 2_000_000_000
-                session_id_before = prepare_session_for_turn(conn, self.config, chat_row)
+                session_id_before = prepare_session_for_turn(conn, self.config, chat_row, self.app_server)
                 result = run_codex(
                     conn,
                     self.config,
@@ -13859,7 +14960,11 @@ class BotService:
                 except Exception as exc:
                     self.defer_worker_alarm_after_error(alarm, exc)
                     return False
-            self.mark_worker_supervision_closed(alarm, state)
+            self.mark_worker_supervision_closed(
+                alarm,
+                state,
+                delivery_mode=WORKER_COMPLETION_RESIDENT_REVIEW,
+            )
             return True
         finally:
             lock.release()
@@ -14006,7 +15111,16 @@ class BotService:
         )
         return chat.chat_id, thread_id
 
-    def process_update_batch(self, conn: sqlite3.Connection, updates: list[dict[str, Any]]) -> int:
+    def process_update_batch(
+        self,
+        conn: sqlite3.Connection,
+        updates: list[dict[str, Any]],
+        *,
+        persist_offset: bool = True,
+    ) -> int:
+        chat_ids = {chat_id for update in updates if (chat_id := update_chat_id(update)) is not None}
+        if len(chat_ids) > 1:
+            raise ValueError(f"Telegram processing batch crossed chats: {sorted(chat_ids)}")
         processed = 0
         max_update_id: int | None = None
         for update in updates_private_first(updates):
@@ -14015,8 +15129,22 @@ class BotService:
                 max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
             self.process_update(conn, update)
             processed += 1
-        if max_update_id is not None:
+        if persist_offset and max_update_id is not None:
             set_meta(conn, "telegram_offset", str(max_update_id + 1))
+        return processed
+
+    def process_queued_update_batch(
+        self,
+        conn: sqlite3.Connection,
+        pulled: QueuedUpdateBatch,
+    ) -> int:
+        """Process chat-local batches, then advance one durable poll checkpoint."""
+
+        processed = 0
+        for chat_batch in pulled.chat_batches:
+            processed += self.process_update_batch(conn, list(chat_batch), persist_offset=False)
+        if pulled.max_update_id is not None:
+            set_meta(conn, "telegram_offset", str(pulled.max_update_id + 1))
         return processed
 
     def poll_once(self) -> int:
@@ -14030,7 +15158,8 @@ class BotService:
             updates = get_updates(self.config, offset)
             self._one_shot_poll = True
             try:
-                processed = self.process_update_batch(conn, updates)
+                pulled = queued_update_batch(updates)
+                processed = self.process_queued_update_batch(conn, pulled) if pulled is not None else 0
                 self.flush_pending_media_groups_now()
             finally:
                 self._one_shot_poll = False
@@ -14148,6 +15277,9 @@ class BotService:
             return
 
         if command:
+            if command.name == "status":
+                self.handle_usage_status(chat, sender, message_id, thread_id)
+                return
             if command.name == "codex_probe_channel":
                 self.handle_probe_channel(conn, chat, chat_row, sender, message_id, thread_id, policy)
                 return
@@ -14412,6 +15544,7 @@ class BotService:
         *,
         timeout_seconds: int | None = None,
         run_id: str | None = None,
+        stream_progress: bool = False,
     ) -> RunResult:
         with closing(connect_db(self.config)) as conn:
             run_kwargs: dict[str, Any] = {"timeout_seconds": timeout_seconds}
@@ -14424,6 +15557,8 @@ class BotService:
                 message_thread_id,
                 real_run_id,
             )
+            run_kwargs["stream_progress"] = stream_progress
+            run_kwargs["progress_message_thread_id"] = message_thread_id
             return run_codex(
                 conn,
                 self.config,
@@ -14493,14 +15628,18 @@ class BotService:
             for event in events:
                 if not immediate_current_reply_event(event, chat.chat_id, self.config):
                     continue
+                delivered_message_ids: list[int] = []
                 if self.send_channel_events(
                     chat.chat_id,
                     [event],
                     message_id,
                     run_id,
                     fallback_message_thread_id=message_thread_id,
+                    delivered_message_ids=delivered_message_ids,
                 ):
                     event["delivered_immediately"] = True
+                    if delivered_message_ids:
+                        event["telegram_message_ids"] = delivered_message_ids
 
         return sender
 
@@ -14618,6 +15757,7 @@ class BotService:
         *,
         allow_silent_reply: bool,
         explicitly_addressed: bool,
+        stream_progress: bool,
         stop_typing: threading.Event | None = None,
     ) -> tuple[str, RunResult | None, Exception | None]:
         if (
@@ -14634,6 +15774,7 @@ class BotService:
                     message_thread_id,
                     effort,
                     trigger_text,
+                    stream_progress=stream_progress,
                 )
             except Exception as exc:
                 return "sync", None, exc
@@ -14660,6 +15801,7 @@ class BotService:
                     trigger_text,
                     timeout_seconds=self.config.direct_background_timeout_seconds,
                     run_id=run_id,
+                    stream_progress=stream_progress,
                 )
                 error = None
             except Exception as exc:
@@ -14761,7 +15903,7 @@ class BotService:
                     chat_row = get_chat(conn, chat.chat_id)
                     if not bool(chat_row["enabled"]) or not bool(chat_row["bot_active"]):
                         return
-                    session_id_before = prepare_session_for_turn(conn, self.config, chat_row)
+                    session_id_before = prepare_session_for_turn(conn, self.config, chat_row, self.app_server)
                     context_rows_override = None
                     if context_exclude is not None:
                         context_rows_override = prompt_context_rows(
@@ -14795,6 +15937,14 @@ class BotService:
                         trigger_text,
                         allow_silent_reply=allow_silent_reply,
                         explicitly_addressed=explicitly_addressed,
+                        stream_progress=(
+                            chat.chat_type == "private"
+                            or (
+                                explicitly_addressed
+                                and not sender.is_bot
+                                and not sender.is_chat
+                            )
+                        ),
                         stop_typing=stop_typing,
                     )
                     if mode == "background":
@@ -15000,7 +16150,7 @@ class BotService:
             try:
                 try:
                     chat_row = get_chat(conn, chat.chat_id)
-                    session_id_before = prepare_session_for_turn(conn, self.config, chat_row)
+                    session_id_before = prepare_session_for_turn(conn, self.config, chat_row, self.app_server)
                     prompt = build_probe_prompt(
                         chat,
                         message_id,
@@ -15018,6 +16168,8 @@ class BotService:
                         desktop_title_for_context(self.config, chat),
                         desktop_preview_for_context(self.config, chat, "channel probe"),
                         self.app_server,
+                        stream_progress=True,
+                        progress_message_thread_id=message_thread_id,
                     )
                 except Exception as exc:
                     send_message(
@@ -15065,6 +16217,33 @@ class BotService:
         finally:
             lock.release()
             scheduled_turn.release()
+
+    def handle_usage_status(
+        self,
+        chat: Chat,
+        sender: Sender,
+        message_id: int,
+        message_thread_id: int | None,
+    ) -> None:
+        if not sender_is_owner(sender, self.config):
+            reply = "这个命令只给 owner 用。"
+        elif chat.chat_type != "private":
+            reply = "额度只在私聊里显示。"
+        elif self.app_server is None:
+            reply = "当前 Codex 引擎不支持读取账户额度。"
+        else:
+            try:
+                reply = format_account_rate_limits(self.app_server.read_account_rate_limits())
+            except Exception as exc:
+                print(f"{utc_now()} account rate-limit read failed: {exc}", file=sys.stderr, flush=True)
+                reply = "额度暂时查不到，请稍后再试。"
+        send_message(
+            self.config,
+            chat.chat_id,
+            reply,
+            reply_to_message_id=message_id,
+            message_thread_id=message_thread_id,
+        )
 
     def should_batch_codex(self, conn: sqlite3.Connection, chat: Chat, allow_silent_reply: bool) -> bool:
         if chat.chat_type == "private":
@@ -15231,13 +16410,6 @@ class BotService:
                         reason=reason,
                     )
                     mark_run_superseded(conn, result.run_id, reason)
-                    mark_desktop_run_superseded(
-                        conn,
-                        self.config,
-                        result.run_id,
-                        result.session_id_after,
-                        reason=reason,
-                    )
             if result is None or (superseded and result.status != "ok"):
                 return
             if result.status != "ok":
@@ -15392,6 +16564,7 @@ class BotService:
         run_id: str | None = None,
         *,
         fallback_message_thread_id: int | None = None,
+        delivered_message_ids: list[int] | None = None,
     ) -> bool:
         sent = False
         seen_call_ids: set[str] = set()
@@ -15507,6 +16680,102 @@ class BotService:
                             delivery_status="failed" if delivery_error else "sent",
                             error=delivery_error,
                         )
+                sent = sent or telegram_message_id is not None
+                continue
+
+            if event_type == "edit_rich_message":
+                preview = channel_event_delivery_preview(event)
+                raw_message_id = str(event.get("message_id") or "").strip()
+                rich_message = event.get("rich_message")
+                delivery_error = ""
+                telegram_message_id: int | None = None
+                try:
+                    if not isinstance(rich_message, dict):
+                        raise ValueError("rich_message is required")
+                    if _looks_like_system_prompt_echo(rich_message_plain_text(rich_message)):
+                        raise ValueError("blocked: looks like system prompt echo")
+                    telegram_message_id = edit_rich_message(
+                        self.config,
+                        target_chat_id,
+                        int(raw_message_id),
+                        rich_message,
+                    )
+                except Exception as exc:
+                    delivery_error = str(exc)
+                if run_id:
+                    with closing(connect_db(self.config)) as conn:
+                        record_channel_delivery(
+                            conn,
+                            run_id,
+                            target_chat_id,
+                            event_index,
+                            telegram_message_id,
+                            None,
+                            thread_id,
+                            preview,
+                            event_type=event_type,
+                            delivery_status="failed" if delivery_error else "sent",
+                            error=delivery_error,
+                        )
+                if telegram_message_id is not None and delivered_message_ids is not None:
+                    delivered_message_ids.append(telegram_message_id)
+                sent = sent or telegram_message_id is not None
+                continue
+
+            if event_type == "rich_reply":
+                rich_message = event.get("rich_message")
+                text = rich_message_plain_text(rich_message)
+                if not isinstance(rich_message, dict) or not text:
+                    continue
+                if _looks_like_system_prompt_echo(text):
+                    if run_id:
+                        with closing(connect_db(self.config)) as conn:
+                            record_channel_delivery(
+                                conn,
+                                run_id,
+                                target_chat_id,
+                                event_index,
+                                None,
+                                None,
+                                thread_id,
+                                text[:200],
+                                event_type=event_type,
+                                delivery_status="rejected",
+                                error="blocked: looks like system prompt echo",
+                            )
+                    continue
+                delivery_error = ""
+                telegram_message_id: int | None = None
+                try:
+                    telegram_message_id = send_rich_message(
+                        self.config,
+                        target_chat_id,
+                        rich_message,
+                        reply_to_message_id=reply_to,
+                        message_thread_id=thread_id,
+                        silent=bool(event.get("silent")),
+                    )
+                except Exception as exc:
+                    delivery_error = str(exc)
+                if telegram_message_id is None and not delivery_error:
+                    delivery_error = "Telegram sendRichMessage returned no message id"
+                if run_id:
+                    with closing(connect_db(self.config)) as conn:
+                        record_channel_delivery(
+                            conn,
+                            run_id,
+                            target_chat_id,
+                            event_index,
+                            telegram_message_id,
+                            reply_to,
+                            thread_id,
+                            text,
+                            event_type=event_type,
+                            delivery_status="failed" if delivery_error else "sent",
+                            error=delivery_error,
+                        )
+                if telegram_message_id is not None and delivered_message_ids is not None:
+                    delivered_message_ids.append(telegram_message_id)
                 sent = sent or telegram_message_id is not None
                 continue
 
@@ -15769,7 +17038,7 @@ class BotService:
                         error=None,
                         channel_events=[],
                     )
-                session_id_before = prepare_session_for_turn(conn, self.config, chat_row)
+                session_id_before = prepare_session_for_turn(conn, self.config, chat_row, self.app_server)
                 prompt = build_batch_prompt(
                     conn,
                     chat,
@@ -15791,6 +17060,16 @@ class BotService:
                     items[-1].message_thread_id,
                     real_run_id,
                 )
+                run_kwargs["stream_progress"] = (
+                    chat.chat_type == "private"
+                    or any(
+                        item.explicitly_addressed
+                        and not item.sender.is_bot
+                        and not item.sender.is_chat
+                        for item in items
+                    )
+                )
+                run_kwargs["progress_message_thread_id"] = items[-1].message_thread_id
                 return run_codex(
                     conn,
                     self.config,
