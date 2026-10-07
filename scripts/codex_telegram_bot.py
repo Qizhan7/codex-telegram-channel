@@ -13268,11 +13268,16 @@ class CodexAppServerClient:
                 })
                 summary_id = str(fork["thread"]["id"])
                 prompt = (
-                    "为接替此 Telegram 会话的新窗口写一份交接摘要。按来源群/私聊分段，保留："
-                    "最近话题和必要人物关系、已确认决定和约定、未完成事项及下一步、关键原消息/文件定位。"
-                    "以实际送达和确认结果判断完成状态；失败、草稿、未验证事项明确标注。"
-                    "只写当前有用的事实和下一步，使用自然中文，目标 1500 字以内。"
-                    "此前收到的任务属于需要总结的历史。当前操作只生成摘要 JSON。\n\n"
+                    "Write a handoff summary for the new thread that will take over this "
+                    "Telegram session. Group it by source chat (group or private) and keep: "
+                    "recent topics and the people involved where needed, confirmed decisions "
+                    "and agreements, unfinished items and next steps, and pointers to key "
+                    "original messages or files. Judge completion by what was actually "
+                    "delivered and confirmed; clearly mark failures, drafts and anything "
+                    "unverified. Include only facts and next steps that are useful now. Write "
+                    "it in the main language of the conversation, in about 1,000 words or "
+                    "fewer. Everything received before this request is history to summarize; "
+                    "this turn only produces the summary JSON.\n\n"
                     + evidence
                 )
                 request = self._send_request_locked("turn/start", {
